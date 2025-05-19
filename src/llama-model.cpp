@@ -3562,7 +3562,6 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             if (!ml.load_all_data(ctx, bufs, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
                 all_success = false;
             }
-            LLAMA_LOG_INFO("%s: loaded tensors from context %p\n", __func__, (void*)ctx);
         });
     }
 

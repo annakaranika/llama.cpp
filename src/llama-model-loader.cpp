@@ -882,9 +882,7 @@ bool llama_model_loader::load_all_data(
         llama_mlocks * lmlocks,
         llama_progress_callback progress_callback,
         void * progress_callback_user_data) {
-    LLAMA_LOG_INFO("%s: loading all tensors\n", __func__);
     GGML_ASSERT(size_data != 0 && "call init_mappings() first");
-    LLAMA_LOG_INFO("%s: loading %zu bytes of data\n", __func__, size_data);
     std::vector<no_init<uint8_t>> read_buf;
     std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;
 
@@ -993,7 +991,7 @@ bool llama_model_loader::load_all_data(
         size_t n_size = ggml_nbytes(cur);
 
         if (use_mmap) {
-            LLAMA_LOG_INFO("%s [thread %zu]: loading tensor '%s' from mmap for context %p\n", __func__,std::hash<std::thread::id>{}(std::this_thread::get_id()), ggml_get_name(cur), (void*)ctx);
+            LLAMA_LOG_DEBUG("%s [thread %zu]: loading tensor '%s' from mmap for context %p\n", __func__,std::hash<std::thread::id>{}(std::this_thread::get_id()), ggml_get_name(cur), (void*)ctx);
             const auto & mapping = mappings.at(weight->idx);
             ggml_backend_buffer_t buf_mmap = nullptr;
             if (bufs.count(weight->idx)) {
@@ -1011,7 +1009,7 @@ bool llama_model_loader::load_all_data(
             if (buf_mmap && cur->data == nullptr) {
                 ggml_backend_tensor_alloc(buf_mmap, cur, data);
                 if (lmlocks) {
-                    LLAMA_LOG_INFO("%s: growing mmap lock for tensor '%s' from %ld to %zu\n", __func__, ggml_get_name(cur), weight->offs, n_size);
+                    LLAMA_LOG_DEBUG("%s: growing mmap lock for tensor '%s' from %ld to %zu\n", __func__, ggml_get_name(cur), weight->offs, n_size);
                     const auto & lmlock = lmlocks->at(weight->idx);
                     lmlock->grow_to(weight->offs + n_size);
                 }
@@ -1020,11 +1018,9 @@ bool llama_model_loader::load_all_data(
                 mmap_used.first  = std::min(mmap_used.first,  weight->offs);
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
             } else {
-                LLAMA_LOG_INFO("%s: begin loading tensor\n", __func__);
                 ggml_backend_tensor_set(cur, data, 0, n_size);
             }
         } else {
-            LLAMA_LOG_INFO("%s: loading tensor '%s' from file %d\n", __func__, ggml_get_name(cur), weight->idx);
             const auto & file = files.at(weight->idx);
             if (ggml_backend_buffer_is_host(cur->buffer)) {
                 file->seek(weight->offs, SEEK_SET);
