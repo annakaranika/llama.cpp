@@ -13,6 +13,7 @@
 #include <map>
 #include <sstream>
 #include <stdexcept>
+#include <future>
 
 const char * llm_type_name(llm_type type) {
     switch (type) {
@@ -3524,7 +3525,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         const int max_backend_supported_layers = hparams.n_layer + 1;
         const int max_offloadable_layers       = hparams.n_layer + 1;
 
-        LLAMA_LOG_INFO("%s: offloaded %d/%d layers to GPU\n", __func__, std::min(n_gpu_layers, max_offloadable_layers), max_backend_supported_layers);
+        LLAMA_LOG_INFO("%s: successfully offloaded %d/%d layers to GPU\n", __func__, std::min(n_gpu_layers, max_offloadable_layers), max_backend_supported_layers);
     }
 
     // print memory requirements per buffer type
@@ -3540,12 +3541,40 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     }
 
     // load tensor data
+    // for (auto & it : ctx_bufs) {
+    //     ggml_context * ctx = it.first;
+    //     auto & bufs = it.second;
+    //     if (!ml.load_all_data(ctx, bufs, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
+    //         return false;
+    //     }
+    //     LLAMA_LOG_INFO("%s: loaded tensors from context %p\n", __func__, (void*)ctx);
+    // }
+    {
+    std::vector<std::thread> threads;
+    std::atomic<bool> all_success{true};
+
     for (auto & it : ctx_bufs) {
         ggml_context * ctx = it.first;
         auto & bufs = it.second;
-        if (!ml.load_all_data(ctx, bufs, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
-            return false;
-        }
+
+        threads.emplace_back([&, ctx]() {
+            
+            if (!ml.load_all_data(ctx, bufs, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
+                all_success = false;
+            }
+            LLAMA_LOG_INFO("%s: loaded tensors from context %p\n", __func__, (void*)ctx);
+        });
+    }
+
+    for (auto & t : threads) {
+        t.join();
+    }
+
+    if (!all_success) {
+        LLAMA_LOG_ERROR("%s: failed to load all tensors\n", __func__);
+        LLAMA_LOG_INFO("fail\n");
+        return false;
+    }
     }
 
     if (use_mmap_buffer) {
