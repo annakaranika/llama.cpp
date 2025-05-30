@@ -1462,6 +1462,10 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             }
 
             ggml_backend_buffer_type_t buft = select_weight_buft(hparams, t_meta, op, *buft_list);
+            // if(op==GGML_OP_MUL_MAT||op==GGML_OP_MUL_MAT_ID){
+            // LLAMA_LOG_INFO("%p\n", buft);
+            LLAMA_LOG_INFO("%s: tensor %s is using buffer type %s for op %s\n", __func__, tn.str().c_str(), ggml_backend_buft_name(buft), ggml_op_name(op));
+            
             if (!buft) {
                 throw std::runtime_error(format("failed to find a compatible buffer type for tensor %s", tn.str().c_str()));
             }

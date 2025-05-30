@@ -8697,9 +8697,11 @@ static int llama_decode_impl(
         }
 
         // plot the computation graph in dot format (for debugging purposes)
-        //if (n_past%100 == 0) {
-        //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
-        //}
+        // LLAMA_LOG_INFO("kv_self.used = %d, kv_self.head = %d\n", kv_self.used, kv_self.head);
+        if (kv_self.used%100 == 0) {
+           ggml_graph_dump_dot(gf, NULL, "llama.dot");
+           
+        }
 
         // extract logits
         if (res) {
