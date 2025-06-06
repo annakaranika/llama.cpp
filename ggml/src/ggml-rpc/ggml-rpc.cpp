@@ -110,6 +110,7 @@ enum rpc_cmd {
     RPC_CMD_GET_DEVICE_MEMORY,
     RPC_CMD_INIT_TENSOR,
     RPC_CMD_GET_ALLOC_SIZE,
+    RPC_CMD_SET_SPLIT,
     RPC_CMD_COUNT,
 };
 
@@ -188,6 +189,10 @@ struct rpc_msg_graph_compute_rsp {
 struct rpc_msg_get_device_memory_rsp {
     uint64_t free_mem;
     uint64_t total_mem;
+};
+
+struct rpc_msg_set_split_rsp{
+    uint8_t result;
 };
 #pragma pack(pop)
 
@@ -1226,7 +1231,17 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_split_buffer_type(int main_de
     std::lock_guard<std::mutex> lock(mutex);
     static std::map<std::pair<int,std::array<float,RPC_MAX_DEVICES>>, struct ggml_backend_buffer_type> split_buft_map;
 
-    split=true;
+    if(!split){
+        for(int id=0;id<ggml_backend_rpc_get_device_count();++id){
+            auto dev_ctx = (ggml_backend_rpc_device_context *)reg_ctx->devices[id]->context;
+            rpc_msg_set_split_rsp response;
+            bool status = send_rpc_cmd(get_socket(dev_ctx->endpoint), RPC_CMD_SET_SPLIT, NULL, 0, &response, sizeof(response));
+            GGML_ASSERT(status);
+        }
+        split=true;
+
+    }
+
     std::array<float, RPC_MAX_DEVICES> tensor_split_arr = {};
 
     bool all_zero = tensor_split == nullptr || std::all_of(tensor_split, tensor_split + RPC_MAX_DEVICES, [](float x) { return x == 0.0f; });
@@ -1647,6 +1662,7 @@ public:
     bool graph_compute(const std::vector<uint8_t> & input, rpc_msg_graph_compute_rsp & response);
     bool init_tensor(const rpc_msg_init_tensor_req & request);
     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
+    bool set_split(rpc_msg_set_split_rsp & response);
 
 private:
     ggml_tensor * deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor);
@@ -1658,6 +1674,7 @@ private:
 
     ggml_backend_t backend;
     std::unordered_set<ggml_backend_buffer_t> buffers;
+    bool split = false;
 };
 
 bool rpc_server::get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response) {
@@ -1837,6 +1854,7 @@ bool rpc_server::init_tensor(const rpc_msg_init_tensor_req & request) {
         /*.mem_buffer =*/ NULL,
         /*.no_alloc   =*/ true,
     };
+
     struct ggml_context * ctx = ggml_init(params);
     ggml_tensor * tensor = deserialize_tensor(ctx, &request.tensor);
     if (tensor == nullptr) {
@@ -1854,13 +1872,13 @@ bool rpc_server::init_tensor(const rpc_msg_init_tensor_req & request) {
     }
 
     //now we use tensor->extra for split_buffer 
-    if (tensor->extra != nullptr) {
-        // This pointer can either be passed around client/server, or probably better stored server-side and kept track of.
-        // Currently unimplemented.
-        GGML_LOG_ERROR("tensor->extra populated by the backend, this is currently unsupported.\n");
-        ggml_free(ctx);
-        return false;
-    }
+    // if (tensor->extra != nullptr) {
+    //     // This pointer can either be passed around client/server, or probably better stored server-side and kept track of.
+    //     // Currently unimplemented.
+    //     GGML_LOG_ERROR("tensor->extra populated by the backend, this is currently unsupported.\n");
+    //     ggml_free(ctx);
+    //     return false;
+    // }
 
 
     ggml_free(ctx);
@@ -1958,11 +1976,45 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
             return nullptr;
         }
         tensor_map[id] = result;
-        for (int i = 0; i < GGML_MAX_SRC; i++) {
-            result->src[i] = create_node(tensor->src[i], ctx, tensor_ptrs, tensor_map);
+
+        if(split){
+            for(int i = 0; i < GGML_MAX_SRC; i++) {
+                uint64_t src_id=tensor->src[i];
+                if (src_id == 0) {
+                    result->src[i] = nullptr;
+                }
+                if (tensor_map.find(src_id) != tensor_map.end()) {
+                    result->src[i]=tensor_map[src_id];
+                }
+                const rpc_tensor * src_tensor = tensor_ptrs.at(src_id);
+                struct ggml_tensor * src_result = deserialize_tensor(ctx, src_tensor);
+                if (src_result == nullptr) {
+                    result->src[i]=nullptr;
+                }
+                tensor_map[src_id] = src_result;
+                result->src[i] = src_result;
+            }
+            uint64_t src_id=tensor->view_src;
+            if (src_id == 0) {
+                result->view_src = nullptr;
+            }
+            if (tensor_map.find(src_id) != tensor_map.end()) {
+                result->view_src=tensor_map[src_id];
+            }
+            const rpc_tensor * src_tensor = tensor_ptrs.at(src_id);
+            struct ggml_tensor * src_result = deserialize_tensor(ctx, src_tensor);
+            if (src_result == nullptr) {
+                result->view_src=nullptr;
+            }
+            tensor_map[src_id] = src_result;
+            result->view_src = src_result;
+        }else{
+            for (int i = 0; i < GGML_MAX_SRC; i++) {
+                result->src[i] = create_node(tensor->src[i], ctx, tensor_ptrs, tensor_map);
+            }
+            result->view_src = create_node(tensor->view_src, ctx, tensor_ptrs, tensor_map);
+            result->view_offs = tensor->view_offs;
         }
-        result->view_src = create_node(tensor->view_src, ctx, tensor_ptrs, tensor_map);
-        result->view_offs = tensor->view_offs;
         return result;
     } catch (const std::out_of_range & e) {
         GGML_LOG_ERROR("[%s] tensor with id %" PRIu64 " not found in tensor_ptrs: %s\n", __func__, id, e.what());
@@ -2022,6 +2074,12 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, rpc_msg_graph
     //     }
     // }
     ggml_free(ctx);
+    return true;
+}
+
+bool rpc_server::set_split(rpc_msg_set_split_rsp & response) {
+    split = true;
+    response.result = GGML_STATUS_SUCCESS;
     return true;
 }
 
@@ -2206,6 +2264,19 @@ static void rpc_serve_client(ggml_backend_t backend, sockfd_t sockfd, size_t fre
                 response.free_mem = free_mem;
                 response.total_mem = total_mem;
                 if (!send_msg(sockfd, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_SET_SPLIT: {
+                rpc_msg_set_split_rsp response;
+                if (!recv_msg(sockfd, &response, sizeof(response))) {
+                    return;
+                }
+                if(!server.set_split(response)) {
+                    return;
+                }
+                if (!send_msg(sockfd, nullptr, 0)) {
                     return;
                 }
                 break;
