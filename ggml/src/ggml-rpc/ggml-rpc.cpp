@@ -2269,14 +2269,14 @@ static void rpc_serve_client(ggml_backend_t backend, sockfd_t sockfd, size_t fre
                 break;
             }
             case RPC_CMD_SET_SPLIT: {
-                rpc_msg_set_split_rsp response;
-                if (!recv_msg(sockfd, &response, sizeof(response))) {
+                if (!recv_msg(sockfd, nullptr, 0)) {
                     return;
                 }
+                rpc_msg_set_split_rsp response;
                 if(!server.set_split(response)) {
                     return;
                 }
-                if (!send_msg(sockfd, nullptr, 0)) {
+                if (!send_msg(sockfd, &response, sizeof(response))) {
                     return;
                 }
                 break;
