@@ -1972,6 +1972,7 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
         }
         const rpc_tensor * tensor = tensor_ptrs.at(id);
         struct ggml_tensor * result = deserialize_tensor(ctx, tensor);
+        GGML_LOG_INFO("create node with tensor: %s\n",result->name);
         if (result == nullptr) {
             return nullptr;
         }
@@ -2017,7 +2018,7 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
         }
         return result;
     } catch (const std::out_of_range & e) {
-        GGML_LOG_ERROR("[%s] tensor with id %" PRIu64 " not found in tensor_ptrs: %s\n", __func__, id, e.what());
+        GGML_LOG_ERROR("[%s] tensor with not found in tensor_ptrs: %s\n", __func__ , e.what());
         return nullptr;
     }
 }
