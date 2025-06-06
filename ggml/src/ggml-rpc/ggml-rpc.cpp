@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string>
 #include <vector>
+#include <stdexcept>
 
 #include <thread>
 
@@ -1331,7 +1332,6 @@ static void add_tensor_part(ggml_tensor * tensor, std::vector<rpc_tensor> & tens
     if (tensor == nullptr || visited.count(tensor)) {
         return;
     }
-
     visited.insert(tensor);
     tensors.push_back(serialize_tensor(tensor));
     tensor_extras.push_back((ggml_tensor_extra_rpc*)tensor->extra);
@@ -1344,6 +1344,7 @@ static void add_tensor_part(ggml_tensor * tensor, std::vector<rpc_tensor> & tens
             if(split && i==0){
                 tensors.push_back(split_serialize_tensor(src, (ggml_tensor_extra_rpc*)tensor->extra, id));
                 tensor_extras.push_back((ggml_tensor_extra_rpc*)tensor->extra);
+                continue;
             }
             tensors.push_back(serialize_tensor(src));
             tensor_extras.push_back((ggml_tensor_extra_rpc*)tensor->extra);
@@ -1410,7 +1411,7 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                 std::unordered_set<ggml_tensor*> visited;
                 for (; count_nodes < cgraph->n_nodes; count_nodes++) {
                     ggml_tensor * node = cgraph->nodes[count_nodes];
-                    if(ggml_is_empty(node) && node->src[0] != nullptr 
+                    if(!ggml_is_empty(node) && node->src[0] != nullptr 
                         && ggml_backend_buft_is_rpc_split(node->src[0]->buffer->buft) 
                         && (node->op == GGML_OP_MUL_MAT|| node->op == GGML_OP_MUL_MAT_ID)) {
                         // this is a split node, we need to compute it
@@ -1944,24 +1945,29 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
                                       struct ggml_context * ctx,
                                       const std::unordered_map<uint64_t, const rpc_tensor*> & tensor_ptrs,
                                       std::unordered_map<uint64_t, struct ggml_tensor*> & tensor_map) {
-    if (id == 0) {
+    try{
+        if (id == 0) {
+            return nullptr;
+        }
+        if (tensor_map.find(id) != tensor_map.end()) {
+            return tensor_map[id];
+        }
+        const rpc_tensor * tensor = tensor_ptrs.at(id);
+        struct ggml_tensor * result = deserialize_tensor(ctx, tensor);
+        if (result == nullptr) {
+            return nullptr;
+        }
+        tensor_map[id] = result;
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+            result->src[i] = create_node(tensor->src[i], ctx, tensor_ptrs, tensor_map);
+        }
+        result->view_src = create_node(tensor->view_src, ctx, tensor_ptrs, tensor_map);
+        result->view_offs = tensor->view_offs;
+        return result;
+    } catch (const std::out_of_range & e) {
+        GGML_LOG_ERROR("[%s] tensor with id %" PRIu64 " not found in tensor_ptrs: %s\n", __func__, id, e.what());
         return nullptr;
     }
-    if (tensor_map.find(id) != tensor_map.end()) {
-        return tensor_map[id];
-    }
-    const rpc_tensor * tensor = tensor_ptrs.at(id);
-    struct ggml_tensor * result = deserialize_tensor(ctx, tensor);
-    if (result == nullptr) {
-        return nullptr;
-    }
-    tensor_map[id] = result;
-    for (int i = 0; i < GGML_MAX_SRC; i++) {
-        result->src[i] = create_node(tensor->src[i], ctx, tensor_ptrs, tensor_map);
-    }
-    result->view_src = create_node(tensor->view_src, ctx, tensor_ptrs, tensor_map);
-    result->view_offs = tensor->view_offs;
-    return result;
 }
 
 bool rpc_server::graph_compute(const std::vector<uint8_t> & input, rpc_msg_graph_compute_rsp & response) {
