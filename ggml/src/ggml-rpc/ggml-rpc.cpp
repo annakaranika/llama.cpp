@@ -511,11 +511,13 @@ static void * ggml_backend_rpc_buffer_context_get_base(ggml_backend_rpc_buffer_c
     if (ctx->base_ptr != nullptr) {
         return ctx->base_ptr;
     }
+    GGML_LOG_INFO("ggml_backend_rpc_buffer_context_get_base: remote_ptr=%" PRIx64 ",sock=%d\n", ctx->remote_ptr, ctx->sock->fd);
     rpc_msg_buffer_get_base_req request = {ctx->remote_ptr};
     rpc_msg_buffer_get_base_rsp response;
     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_BUFFER_GET_BASE, &request, sizeof(request), &response, sizeof(response));
     GGML_ASSERT(status);
     ctx->base_ptr = reinterpret_cast<void *>(response.base_ptr);
+    GGML_LOG_INFO("ggml_backend_rpc_buffer_context_get_base: base_ptr=%p for remote_ptr=%" PRIx64 "\n", ctx->base_ptr, ctx->remote_ptr);
     return ctx->base_ptr;
 }
 
@@ -575,8 +577,7 @@ static rpc_tensor split_serialize_tensor(const ggml_tensor * tensor, const ggml_
     if (extra) {
         ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)extra->buffer_ctx[device_id];
         result.buffer = ctx->remote_ptr;              //use remote_ptr to find the exact buffer on the remote server
-        GGML_LOG_INFO("split_serialize_tensor\n");
-        result.data = reinterpret_cast<uint64_t>(ggml_backend_rpc_buffer_context_get_base(reinterpret_cast<ggml_backend_rpc_buffer_context *>(ctx)));        //use base_ptr to find the base address of the buffer
+        result.data = reinterpret_cast<uint64_t>(ggml_backend_rpc_buffer_context_get_base(reinterpret_cast<ggml_backend_rpc_buffer_context *>(ctx)));  
     } else {
         result.buffer = 0;
     }
@@ -637,6 +638,7 @@ static void ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_t buffer, gg
             if (response.remote_ptr != 0) {
                 extra->buffer_ctx[id] = new ggml_backend_rpc_buffer_context{sock, nullptr, response.remote_ptr};
                 extra->rows[id] = {0, tensor->ne[1]};
+                GGML_LOG_INFO("[%s] allocated buffer for tensor %s device %d, remote_ptr=%" PRIx64 ", remote_size=%" PRIu64 "\n", __func__, tensor->name, id, response.remote_ptr, response.remote_size);
             } else {
                 GGML_LOG_INFO("[%s] failed to allocate buffer for device %d\n", __func__, id);
                 delete extra;
@@ -693,8 +695,9 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
     // input serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes) |
     size_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + size;
     std::vector<uint8_t> input(input_size, 0);
-    rpc_tensor rpc_tensor = serialize_tensor(tensor);
-    memcpy(input.data(), &rpc_tensor, sizeof(rpc_tensor));
+    rpc_tensor rpc_tensor1 = serialize_tensor(tensor);
+    GGML_LOG_INFO("[%s] rpc_tensor.data=%" PRIx64 ", rpc_tensor.buffer=%" PRIx64 "\n", __func__, rpc_tensor1.data, rpc_tensor1.buffer);
+    memcpy(input.data(), &rpc_tensor1, sizeof(rpc_tensor));
     memcpy(input.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
     memcpy(input.data() + sizeof(rpc_tensor) + sizeof(offset), data, size);
     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR, input.data(), input.size(), nullptr, 0);
@@ -714,22 +717,39 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
                 
                 // input serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes) |
                 size_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + size;
-                std::vector<uint8_t> input(input_size, 0);
-                rpc_tensor = serialize_tensor(tensor);
+                std::vector<uint8_t> input_(input_size, 0);
+                rpc_tensor rpc_tensor2 = serialize_tensor(tensor);
                 //change the buffer and data pointer for this device
                 if (extra->buffer_ctx[id] == nullptr) {
                     GGML_LOG_INFO("[%s] buffer context for device %d is null\n", __func__, id);
                 }else{
-                    rpc_tensor.buffer = extra->buffer_ctx[id]->remote_ptr;
-                    GGML_LOG_INFO("set\n");
-                    rpc_tensor.data = reinterpret_cast<uint64_t>(ggml_backend_rpc_buffer_context_get_base(reinterpret_cast<ggml_backend_rpc_buffer_context *>(extra->buffer_ctx[id])));
+                    GGML_LOG_INFO("reset data for device %d\n", id);
+                    rpc_tensor2.buffer = extra->buffer_ctx[id]->remote_ptr;
+                    rpc_tensor2.data = reinterpret_cast<uint64_t>(ggml_backend_rpc_buffer_context_get_base(reinterpret_cast<ggml_backend_rpc_buffer_context *>(extra->buffer_ctx[id])));
+                    GGML_LOG_INFO("rpc_tensor.data=%" PRIx64 ", rpc_tensor.buffer=%" PRIx64 "\n", rpc_tensor2.data, rpc_tensor2.buffer);
                 }
-                memcpy(input.data(), &rpc_tensor, sizeof(rpc_tensor));
-                memcpy(input.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
-                memcpy(input.data() + sizeof(rpc_tensor) + sizeof(offset), data, size);
-            
+                memcpy(input_.data(), &rpc_tensor2, sizeof(rpc_tensor));
+                memcpy(input_.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
+                memcpy(input_.data() + sizeof(rpc_tensor) + sizeof(offset), data, size);
 
-                bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR, input.data(), input.size(), nullptr, 0);
+                const rpc_tensor * in_tensor = (const rpc_tensor *)input_.data();
+                
+                struct ggml_init_params params {
+                    /*.mem_size   =*/ ggml_tensor_overhead(),
+                    /*.mem_buffer =*/ NULL,
+                    /*.no_alloc   =*/ true,
+                };
+                struct ggml_context * ctx_ = ggml_init(params);
+                ggml_tensor * result = ggml_new_tensor_4d(ctx_, (ggml_type) tensor->type,
+                in_tensor->ne[0], in_tensor->ne[1], in_tensor->ne[2], in_tensor->ne[3]);
+                for (uint32_t i = 0; i < GGML_MAX_DIMS; i++) {
+                    result->nb[i] = in_tensor->nb[i];
+                }
+                result->buffer = reinterpret_cast<ggml_backend_buffer_t>(in_tensor->buffer);
+                GGML_LOG_INFO("result->buffer=%p\n", result->buffer);
+                        
+
+                bool status = send_rpc_cmd(get_socket(dev_ctx->endpoint), RPC_CMD_SET_TENSOR, input_.data(), input_.size(), nullptr, 0);
                 if(!status) {
                     GGML_LOG_INFO("[%s] failed to set tensor %s, offset=%zu, size=%zu\n", __func__, tensor->name, offset, size);
                 }
@@ -901,6 +921,7 @@ static void ggml_backend_rpc_split_buffer_init_tensor(ggml_backend_buffer_t buff
             extra->buffer_ctx[id] = buffer_ctx;
             extra->rows[id] = {row_low, row_high};
             GGML_LOG_INFO("[%s] allocating buffer for tensor %s on device %d, size=%zu\n", __func__, tensor->name, id, response.remote_size);
+            GGML_LOG_INFO("[%s] remote_ptr=%" PRIx64 ", sock=%d\n", __func__, response.remote_ptr, sock->fd);
         }else{
             GGML_LOG_INFO("[%s] failed to allocate buffer for tensor %s on device %d\n", __func__, tensor->name, id);
             extra->buffer_ctx[id] = nullptr;
@@ -1067,6 +1088,7 @@ static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_back
             ggml_backend_rpc_buffer_interface,
             new ggml_backend_rpc_buffer_context{sock, nullptr, response.remote_ptr},
             response.remote_size);
+        GGML_LOG_INFO("[%s] allocated buffer for size %zu, remote_ptr=%" PRIx64 ", remote_size=%" PRIu64 "\n", __func__, size, response.remote_ptr, response.remote_size);
         return buffer;
     } else {
         return nullptr;
@@ -1362,6 +1384,7 @@ static void serialize_graph(const ggml_cgraph * cgraph, std::vector<uint8_t> & o
 
 static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
+    GGML_LOG_INFO("[%s] computing graph with %d nodes\n", __func__, cgraph->n_nodes);
     if(split) {
         uint32_t count_nodes_low = 0; //the first node to compute for a part-of-graph
         uint32_t count_nodes = 0;
@@ -1417,7 +1440,6 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                                 GGML_LOG_INFO("[%s] buffer context for device %d is null\n", __func__, id);
                             }else{
                                 rpc_t.buffer = tensor_extras[i]->buffer_ctx[id]->remote_ptr;
-                                GGML_LOG_INFO("graph\n");
                                 rpc_t.data = reinterpret_cast<uint64_t>(ggml_backend_rpc_buffer_context_get_base(reinterpret_cast<ggml_backend_rpc_buffer_context *>(tensor_extras[i]->buffer_ctx[id])));
                             }
 
@@ -1449,7 +1471,8 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                         memcpy(in_tensors, tensors.data(), n_tensors * sizeof(rpc_tensor));
 
                         rpc_msg_graph_compute_rsp response;
-                        auto sock = get_socket(rpc_ctx->endpoint);
+                        auto dev_ctx = (ggml_backend_rpc_device_context*)reg_ctx->devices[id]->context;
+                        auto sock = get_socket(dev_ctx->endpoint);
 
                         bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE,
                                                 input.data(), input.size(),
@@ -1480,15 +1503,11 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                             GGML_LOG_INFO("[%s] buffer context for device %d is null\n", __func__, id);
                         }else{
                             request.tensor.buffer = extra->buffer_ctx[id]->remote_ptr;
-                            GGML_LOG_INFO("graph\n");
                             request.tensor.data = reinterpret_cast<uint64_t>(ggml_backend_rpc_buffer_context_get_base(reinterpret_cast<ggml_backend_rpc_buffer_context *>(extra->buffer_ctx[id])));
                         }
 
                         request.offset = 0;
                         request.size = split_size;
-
-                        ggml_backend_rpc_device_context* dev_ctx =
-                            (ggml_backend_rpc_device_context*)reg_ctx->devices[id]->context;
 
                         status = send_rpc_cmd(get_socket(dev_ctx->endpoint),
                                             RPC_CMD_GET_TENSOR,
@@ -1750,8 +1769,8 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
         uint64_t tensor_size = (uint64_t) ggml_nbytes(result);
         uint64_t buffer_start = (uint64_t) ggml_backend_buffer_get_base(result->buffer);
         uint64_t buffer_size = (uint64_t) ggml_backend_buffer_get_size(result->buffer);
-        GGML_LOG_INFO("[%s] buffer: %p, data: %p, size: %" PRIu64 ", buffer_start: %" PRIu64 ", buffer_size: %" PRIu64 "\n",
-            __func__, (void*)result->buffer, result->data, tensor_size, buffer_start, buffer_size);
+        GGML_LOG_INFO("[%s] tensor name: %s, buffer: %p, data: %p, size: %" PRIu64 ", buffer_start: %" PRIx64 ", buffer_size: %" PRIu64 "\n",
+            __func__, tensor->name, (void*)result->buffer, tensor->data, tensor_size, buffer_start, buffer_size);
         GGML_ASSERT(tensor->data + tensor_size >= tensor->data); // check for overflow
         GGML_ASSERT(tensor->data >= buffer_start);
         GGML_ASSERT(tensor->data + tensor_size <= buffer_start + buffer_size);
@@ -1770,7 +1789,9 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
 
 bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
     // serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes) |
+    GGML_LOG_INFO("SET_TENSOR");
     if (input.size() < sizeof(rpc_tensor) + sizeof(uint64_t)) {
+        GGML_LOG_INFO("[%s] input size too small: %zu\n", __func__, input.size());
         return false;
     }
     const rpc_tensor * in_tensor = (const rpc_tensor *)input.data();
@@ -1784,9 +1805,10 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
         /*.no_alloc   =*/ true,
     };
     struct ggml_context * ctx = ggml_init(params);
+    GGML_LOG_INFO("[%s] offset: %" PRIu64 ", size: %zu\n", __func__, offset, size);
     ggml_tensor * tensor = deserialize_tensor(ctx, in_tensor);
     if (tensor == nullptr) {
-        GGML_LOG_ERROR("[%s] error deserializing tensor\n", __func__);
+        GGML_LOG_INFO("[%s] error deserializing tensor\n", __func__);
         ggml_free(ctx);
         return false;
     }
@@ -2333,12 +2355,18 @@ static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const st
 }
 
 static bool ggml_backend_rpc_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
-    if (!buft || buft->iface.get_name != ggml_backend_rpc_buffer_type_name) {
+    if (!buft || (buft->iface.get_name != ggml_backend_rpc_buffer_type_name && buft->iface.get_name != ggml_backend_rpc_split_buffer_type_name)) {
         return false;
     }
-    ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *)buft->context;
-    ggml_backend_rpc_device_context * dev_ctx = (ggml_backend_rpc_device_context *)dev->context;
-    return buft_ctx->endpoint == dev_ctx->endpoint;
+    if(buft->iface.get_name == ggml_backend_rpc_split_buffer_type_name) {
+        ggml_backend_rpc_split_buffer_type_context * buft_ctx = (ggml_backend_rpc_split_buffer_type_context *)buft->context;
+        ggml_backend_rpc_device_context * dev_ctx = (ggml_backend_rpc_device_context *)dev->context;
+        return buft_ctx->endpoint == dev_ctx->endpoint;
+    }else{
+        ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *)buft->context;
+        ggml_backend_rpc_device_context * dev_ctx = (ggml_backend_rpc_device_context *)dev->context;
+        return buft_ctx->endpoint == dev_ctx->endpoint;
+    }
 }
 
 static const struct ggml_backend_device_i ggml_backend_rpc_device_i = {
