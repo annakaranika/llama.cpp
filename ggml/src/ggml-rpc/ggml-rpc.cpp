@@ -1426,6 +1426,9 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                 std::unordered_set<ggml_tensor*> visited;
                 for (; count_nodes < cgraph->n_nodes; count_nodes++) {
                     ggml_tensor * node = cgraph->nodes[count_nodes];
+                    GGML_LOG_INFO("tensor %s ne0 :%d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d ",
+                        node->name,node->ne[0],node->ne[1],node->ne[2],node->ne[3],node->nb[0],node->nb[1],node->nb[2],node->nb[4]);
+
                     if(!ggml_is_empty(node) && node->src[0] != nullptr 
                         && ggml_backend_buft_is_rpc_split(node->src[0]->buffer->buft) 
                         && (node->op == GGML_OP_MUL_MAT|| node->op == GGML_OP_MUL_MAT_ID)) {
@@ -1440,7 +1443,7 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                 }
                 std::vector<uint8_t> data;
                 ggml_tensor* tensor= cgraph->nodes[count_nodes];
-
+                
                 //compute concurrently
                 std::mutex rpc_mutex; 
 
@@ -1463,11 +1466,13 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                         std::unordered_set<ggml_tensor*> visited_id = visited;
                         add_tensor_part(cgraph->nodes[count_nodes], tensors_id, tensor_extras, visited_id, true, id);
 
+                        
+
                         std::vector<uint8_t> input;
                         uint32_t n_nodes = count_nodes - count_nodes_low + 1;
                         if (n_nodes == 0) return;
 
-                        uint32_t n_tensors = tensors.size();
+                        uint32_t n_tensors = tensors_id.size();
                         int input_size = sizeof(uint32_t) + n_nodes * sizeof(uint64_t)
                                         + sizeof(uint32_t) + n_tensors * sizeof(rpc_tensor);
                         input.resize(input_size, 0);
@@ -1484,7 +1489,7 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                         rpc_tensor* in_tensors = (rpc_tensor*)(input.data()
                                             + sizeof(n_nodes) + n_nodes * sizeof(uint64_t)
                                             + sizeof(uint32_t));
-                        memcpy(in_tensors, tensors.data(), n_tensors * sizeof(rpc_tensor));
+                        memcpy(in_tensors, tensors_id.data(), n_tensors * sizeof(rpc_tensor));
 
                         rpc_msg_graph_compute_rsp response;
                         auto dev_ctx = (ggml_backend_rpc_device_context*)reg_ctx->devices[id]->context;
@@ -1972,6 +1977,8 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
         }
         const rpc_tensor * tensor = tensor_ptrs.at(id);
         struct ggml_tensor * result = deserialize_tensor(ctx, tensor);
+        GGML_LOG_INFO("tensor %s ne0 :%d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d ",
+                    result->name,result->ne[0],result->ne[1],result->ne[2],result->ne[3],result->nb[0],result->nb[1],result->nb[2],result->nb[4]);
         GGML_LOG_INFO("create node with tensor: %s\n",result->name);
         if (result == nullptr) {
             return nullptr;
@@ -1983,17 +1990,24 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
                 uint64_t src_id=tensor->src[i];
                 if (src_id == 0) {
                     result->src[i] = nullptr;
+                    continue;
                 }
                 if (tensor_map.find(src_id) != tensor_map.end()) {
                     result->src[i]=tensor_map[src_id];
+                    GGML_LOG_INFO("src %d ne0 :%d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d ",
+                        i,result->src[i]->ne[0],result->src[i]->ne[1],result->src[i]->ne[2],result->src[i]->ne[3],result->src[i]->nb[0],result->src[i]->nb[1],result->src[i]->nb[2],result->src[i]->nb[4]);
+                    continue;
                 }
                 const rpc_tensor * src_tensor = tensor_ptrs.at(src_id);
                 struct ggml_tensor * src_result = deserialize_tensor(ctx, src_tensor);
                 if (src_result == nullptr) {
                     result->src[i]=nullptr;
+                    continue;
                 }
                 tensor_map[src_id] = src_result;
                 result->src[i] = src_result;
+                GGML_LOG_INFO("src %d ne0 :%d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d ",
+                    i,src_result->ne[0],src_result->ne[1],src_result->ne[2],src_result->ne[3],src_result->nb[0],src_result->nb[1],src_result->nb[2],src_result->nb[4]);
             }
             uint64_t src_id=tensor->view_src;
             if (src_id == 0) {
