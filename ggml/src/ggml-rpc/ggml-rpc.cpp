@@ -1357,19 +1357,19 @@ static void add_tensor_part(ggml_tensor * tensor, std::vector<rpc_tensor> & tens
         if (src && visited.count(src) == 0) {
             visited.insert(src);
             if(split && i==0){
-                tensors.push_back(split_serialize_tensor(src, (ggml_tensor_extra_rpc*)tensor->extra, id));
-                tensor_extras.push_back((ggml_tensor_extra_rpc*)tensor->extra);
+                tensors.push_back(split_serialize_tensor(src, (ggml_tensor_extra_rpc*)src->extra, id));
+                tensor_extras.push_back((ggml_tensor_extra_rpc*)src->extra);
                 continue;
             }
             tensors.push_back(serialize_tensor(src));
-            tensor_extras.push_back((ggml_tensor_extra_rpc*)tensor->extra);
+            tensor_extras.push_back((ggml_tensor_extra_rpc*)src->extra);
         }
     }
 
     if (tensor->view_src && visited.count(tensor->view_src) == 0) {
         visited.insert(tensor->view_src);
         tensors.push_back(serialize_tensor(tensor->view_src));
-        tensor_extras.push_back((ggml_tensor_extra_rpc*)tensor->extra);
+        tensor_extras.push_back((ggml_tensor_extra_rpc*)tensor->view_src->extra);
     }
 }
 
@@ -1426,9 +1426,15 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                 std::unordered_set<ggml_tensor*> visited;
                 for (; count_nodes < cgraph->n_nodes; count_nodes++) {
                     ggml_tensor * node = cgraph->nodes[count_nodes];
-                    GGML_LOG_INFO("tensor %s ne0 :%d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d ",
+                    GGML_LOG_INFO("\ntensor %s ne0 :%d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d \n",
                         node->name,node->ne[0],node->ne[1],node->ne[2],node->ne[3],node->nb[0],node->nb[1],node->nb[2],node->nb[4]);
-
+                    for(int i=0;i<GGML_MAX_SRC;i++){
+                        ggml_tensor* src=node->src[i];
+                        if(src){
+                            GGML_LOG_INFO("src %d ne0 :%d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d \n",
+                                i,src->ne[0],src->ne[1],src->ne[2],src->ne[3],src->nb[0],src->nb[1],src->nb[2],src->nb[4]);
+                        }
+                    }
                     if(!ggml_is_empty(node) && node->src[0] != nullptr 
                         && ggml_backend_buft_is_rpc_split(node->src[0]->buffer->buft) 
                         && (node->op == GGML_OP_MUL_MAT|| node->op == GGML_OP_MUL_MAT_ID)) {
