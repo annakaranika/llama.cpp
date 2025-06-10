@@ -2093,6 +2093,8 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
             struct ggml_tensor * src_result = deserialize_tensor(ctx, src_tensor);
             if (src_result == nullptr) {
                 result->view_src=nullptr;
+                result->view_offs = tensor->view_offs;
+                return result;
             }
             tensor_map[src_id] = src_result;
             result->view_src = src_result;
