@@ -2093,6 +2093,7 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
                 result->view_offs = tensor->view_offs;
                 return result;
             }
+
             const rpc_tensor * src_tensor = tensor_ptrs.at(src_id);
             GGML_LOG_INFO("deserializing view_src tensor with id: %d, name: %s\n", src_id, src_tensor->name);
             struct ggml_tensor * src_result = deserialize_tensor(ctx, src_tensor);
@@ -2169,8 +2170,14 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, rpc_msg_graph
         memcpy(&id, &nodes[i], sizeof(id));
         graph->nodes[i] = create_node(id, ctx, tensor_ptrs, tensor_map);
     }
-    ggml_status status = ggml_backend_graph_compute(backend, graph);
-    response.result = status;
+    try{
+        ggml_status status = ggml_backend_graph_compute(backend, graph);
+        response.result = status;
+    } catch (const std::exception & e) {
+        GGML_LOG_INFO("[%s] exception during graph compute: %s\n", __func__, e.what());
+        ggml_free(ctx);
+        return false;
+    }
     // bool split_r;
     // memcpy(&split_r, input.data() + sizeof(n_nodes) + n_nodes*sizeof(uint64_t) + sizeof(n_tensors) + n_tensors*sizeof(rpc_tensor), sizeof(bool)); 
     // if(split){
