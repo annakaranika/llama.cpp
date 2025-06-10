@@ -443,6 +443,7 @@ static bool send_rpc_cmd(const std::shared_ptr<socket_t> & sock, enum rpc_cmd cm
         return false;
     }
     if (out_size != output_size) {
+        GGML_LOG_INFO("Expected output size %zu, but got %" PRIu64 "\n", output_size, out_size);
         return false;
     }
     if (!recv_data(sock->fd, output, output_size)) {
@@ -903,6 +904,20 @@ static void ggml_backend_rpc_split_buffer_init_tensor(ggml_backend_buffer_t buff
     ggml_backend_rpc_split_buffer_context * ctx = (ggml_backend_rpc_split_buffer_context *)buffer->context;
     ggml_backend_rpc_split_buffer_type_context * buft_ctx = (ggml_backend_rpc_split_buffer_type_context *)buffer->buft->context;
 
+    GGML_LOG_INFO("[%s] split: %d\n", __func__, split);
+    static bool set_split = false;
+    if(split&&!set_split) {
+        for(int id=0;id<ggml_backend_rpc_get_device_count();++id){
+            auto dev_ctx = (ggml_backend_rpc_device_context *)reg_ctx->devices[id]->context;
+            rpc_msg_set_split_rsp response;
+            GGML_LOG_INFO("[%s] setting split for device %d, endpoint=%s\n", __func__, id, dev_ctx->endpoint.c_str());
+            bool status = send_rpc_cmd(get_socket(dev_ctx->endpoint), RPC_CMD_SET_SPLIT, NULL, 0, &response, sizeof(response));
+            GGML_ASSERT(status);
+        }
+        set_split = true;
+    }
+
+
     ggml_tensor_extra_rpc * extra = new ggml_tensor_extra_rpc();
     ctx->tensor_extras.push_back(extra);
     for (int id = 0; id < ggml_backend_rpc_get_device_count(); ++id) {
@@ -1231,18 +1246,8 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_split_buffer_type(int main_de
     std::lock_guard<std::mutex> lock(mutex);
     static std::map<std::pair<int,std::array<float,RPC_MAX_DEVICES>>, struct ggml_backend_buffer_type> split_buft_map;
 
-    GGML_LOG_INFO("[%s] split: %d\n", __func__, split);
-    if(!split){
-        for(int id=0;id<ggml_backend_rpc_get_device_count();++id){
-            auto dev_ctx = (ggml_backend_rpc_device_context *)reg_ctx->devices[id]->context;
-            rpc_msg_set_split_rsp response;
-            GGML_LOG_INFO("[%s] setting split for device %d, endpoint=%s\n", __func__, id, dev_ctx->endpoint.c_str());
-            bool status = send_rpc_cmd(get_socket(dev_ctx->endpoint), RPC_CMD_SET_SPLIT, NULL, 0, &response, sizeof(response));
-            GGML_ASSERT(status);
-        }
-        split=true;
+    split=true;
 
-    }
 
     std::array<float, RPC_MAX_DEVICES> tensor_split_arr = {};
 
@@ -2152,6 +2157,7 @@ static void rpc_serve_client(ggml_backend_t backend, sockfd_t sockfd, size_t fre
             fprintf(stderr, "Unknown command: %d\n", cmd);
             break;
         }
+        GGML_LOG_INFO("Received command: %d\n", cmd);
         switch (cmd) {
             case RPC_CMD_ALLOC_BUFFER: {
                 rpc_msg_alloc_buffer_req request;
