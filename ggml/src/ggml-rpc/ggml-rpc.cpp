@@ -2113,10 +2113,13 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, rpc_msg_graph
     for (uint32_t i = 0; i < n_tensors; i++) {
         tensor_ptrs[tensors[i].id] = &tensors[i];
     }
-    for(int i=0; i < tensor_ptrs.size(); i++) {
-        GGML_LOG_INFO("tensor %d id: %lu, name: %s\n",
-            i, tensor_ptrs.begin()->second->id, tensor_ptrs.begin()->second->name);
+    // Print all entries in tensor_ptrs
+    for (const auto &pair : tensor_ptrs) {
+        const rpc_tensor *t = pair.second;
+        GGML_LOG_INFO("tensor_ptrs: id=%" PRIu64 ", name=%s, type=%u, buffer=%" PRIu64 "\n",
+            pair.first, t->name, t->type, t->buffer);
     }
+    
     std::unordered_map<uint64_t, ggml_tensor*> tensor_map;
     for (uint32_t i = 0; i < n_nodes; i++) {
         int64_t id;
