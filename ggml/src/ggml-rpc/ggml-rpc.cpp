@@ -2037,7 +2037,7 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
                 }
                 if (tensor_map.find(src_id) != tensor_map.end()) {
                     result->src[i]=tensor_map[src_id];
-                    GGML_LOG_INFO("src %d ne0 :%d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d ",
+                    GGML_LOG_INFO("src %d ne0 :%d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d\n",
                         i,result->src[i]->ne[0],result->src[i]->ne[1],result->src[i]->ne[2],result->src[i]->ne[3],result->src[i]->nb[0],result->src[i]->nb[1],result->src[i]->nb[2],result->src[i]->nb[4]);
                     continue;
                 }
@@ -2049,7 +2049,7 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
                 }
                 tensor_map[src_id] = src_result;
                 result->src[i] = src_result;
-                GGML_LOG_INFO("src %d ne0 :%d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d ",
+                GGML_LOG_INFO("src %d ne0 :%d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d \n",
                     i,src_result->ne[0],src_result->ne[1],src_result->ne[2],src_result->ne[3],src_result->nb[0],src_result->nb[1],src_result->nb[2],src_result->nb[4]);
             }
             uint64_t src_id=tensor->view_src;
@@ -2058,6 +2058,7 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
             }
             if (tensor_map.find(src_id) != tensor_map.end()) {
                 result->view_src=tensor_map[src_id];
+                
             }
             const rpc_tensor * src_tensor = tensor_ptrs.at(src_id);
             struct ggml_tensor * src_result = deserialize_tensor(ctx, src_tensor);
@@ -2066,13 +2067,17 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
             }
             tensor_map[src_id] = src_result;
             result->view_src = src_result;
+            GGML_LOG_INFO("view_src ne0 :%d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d\n",
+                result->view_src->ne[0],result->view_src->ne[1],result->view_src->ne[2],result->view_src->ne[3],result->view_src->nb[0],result->view_src->nb[1],result->view_src->nb[2],result->view_src->nb[4]);
         }else{
             for (int i = 0; i < GGML_MAX_SRC; i++) {
                 result->src[i] = create_node(tensor->src[i], ctx, tensor_ptrs, tensor_map);
             }
             result->view_src = create_node(tensor->view_src, ctx, tensor_ptrs, tensor_map);
             result->view_offs = tensor->view_offs;
+            
         }
+        
         return result;
     } catch (const std::out_of_range & e) {
         GGML_LOG_ERROR("[%s] tensor %d with not found in tensor_ptrs: %s\n", __func__ , id, e.what());
