@@ -23,6 +23,7 @@
 #include <stdexcept>
 
 #include <thread>
+#include <errno.h>
 
 #include <cinttypes>
 #include <string>
@@ -374,6 +375,11 @@ static bool recv_data(sockfd_t sockfd, void * data, size_t size) {
     while (bytes_recv < size) {
         ssize_t n = recv(sockfd, (char *)data + bytes_recv, size - bytes_recv, 0);
         if (n <= 0) {
+            if (n < 0) {
+                GGML_LOG_INFO("recv failed: %s\n", strerror(errno));
+            } else {
+                GGML_LOG_INFO( "Connection closed by peer\n");
+            }
             return false;
         }
         bytes_recv += n;
@@ -428,18 +434,22 @@ static bool parse_endpoint(const std::string & endpoint, std::string & host, int
 static bool send_rpc_cmd(const std::shared_ptr<socket_t> & sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
     uint8_t cmd_byte = cmd;
     if (!send_data(sock->fd, &cmd_byte, sizeof(cmd_byte))) {
+        GGML_LOG_INFO("Failed to send command byte %d\n", cmd_byte);
         return false;
     }
     if (!send_data(sock->fd, &input_size, sizeof(input_size))) {
+        GGML_LOG_INFO("Failed to send input size %zu\n", input_size);
         return false;
     }
     if (!send_data(sock->fd, input, input_size)) {
+        GGML_LOG_INFO("Failed to send input data of size %zu\n", input_size);
         return false;
     }
     // TODO: currently the output_size is always known, do we need support for commands with variable output size?
     // even if we do, we can skip sending output_size from the server for commands with known output size
     uint64_t out_size;
     if (!recv_data(sock->fd, &out_size, sizeof(out_size))) {
+        GGML_LOG_INFO("Failed to receive output size\n");
         return false;
     }
     if (out_size != output_size) {
@@ -447,6 +457,7 @@ static bool send_rpc_cmd(const std::shared_ptr<socket_t> & sock, enum rpc_cmd cm
         return false;
     }
     if (!recv_data(sock->fd, output, output_size)) {
+        GGML_LOG_INFO("Failed to receive output data of size %" PRIu64 "\n", out_size);
         return false;
     }
     return true;
@@ -1382,6 +1393,8 @@ static void add_tensor_part(ggml_tensor * tensor, std::vector<rpc_tensor> & tens
     if(split_){
         auto extra = (ggml_tensor_extra_rpc*)tensor->src[0]->extra;
         rpc_t.ne[0] = extra->rows[id].second - extra->rows[id].first;
+        GGML_LOG_INFO("for tensor %s, ne0: %d ne1: %d ne2: %d ne3: %d \n",
+            tensor->name,rpc_t.ne[0],rpc_t.ne[1],rpc_t.ne[2],rpc_t.ne[3]);
         
         rpc_t.nb[0] = ggml_type_size(tensor->type);
         rpc_t.nb[1] = ggml_row_size(tensor->type, rpc_t.ne[0]);
@@ -1473,6 +1486,7 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                 }
                 std::vector<uint8_t> data;
                 ggml_tensor* tensor= cgraph->nodes[count_nodes];
+                data.reserve(ggml_nbytes(tensor)); 
                 
                 //compute concurrently
                 std::mutex rpc_mutex; 
@@ -1499,8 +1513,15 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                         for(int i=0;i<tensors_id.size();i++) {
                             GGML_LOG_INFO("[%s] device %d, tensor %s\n",
                                 __func__, id, tensors_id[i].name);
+                            if (std::strcmp(tensors_id[i].name, "ffn_up-0") == 0){
+                                GGML_LOG_INFO("[%s] device %d, tensor %s, ne0: %d, ne1: %d, ne2: %d, ne3: %d\n",
+                                    __func__, id, tensors_id[i].name,
+                                    tensors_id[i].ne[0], tensors_id[i].ne[1],
+                                    tensors_id[i].ne[2], tensors_id[i].ne[3]);
+                            }
                         }
 
+                        
                         std::vector<uint8_t> input;
                         uint32_t n_nodes = count_nodes - count_nodes_low + 1;
                         if (n_nodes == 0) return;
@@ -1548,8 +1569,8 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                         if (nrows_split == 0) return;
 
                         GGML_LOG_INFO("[%s] device %d, tensor %s, nrows_split=%" PRId64 ", offset=%d, size=%d\n",
-                            __func__, id, tensor->name, nrows_split, row_low * tensor->nb[0], nrows_split*ggml_row_size(tensor->type, tensor->ne[1]));
-                        size_t offset_split = row_low * tensor->nb[0];
+                            __func__, id, tensor->name, nrows_split, row_low * tensor->nb[0] * tensor->ne[1], nrows_split*ggml_row_size(tensor->type, tensor->ne[1]));
+                        size_t offset_split = row_low * tensor->nb[0] * tensor->ne[1];
                         size_t split_size = nrows_split*ggml_row_size(tensor->type, tensor->ne[1]);
 
                         rpc_msg_get_tensor_req request;
@@ -2018,6 +2039,11 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
             return tensor_map[id];
         }
         const rpc_tensor * tensor = tensor_ptrs.at(id);
+        if(std::strcmp(tensor->name, "ffn_up-0") == 0){
+            GGML_LOG_INFO("create node with tensor: %s, ne0: %d, ne1: %d, ne2: %d, ne3: %d, nb0: %d, nb1: %d, nb2: %d, nb3: %d\n",
+                tensor->name, tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3],
+                tensor->nb[0], tensor->nb[1], tensor->nb[2], tensor->nb[4]);
+        }
         struct ggml_tensor * result = deserialize_tensor(ctx, tensor);
         GGML_LOG_INFO("tensor %s ne0 :%d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d ",
                     result->name,result->ne[0],result->ne[1],result->ne[2],result->ne[3],result->nb[0],result->nb[1],result->nb[2],result->nb[4]);
