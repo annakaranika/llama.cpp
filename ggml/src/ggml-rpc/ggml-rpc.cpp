@@ -1511,14 +1511,10 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                         add_tensor_part(cgraph->nodes[count_nodes], tensors_id, tensor_extras, visited_id, true, id);
 
                         for(int i=0;i<tensors_id.size();i++) {
-                            GGML_LOG_INFO("[%s] device %d, tensor %s\n",
-                                __func__, id, tensors_id[i].name);
-                            if (std::strcmp(tensors_id[i].name, "ffn_up-0") == 0){
                                 GGML_LOG_INFO("[%s] device %d, tensor %s, ne0: %d, ne1: %d, ne2: %d, ne3: %d\n",
                                     __func__, id, tensors_id[i].name,
                                     tensors_id[i].ne[0], tensors_id[i].ne[1],
                                     tensors_id[i].ne[2], tensors_id[i].ne[3]);
-                            }
                         }
 
                         
@@ -2090,10 +2086,12 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
                 return result;
             }
             const rpc_tensor * src_tensor = tensor_ptrs.at(src_id);
+            GGML_LOG_INFO("deserializing view_src tensor with id: %d, name: %s\n", src_id, src_tensor->name);
             struct ggml_tensor * src_result = deserialize_tensor(ctx, src_tensor);
             if (src_result == nullptr) {
                 result->view_src=nullptr;
                 result->view_offs = tensor->view_offs;
+                GGML_LOG_INFO("view_src is null, returning result\n");
                 return result;
             }
             tensor_map[src_id] = src_result;
