@@ -1231,10 +1231,12 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_split_buffer_type(int main_de
     std::lock_guard<std::mutex> lock(mutex);
     static std::map<std::pair<int,std::array<float,RPC_MAX_DEVICES>>, struct ggml_backend_buffer_type> split_buft_map;
 
+    GGML_LOG_INFO("[%s] split: %d\n", __func__, split);
     if(!split){
         for(int id=0;id<ggml_backend_rpc_get_device_count();++id){
             auto dev_ctx = (ggml_backend_rpc_device_context *)reg_ctx->devices[id]->context;
             rpc_msg_set_split_rsp response;
+            GGML_LOG_INFO("[%s] setting split for device %d, endpoint=%s\n", __func__, id, dev_ctx->endpoint.c_str());
             bool status = send_rpc_cmd(get_socket(dev_ctx->endpoint), RPC_CMD_SET_SPLIT, NULL, 0, &response, sizeof(response));
             GGML_ASSERT(status);
         }
@@ -2127,6 +2129,7 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, rpc_msg_graph
 
 bool rpc_server::set_split(rpc_msg_set_split_rsp & response) {
     server_split = true;
+    GGML_LOG_INFO("[%s] server_split set to %d\n", __func__, server_split);
     response.result = GGML_STATUS_SUCCESS;
     return true;
 }
