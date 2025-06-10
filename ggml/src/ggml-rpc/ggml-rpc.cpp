@@ -2055,10 +2055,13 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
             uint64_t src_id=tensor->view_src;
             if (src_id == 0) {
                 result->view_src = nullptr;
+                result->view_offs = tensor->view_offs;
+                return result;
             }
             if (tensor_map.find(src_id) != tensor_map.end()) {
                 result->view_src=tensor_map[src_id];
-                
+                result->view_offs = tensor->view_offs;
+                return result;
             }
             const rpc_tensor * src_tensor = tensor_ptrs.at(src_id);
             struct ggml_tensor * src_result = deserialize_tensor(ctx, src_tensor);
@@ -2067,6 +2070,7 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
             }
             tensor_map[src_id] = src_result;
             result->view_src = src_result;
+            result->view_offs = tensor->view_offs;
             GGML_LOG_INFO("view_src ne0 :%d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d\n",
                 result->view_src->ne[0],result->view_src->ne[1],result->view_src->ne[2],result->view_src->ne[3],result->view_src->nb[0],result->view_src->nb[1],result->view_src->nb[2],result->view_src->nb[4]);
         }else{
