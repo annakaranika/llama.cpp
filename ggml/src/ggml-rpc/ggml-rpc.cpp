@@ -904,20 +904,6 @@ static void ggml_backend_rpc_split_buffer_init_tensor(ggml_backend_buffer_t buff
     ggml_backend_rpc_split_buffer_context * ctx = (ggml_backend_rpc_split_buffer_context *)buffer->context;
     ggml_backend_rpc_split_buffer_type_context * buft_ctx = (ggml_backend_rpc_split_buffer_type_context *)buffer->buft->context;
 
-    GGML_LOG_INFO("[%s] split: %d\n", __func__, split);
-    static bool set_split = false;
-    if(split&&!set_split) {
-        for(int id=0;id<ggml_backend_rpc_get_device_count();++id){
-            auto dev_ctx = (ggml_backend_rpc_device_context *)reg_ctx->devices[id]->context;
-            rpc_msg_set_split_rsp response;
-            GGML_LOG_INFO("[%s] setting split for device %d, endpoint=%s\n", __func__, id, dev_ctx->endpoint.c_str());
-            bool status = send_rpc_cmd(get_socket(dev_ctx->endpoint), RPC_CMD_SET_SPLIT, NULL, 0, &response, sizeof(response));
-            GGML_ASSERT(status);
-        }
-        set_split = true;
-    }
-
-
     ggml_tensor_extra_rpc * extra = new ggml_tensor_extra_rpc();
     ctx->tensor_extras.push_back(extra);
     for (int id = 0; id < ggml_backend_rpc_get_device_count(); ++id) {
@@ -976,6 +962,7 @@ static void ggml_backend_rpc_split_buffer_init_tensor(ggml_backend_buffer_t buff
             bool status = send_rpc_cmd(get_socket(dev_ctx->endpoint), RPC_CMD_INIT_TENSOR, &request, sizeof(request), nullptr, 0);
             GGML_ASSERT(status);
         }
+
     }
     tensor->extra = extra;
 
@@ -990,6 +977,19 @@ static void * ggml_backend_rpc_split_buffer_get_base(ggml_backend_buffer_t buffe
 static void ggml_backend_rpc_split_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     GGML_ASSERT(offset==0);
     // GGML_LOG_INFO("[%s] setting tensor %s on split buffer %p, offset=%zu, size=%zu\n", __func__, tensor->name, (void *)buffer, offset, size);
+    GGML_LOG_INFO("[%s] split: %d\n", __func__, split);
+    static bool set_split = false;
+    if(split&&!set_split) {
+        for(int id=0;id<ggml_backend_rpc_get_device_count();++id){
+            auto dev_ctx = (ggml_backend_rpc_device_context *)reg_ctx->devices[id]->context;
+            rpc_msg_set_split_rsp response;
+            GGML_LOG_INFO("[%s] setting split for device %d, endpoint=%s\n", __func__, id, dev_ctx->endpoint.c_str());
+            bool status = send_rpc_cmd(get_socket(dev_ctx->endpoint), RPC_CMD_SET_SPLIT, NULL, 0, &response, sizeof(response));
+            GGML_ASSERT(status);
+        }
+        set_split = true;
+        }
+
     const size_t nb1 = tensor->nb[1];
     ggml_tensor_extra_rpc * extra=(ggml_tensor_extra_rpc*)tensor->extra;
     for (int id = 0; id < ggml_backend_rpc_get_device_count(); ++id) {
@@ -1496,7 +1496,10 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                         std::unordered_set<ggml_tensor*> visited_id = visited;
                         add_tensor_part(cgraph->nodes[count_nodes], tensors_id, tensor_extras, visited_id, true, id);
 
-                        
+                        for(int i=0;i<tensors_id.size();i++) {
+                            GGML_LOG_INFO("[%s] device %d, tensor %s\n",
+                                __func__, id, tensors_id[i].name);
+                        }
 
                         std::vector<uint8_t> input;
                         uint32_t n_nodes = count_nodes - count_nodes_low + 1;
@@ -2072,7 +2075,7 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
         }
         return result;
     } catch (const std::out_of_range & e) {
-        GGML_LOG_ERROR("[%s] tensor with not found in tensor_ptrs: %s\n", __func__ , e.what());
+        GGML_LOG_ERROR("[%s] tensor %d with not found in tensor_ptrs: %s\n", __func__ , id, e.what());
         return nullptr;
     }
 }
@@ -2109,6 +2112,10 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, rpc_msg_graph
     std::unordered_map<uint64_t, const rpc_tensor*> tensor_ptrs;
     for (uint32_t i = 0; i < n_tensors; i++) {
         tensor_ptrs[tensors[i].id] = &tensors[i];
+    }
+    for(int i=0; i < tensor_ptrs.size(); i++) {
+        GGML_LOG_INFO("tensor %d id: %lu, name: %s\n",
+            i, tensor_ptrs.begin()->second->id, tensor_ptrs.begin()->second->name);
     }
     std::unordered_map<uint64_t, ggml_tensor*> tensor_map;
     for (uint32_t i = 0; i < n_nodes; i++) {
