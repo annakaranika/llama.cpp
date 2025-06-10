@@ -1365,13 +1365,10 @@ static void add_tensor_part(ggml_tensor * tensor, std::vector<rpc_tensor> & tens
     if (tensor == nullptr || visited.count(tensor)) {
         return;
     }
-    visited.insert(tensor);
-    tensors.push_back(serialize_tensor(tensor));
-    tensor_extras.push_back((ggml_tensor_extra_rpc*)tensor->extra);
     
     //change the dimensions of the tensor
     // GGML_LOG_INFO("[%s] split tensor %s on device %d\n", __func__, tensor->name, id);
-    rpc_tensor & rpc_t = tensors.back();
+    // rpc_tensor & rpc_t = tensors.back();
     
 
 
@@ -1390,16 +1387,20 @@ static void add_tensor_part(ggml_tensor * tensor, std::vector<rpc_tensor> & tens
         }
     }
 
+    visited.insert(tensor);
+    tensors.push_back(serialize_tensor(tensor));
+    tensor_extras.push_back((ggml_tensor_extra_rpc*)tensor->extra);
+
     if(split_){
         auto extra = (ggml_tensor_extra_rpc*)tensor->src[0]->extra;
-        rpc_t.ne[0] = extra->rows[id].second - extra->rows[id].first;
+        tensors.back().ne[0] = extra->rows[id].second - extra->rows[id].first;
         GGML_LOG_INFO("for tensor %s, ne0: %d ne1: %d ne2: %d ne3: %d \n",
-            tensor->name,rpc_t.ne[0],rpc_t.ne[1],rpc_t.ne[2],rpc_t.ne[3]);
+            tensors.back().name,tensors.back().ne[0],tensors.back().ne[1],tensors.back().ne[2],tensors.back().ne[3]);
         
-        rpc_t.nb[0] = ggml_type_size(tensor->type);
-        rpc_t.nb[1] = ggml_row_size(tensor->type, rpc_t.ne[0]);
-        rpc_t.nb[2] = rpc_t.ne[1] * rpc_t.nb[1];
-        rpc_t.nb[3] = rpc_t.ne[2] * rpc_t.nb[2];
+        tensors.back().nb[0] = ggml_type_size(tensor->type);
+        tensors.back().nb[1] = ggml_row_size(tensor->type, tensors.back().ne[0]);
+        tensors.back().nb[2] = tensors.back().ne[1] * tensors.back().nb[1];
+        tensors.back().nb[3] = tensors.back().ne[2] * tensors.back().nb[2];
     }
 
     if (tensor->view_src && visited.count(tensor->view_src) == 0) {
@@ -1508,6 +1509,12 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
 
                         }
                         std::unordered_set<ggml_tensor*> visited_id = visited;
+                        for(int i=0;i<tensors_id.size();i++) {
+                                GGML_LOG_INFO("[%s] device %d, tensor %s, ne0: %d, ne1: %d, ne2: %d, ne3: %d\n",
+                                    __func__, id, tensors_id[i].name,
+                                    tensors_id[i].ne[0], tensors_id[i].ne[1],
+                                    tensors_id[i].ne[2], tensors_id[i].ne[3]);
+                        }
                         add_tensor_part(cgraph->nodes[count_nodes], tensors_id, tensor_extras, visited_id, true, id);
 
                         for(int i=0;i<tensors_id.size();i++) {
@@ -2075,6 +2082,7 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
                     i,src_result->ne[0],src_result->ne[1],src_result->ne[2],src_result->ne[3],src_result->nb[0],src_result->nb[1],src_result->nb[2],src_result->nb[4]);
             }
             uint64_t src_id=tensor->view_src;
+            GGML_LOG_INFO("view_src id: %d\n", src_id);
             if (src_id == 0) {
                 result->view_src = nullptr;
                 result->view_offs = tensor->view_offs;
