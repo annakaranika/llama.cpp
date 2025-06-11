@@ -1030,12 +1030,12 @@ static void ggml_backend_rpc_split_buffer_set_tensor(ggml_backend_buffer_t buffe
        }
 
         uint64_t tensor_size = (uint64_t) ggml_nbytes(result);
-        GGML_LOG_INFO("[%s] after serialization tensor %s on device %d, size=%" PRIu64 "\n", __func__, tensor->name, id, tensor_size);
+        // GGML_LOG_INFO("[%s] after serialization tensor %s on device %d, size=%" PRIu64 "\n", __func__, tensor->name, id, tensor_size);
 
         memcpy(input.data(), &rpc_tensor, sizeof(rpc_tensor));
         memcpy(input.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
         memcpy(input.data() + sizeof(rpc_tensor) + sizeof(offset), data+offset_split, split_size);
-        GGML_LOG_INFO("[%s] setting tensor %s on device %d, offset=%zu, size=%zu\n", __func__, tensor->name, id, offset_split, split_size);
+        // GGML_LOG_INFO("[%s] setting tensor %s on device %d, offset=%zu, size=%zu\n", __func__, tensor->name, id, offset_split, split_size);
         ggml_backend_rpc_device_context * dev_ctx= (ggml_backend_rpc_device_context *)reg_ctx->devices[id]->context;
         bool status = send_rpc_cmd(get_socket(dev_ctx->endpoint), RPC_CMD_SET_TENSOR, input.data(), input.size(), nullptr, 0);
         if(!status) {
@@ -1118,7 +1118,7 @@ static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_back
             ggml_backend_rpc_buffer_interface,
             new ggml_backend_rpc_buffer_context{sock, nullptr, response.remote_ptr},
             response.remote_size);
-        GGML_LOG_INFO("[%s] allocated buffer for size %zu, remote_ptr=%" PRIx64 ", remote_size=%" PRIu64 "\n", __func__, size, response.remote_ptr, response.remote_size);
+        // GGML_LOG_INFO("[%s] allocated buffer for size %zu, remote_ptr=%" PRIx64 ", remote_size=%" PRIu64 "\n", __func__, size, response.remote_ptr, response.remote_size);
         return buffer;
     } else {
         return nullptr;
@@ -1382,6 +1382,11 @@ static void add_tensor_part(ggml_tensor * tensor, std::vector<rpc_tensor> & tens
             }
             tensors.push_back(serialize_tensor(src));
             tensor_extras.push_back((ggml_tensor_extra_rpc*)src->extra);
+            if (src->view_src && visited.count(src->view_src) == 0) {
+                visited.insert(src->view_src);
+                tensors.push_back(serialize_tensor(src->view_src));
+                tensor_extras.push_back((ggml_tensor_extra_rpc*)src->view_src->extra);
+            }
         }
     }
 
@@ -1484,6 +1489,7 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                         add_tensor_part(node, tensors, tensor_extras, visited, false, -1);
                         if(count_nodes==cgraph->n_nodes-1) {
                             check_end = true;
+                            break;
                         }
                     }
                 }
@@ -1531,6 +1537,8 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                         
                         std::vector<uint8_t> input;
                         uint32_t n_nodes = count_nodes - count_nodes_low + 1;
+                        GGML_LOG_INFO("[%s] device %d, n_nodes=%d, count_nodes_low=%d, count_nodes=%d\n",
+                            __func__, id, n_nodes, count_nodes_low, count_nodes);
                         if (n_nodes == 0) return;
 
                         uint32_t n_tensors = tensors_id.size();
@@ -1565,6 +1573,8 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                             std::lock_guard<std::mutex> lock(rpc_mutex); // To avoid mixed output
                             fprintf(stderr, "RPC graph compute failed with status %d\n", response.result);
                             return;
+                        }else{
+                            GGML_LOG_INFO("[%s] device %d, graph compute successful\n", __func__, id);
                         }
 
                         if(!check_end) {
@@ -1626,6 +1636,7 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
             // }
 
         }
+        GGML_LOG_INFO("[%s] finished computing graph with %d nodes\n", __func__, cgraph->n_nodes);
     }else{
         std::vector<uint8_t> input;
         serialize_graph(cgraph, input);
@@ -2087,6 +2098,32 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
                 result->src[i] = src_result;
                 GGML_LOG_INFO("src %d ne0 :%d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d \n",
                     i,src_result->ne[0],src_result->ne[1],src_result->ne[2],src_result->ne[3],src_result->nb[0],src_result->nb[1],src_result->nb[2],src_result->nb[4]);
+
+                
+                src_id=src_tensor->view_src;
+                GGML_LOG_INFO("src view_src id: %d\n", src_id);
+                if (src_id == 0) {
+                    src_result->view_src = nullptr;
+                    src_result->view_offs = src_tensor->view_offs;
+                    GGML_LOG_INFO("src view_src is null, returning result\n");
+                }
+                if (tensor_map.find(src_id) != tensor_map.end()) {
+                    src_result->view_src=tensor_map[src_id];
+                    src_result->view_offs = src_tensor->view_offs;
+                    
+                }
+
+                const rpc_tensor * src_view_tensor = tensor_ptrs.at(src_id);
+                struct ggml_tensor * src_view_result = deserialize_tensor(ctx, src_view_tensor);
+                if (src_view_result == nullptr) {
+                    src_result->view_src=nullptr;
+                    src_result->view_offs = src_tensor->view_offs;
+                    GGML_LOG_INFO("src view_src is null, returning result\n");
+                }
+                tensor_map[src_id] = src_view_result;
+                src_result->view_src = src_view_result;
+                src_result->view_offs = src_tensor->view_offs;
+
             }
             uint64_t src_id=tensor->view_src;
             GGML_LOG_INFO("view_src id: %d\n", src_id);
