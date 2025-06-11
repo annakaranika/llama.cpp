@@ -7607,6 +7607,7 @@ UseGgmlGemm2:;
         if ((nr0 % 2 != 0) || (ne11 % 2 != 0) || ((ir0_end - ir0_start) % 2 != 0) || ((ir1_end - ir1_start) % 2 != 0)) {
             num_rows_per_vec_dot = 1;
         }
+
         ggml_compute_forward_mul_mat_one_chunk(params, dst, src0->type, num_rows_per_vec_dot, ir0_start, ir0_end, ir1_start, ir1_end);
 
         if (nth >= nchunk0 * nchunk1) {
@@ -12811,8 +12812,8 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
 
     // extra_buffer op?
     if (ggml_cpu_extra_compute_forward(params, tensor)) return;
-    
-    GGML_LOG_INFO("ggml_compute_forward: %s", ggml_op_name(tensor->op));
+
+    GGML_LOG_INFO("ggml_compute_forward: %s\n", ggml_op_name(tensor->op));
     switch (tensor->op) {
         case GGML_OP_DUP:
             {
@@ -13175,6 +13176,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 GGML_ABORT("fatal error");
             }
     }
+    GGML_LOG_INFO("ggml_compute_forward: %s done\n", ggml_op_name(tensor->op));
 }
 
 // Android's libc implementation "bionic" does not support setting affinity

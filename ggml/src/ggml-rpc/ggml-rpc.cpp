@@ -1869,7 +1869,9 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
         result->nb[i] = tensor->nb[i];
     }
     result->buffer = reinterpret_cast<ggml_backend_buffer_t>(tensor->buffer);
+    GGML_LOG_INFO("result->buffer: %p, tensor->buffer: %p\n", (void*)result->buffer, (void*)tensor->buffer);
     if (result->buffer && buffers.find(result->buffer) == buffers.end()) {
+        GGML_LOG_INFO("[%s] buffer not found: %p\n", __func__, (void*)result->buffer);
         result->buffer = nullptr;
     }
 
