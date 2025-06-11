@@ -13944,7 +13944,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     GGML_LOG_INFO("compute graph for each node\n");
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
-        GGML_LOG_INFO("compute node %d/%d: %s\n", node_n, cgraph->n_nodes, ggml_node_name(node));
+        GGML_LOG_INFO("compute node %d/%d: %s\n", node_n, cgraph->n_nodes, node->name);
         ggml_compute_forward(&params, node);
 
         if (state->ith == 0 && cplan->abort_callback &&
