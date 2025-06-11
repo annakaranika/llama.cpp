@@ -13924,6 +13924,7 @@ struct ggml_cplan ggml_graph_plan(
 }
 
 static thread_ret_t ggml_graph_compute_thread(void * data) {
+    GGML_LOG_INFO("ggml_graph_compute_thread: thread %d started\n", ((struct ggml_compute_state *)data)->ith);
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
     struct ggml_threadpool    * tp    = state->threadpool;
 
@@ -13940,6 +13941,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         /*.threadpool=*/ tp,
     };
 
+    GGML_LOG_INFO("compute graph for each node\n");
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
@@ -13955,7 +13957,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             ggml_barrier(state->threadpool);
         }
     }
-
+    GGML_LOG_INFO("ggml_graph_compute_thread: thread %d finished\n", state->ith);
     ggml_barrier(state->threadpool);
 
     return 0;
@@ -14180,6 +14182,7 @@ struct ggml_threadpool * ggml_threadpool_new(struct ggml_threadpool_params * tpp
 }
 
 enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
+    GGML_LOG_INFO("CPU_INIT\n");
     ggml_cpu_init();
 
     GGML_ASSERT(cplan);
@@ -14192,7 +14195,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     bool disposable_threadpool = false;
 
     if (threadpool == NULL) {
-        //GGML_PRINT_DEBUG("Threadpool is not specified. Will create a disposable threadpool : n_threads %d\n", n_threads);
+        GGML_LOG_INFO("Threadpool is not specified. Will create a disposable threadpool : n_threads %d\n", n_threads);
         disposable_threadpool = true;
 
         struct ggml_threadpool_params ttp = ggml_threadpool_params_default(n_threads);
@@ -14226,14 +14229,16 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     }
 #else
     if (n_threads > threadpool->n_threads_max) {
-        GGML_LOG_WARN("cplan requested more threads (%d) than available (%d)\n", n_threads, threadpool->n_threads_max);
+        GGML_LOG_INFO("cplan requested more threads (%d) than available (%d)\n", n_threads, threadpool->n_threads_max);
         n_threads = threadpool->n_threads_max;
     }
 
     // Kick all threads to start the new graph
+    GGML_LOG_INFO("threadpool: kill n_threads %d\n", n_threads);
     ggml_graph_compute_kickoff(threadpool, n_threads);
 
     // This is a work thread too
+    GGML_LOG_INFO("threadpool: main thread %lx\n", pthread_self());
     ggml_graph_compute_thread(&threadpool->workers[0]);
 #endif
 
