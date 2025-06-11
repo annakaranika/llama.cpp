@@ -12811,7 +12811,8 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
 
     // extra_buffer op?
     if (ggml_cpu_extra_compute_forward(params, tensor)) return;
-
+    
+    GGML_LOG_INFO("ggml_compute_forward: %s", ggml_op_name(tensor->op));
     switch (tensor->op) {
         case GGML_OP_DUP:
             {
@@ -13946,7 +13947,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
         GGML_LOG_INFO("compute node %d/%d: %s\n", node_n, cgraph->n_nodes, node->name);
         ggml_compute_forward(&params, node);
-
+        GGML_LOG_INFO("compute node %d/%d: %s done\n", node_n, cgraph->n_nodes, node->name);
         if (state->ith == 0 && cplan->abort_callback &&
                 cplan->abort_callback(cplan->abort_callback_data)) {
             atomic_store_explicit(&tp->abort, node_n + 1, memory_order_relaxed);
@@ -13954,6 +13955,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         }
 
         if (node_n + 1 < cgraph->n_nodes) {
+            GGML_LOG_INFO("ggml_graph_compute_thread: thread %d waiting for other threads to finish node %d/%d\n", state->ith, node_n + 1, cgraph->n_nodes);
             ggml_barrier(state->threadpool);
         }
     }
