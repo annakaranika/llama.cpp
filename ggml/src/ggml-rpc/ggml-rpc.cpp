@@ -1637,6 +1637,7 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
 
         }
         GGML_LOG_INFO("[%s] finished computing graph with %d nodes\n", __func__, cgraph->n_nodes);
+        return GGML_STATUS_SUCCESS;
     }else{
         std::vector<uint8_t> input;
         serialize_graph(cgraph, input);
