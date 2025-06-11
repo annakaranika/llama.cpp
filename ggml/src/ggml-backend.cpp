@@ -273,6 +273,7 @@ void ggml_backend_tensor_get(const struct ggml_tensor * tensor, void * data, siz
     if (size == 0) {
         return;
     }
+    // GGML_LOG_INFO("%s: ggml_backend_tensor_get: tensor %s, offset %zu, size %zu\n", __func__, tensor->name, offset, size);
 
     GGML_ASSERT(buf != NULL && "tensor buffer not set");
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
@@ -323,7 +324,9 @@ enum ggml_status ggml_backend_graph_plan_compute(ggml_backend_t backend, ggml_ba
 }
 
 enum ggml_status ggml_backend_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+    GGML_LOG_INFO("%s: ggml_backend_graph_compute: %s\n", __func__, ggml_backend_name(backend));
     enum ggml_status err = ggml_backend_graph_compute_async(backend, cgraph);
+    GGML_LOG_INFO("%s: ggml_backend_graph_compute: %s done\n", __func__, ggml_backend_name(backend));
     ggml_backend_synchronize(backend);
     return err;
 }
@@ -712,7 +715,7 @@ static int ggml_backend_sched_backend_from_buffer(ggml_backend_sched_t sched, co
     return -1;
 }
 
-#if 0
+#if 1
 #define GGML_SCHED_MAX_SPLITS_DEBUG 4096
 static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS_DEBUG*GGML_SCHED_MAX_SPLIT_INPUTS][128]; // debug only
 #define SET_CAUSE(node, ...) sprintf(causes[hash_id(node)], __VA_ARGS__)
@@ -725,6 +728,8 @@ static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS_DEBUG*GGML
 // returns the backend that should be used for the node based on the current locations
 static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, struct ggml_tensor * tensor) {
     // assign pre-allocated nodes to their backend
+    // GGML_LOG_INFO("%s: ggml_backend_sched_backend_id_from_cur: %s, tensor->buffer = %p, tensor->view_src = %p\n",
+        // __func__, tensor->name, tensor->buffer, tensor->view_src);
     int cur_backend_id = ggml_backend_sched_backend_from_buffer(sched, tensor, tensor);
     if (cur_backend_id != -1) {
         SET_CAUSE(tensor, "1.dst");
@@ -1360,6 +1365,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // copy the input tensors to the split backend
         for (int j = 0; j < split->n_inputs; j++) {
+            GGML_LOG_INFO("%s: split %d/%d, backend %s, input %d/%d: %s",
+                __func__, i + 1, sched->n_splits, ggml_backend_name(split_backend), j + 1, split->n_inputs,
+                split->inputs[j]->name);
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[j]);
             struct ggml_tensor * input = split->inputs[j];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
@@ -1392,8 +1400,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
             }
         }
-
+        // GGML_LOG_INFO("%s: graph compute",__func__);
         if (!sched->callback_eval) {
+            GGML_LOG_INFO("ggml_backend_sched_compute_splits: no callback_eval set, using ggml_backend_graph_compute_async");
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
