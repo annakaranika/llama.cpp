@@ -13944,7 +13944,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     GGML_LOG_INFO("compute graph for each node\n");
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
-
+        GGML_LOG_INFO("compute node %d/%d: %s\n", node_n, cgraph->n_nodes, ggml_node_name(node));
         ggml_compute_forward(&params, node);
 
         if (state->ith == 0 && cplan->abort_callback &&
@@ -14046,7 +14046,7 @@ static thread_ret_t ggml_graph_compute_secondary_thread(void* data) {
     if (ggml_thread_cpumask_is_valid(state->cpumask)) {
         ggml_thread_apply_affinity(state->cpumask);
     }
-
+    GGML_LOG_INFO("ggml_graph_compute_secondary_thread: thread %d started\n", state->ith);
     while (true) {
         // Check if we need to sleep
         while (threadpool->pause) {
@@ -14064,11 +14064,12 @@ static thread_ret_t ggml_graph_compute_secondary_thread(void* data) {
 
         // Check if there is new work
         // The main thread is the only one that can dispatch new work
+        GGML_LOG_INFO("thread #%d: checking for work\n", state->ith);
 
         ggml_graph_compute_check_for_work(state);
         if (state->pending) {
             state->pending = false;
-
+            GGML_LOG_INFO("thread #%d: new graph/work available\n", state->ith);
             ggml_graph_compute_thread(state);
         }
     }
@@ -14148,6 +14149,7 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
     threadpool->workers = workers;
 
 #ifndef GGML_USE_OPENMP
+    GGML_LOG_INFO("GGML_USE_OPENMP is not defined, using pthreads\n");
     ggml_mutex_init(&threadpool->mutex);
     ggml_cond_init(&threadpool->cond);
 
@@ -14209,8 +14211,11 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         threadpool->abort            = -1;
         threadpool->ec               = GGML_STATUS_SUCCESS;
     }
+    GGML_LOG_INFO("threadpool: n_threads %d, n_threads_max %d, work_size %zu\n",
+            n_threads, threadpool->n_threads_max, cplan->work_size);
 
 #ifdef GGML_USE_OPENMP
+    GGML_LOG_INFO("threadpool: using OpenMP\n");
     if (n_threads > 1) {
         #pragma omp parallel num_threads(n_threads)
         {
