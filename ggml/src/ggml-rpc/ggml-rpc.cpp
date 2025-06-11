@@ -2106,10 +2106,12 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
                     src_result->view_src = nullptr;
                     src_result->view_offs = src_tensor->view_offs;
                     GGML_LOG_INFO("src view_src is null, returning result\n");
+                    continue;
                 }
                 if (tensor_map.find(src_id) != tensor_map.end()) {
                     src_result->view_src=tensor_map[src_id];
                     src_result->view_offs = src_tensor->view_offs;
+                    continue;
                     
                 }
 
@@ -2119,6 +2121,7 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
                     src_result->view_src=nullptr;
                     src_result->view_offs = src_tensor->view_offs;
                     GGML_LOG_INFO("src view_src is null, returning result\n");
+                    continue;
                 }
                 tensor_map[src_id] = src_view_result;
                 src_result->view_src = src_view_result;
