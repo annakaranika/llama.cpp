@@ -1527,7 +1527,7 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                 }
                 std::vector<uint8_t> data;
                 ggml_tensor* tensor= cgraph->nodes[count_nodes];
-                data.reserve(ggml_nbytes(tensor)); 
+                data.resize(ggml_nbytes(tensor)); 
                 
                 //compute concurrently
                 std::mutex rpc_mutex; 
@@ -1612,16 +1612,16 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                         if(!check_end) {
                             ggml_tensor_extra_rpc* extra = (ggml_tensor_extra_rpc*)tensor->src[0]->extra;
                             ggml_tensor_extra_rpc* extra_ = (ggml_tensor_extra_rpc*)tensor->extra;
-                            int64_t row_low = extra->rows[id].first;
-                            int64_t row_high = extra->rows[id].second;
+                            int64_t column_low = extra->rows[id].first;
+                            int64_t column_high = extra->rows[id].second;
 
-                            int64_t nrows_split = row_high - row_low;
-                            if (nrows_split == 0) return;
+                            int64_t ncol_split = column_high - column_low;
+                            if (ncol_split == 0) return;
 
                             // GGML_LOG_INFO("[%s] device %d, tensor %s, nrows_split=%" PRId64 ", offset=%d, size=%d\n",
                             //     __func__, id, tensor->name, nrows_split, row_low * tensor->nb[0] * tensor->ne[1], nrows_split*ggml_row_size(tensor->type, tensor->ne[1]));
-                            size_t offset_split = row_low * tensor->nb[0] * tensor->ne[1];
-                            size_t split_size = nrows_split*ggml_row_size(tensor->type, tensor->ne[1]);
+                            size_t offset_split = column_low * tensor->nb[0] * tensor->ne[1];
+                            size_t split_size = ncol_split*ggml_row_size(tensor->type, tensor->ne[1]);
 
                             rpc_msg_get_tensor_req request;
 
@@ -1643,11 +1643,19 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                             request.offset = 0;
                             request.size = split_size;
 
+                            std::vector<uint8_t> curr_data;
+                            curr_data.resize(split_size);
+
                             status = send_rpc_cmd(get_socket(dev_ctx->endpoint),
                                                 RPC_CMD_GET_TENSOR,
                                                 &request, sizeof(request),
-                                                data.data() + offset_split, split_size);
+                                                curr_data.data(), split_size);
                             GGML_ASSERT(status);
+
+                            for(int row=0;row<request.tensor.ne[1];row++){
+                                size_t offset=row * tensor->nb[1] + column_low * tensor->nb[0];
+                                memcpy(data.data() + offset, curr_data.data() + row * request.tensor.nb[1], request.tensor.nb[1]);
+                            }
                         }
                     });
                 }
