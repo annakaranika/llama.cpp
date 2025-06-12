@@ -1034,7 +1034,7 @@ static void ggml_backend_rpc_split_buffer_set_tensor(ggml_backend_buffer_t buffe
 
         memcpy(input.data(), &rpc_tensor, sizeof(rpc_tensor));
         memcpy(input.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
-        memcpy(input.data() + sizeof(rpc_tensor) + sizeof(offset), data+offset_split, split_size);
+        memcpy(input.data() + sizeof(rpc_tensor) + sizeof(offset), ((const char*)data)+offset_split, split_size);
         // GGML_LOG_INFO("[%s] setting tensor %s on device %d, offset=%zu, size=%zu\n", __func__, tensor->name, id, offset_split, split_size);
         ggml_backend_rpc_device_context * dev_ctx= (ggml_backend_rpc_device_context *)reg_ctx->devices[id]->context;
         bool status = send_rpc_cmd(get_socket(dev_ctx->endpoint), RPC_CMD_SET_TENSOR, input.data(), input.size(), nullptr, 0);
@@ -1067,7 +1067,7 @@ static void ggml_backend_rpc_split_buffer_get_tensor(ggml_backend_buffer_t buffe
         request.offset = offset;
         request.size = split_size;
         ggml_backend_rpc_device_context * dev_ctx= (ggml_backend_rpc_device_context *)reg_ctx->devices[id]->context;
-        bool status = send_rpc_cmd(get_socket(dev_ctx->endpoint), RPC_CMD_GET_TENSOR, &request, sizeof(request), data+offset_split, split_size);
+        bool status = send_rpc_cmd(get_socket(dev_ctx->endpoint), RPC_CMD_GET_TENSOR, &request, sizeof(request), (char *)data+offset_split, split_size);
         GGML_ASSERT(status);
     }
 }
@@ -1294,7 +1294,7 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_split_buffer_type(int main_de
         auto dev_ctx= (ggml_backend_rpc_device_context *)reg_ctx->devices[i]->context;
         auto sock = get_socket(dev_ctx->endpoint);
         if (sock == nullptr) {
-            fprintf(stderr, "Failed to connect to %s\n", dev_ctx->endpoint);
+            fprintf(stderr, "Failed to connect to %s\n", dev_ctx->endpoint.c_str());
             return nullptr;
         }
         alignment = std::max(get_alignment(sock),alignment);
@@ -1501,12 +1501,12 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                 for (; count_nodes < cgraph->n_nodes; count_nodes++) {
                     ggml_tensor * node = cgraph->nodes[count_nodes];
                     // GGML_LOG_INFO("\ntensor %s ne0 :%d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d \n",
-                    //     node->name,node->ne[0],node->ne[1],node->ne[2],node->ne[3],node->nb[0],node->nb[1],node->nb[2],node->nb[4]);
+                    //     node->name,node->ne[0],node->ne[1],node->ne[2],node->ne[3],node->nb[0],node->nb[1],node->nb[2],node->nb[3]);
                     // for(int i=0;i<GGML_MAX_SRC;i++){
                     //     ggml_tensor* src=node->src[i];
                     //     if(src){
                     //         GGML_LOG_INFO("src %d ne0 :%d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d \n",
-                    //             i,src->ne[0],src->ne[1],src->ne[2],src->ne[3],src->nb[0],src->nb[1],src->nb[2],src->nb[4]);
+                    //             i,src->ne[0],src->ne[1],src->ne[2],src->ne[3],src->nb[0],src->nb[1],src->nb[2],src->nb[3]);
                     //     }
                     // }
                     if(!ggml_is_empty(node) && node->src[0] != nullptr 
@@ -2106,11 +2106,11 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
         const rpc_tensor * tensor = tensor_ptrs.at(id);
         GGML_LOG_INFO("create node with tensor: %s, ne0: %d, ne1: %d, ne2: %d, ne3: %d, nb0: %d, nb1: %d, nb2: %d, nb3: %d\n",
                 tensor->name, tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3],
-                tensor->nb[0], tensor->nb[1], tensor->nb[2], tensor->nb[4]);
+                tensor->nb[0], tensor->nb[1], tensor->nb[2], tensor->nb[3]);
     
         struct ggml_tensor * result = deserialize_tensor(ctx, tensor);
         GGML_LOG_INFO("tensor %s ne0 :%d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d ",
-                    result->name,result->ne[0],result->ne[1],result->ne[2],result->ne[3],result->nb[0],result->nb[1],result->nb[2],result->nb[4]);
+                    result->name,result->ne[0],result->ne[1],result->ne[2],result->ne[3],result->nb[0],result->nb[1],result->nb[2],result->nb[3]);
         GGML_LOG_INFO("create node with tensor: %s\n",result->name);
         if (result == nullptr) {
             return nullptr;
@@ -2128,7 +2128,7 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
                 if (tensor_map.find(src_id) != tensor_map.end()) {
                     result->src[i]=tensor_map[src_id];
                     GGML_LOG_INFO("src %d ne0 :%d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d\n",
-                        i,result->src[i]->ne[0],result->src[i]->ne[1],result->src[i]->ne[2],result->src[i]->ne[3],result->src[i]->nb[0],result->src[i]->nb[1],result->src[i]->nb[2],result->src[i]->nb[4]);
+                        i,result->src[i]->ne[0],result->src[i]->ne[1],result->src[i]->ne[2],result->src[i]->ne[3],result->src[i]->nb[0],result->src[i]->nb[1],result->src[i]->nb[2],result->src[i]->nb[3]);
                     continue;
                 }
                 const rpc_tensor * src_tensor = tensor_ptrs.at(src_id);
@@ -2140,7 +2140,7 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
                 tensor_map[src_id] = src_result;
                 result->src[i] = src_result;
                 GGML_LOG_INFO("src %d ne0 :%d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d \n",
-                    i,src_result->ne[0],src_result->ne[1],src_result->ne[2],src_result->ne[3],src_result->nb[0],src_result->nb[1],src_result->nb[2],src_result->nb[4]);
+                    i,src_result->ne[0],src_result->ne[1],src_result->ne[2],src_result->ne[3],src_result->nb[0],src_result->nb[1],src_result->nb[2],src_result->nb[3]);
 
                 
                 src_id=src_tensor->view_src;
@@ -2183,7 +2183,7 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
                 result->view_src=tensor_map[src_id];
                 result->view_offs = tensor->view_offs;
                 GGML_LOG_INFO("view_src ne0 :%d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d\n",
-                    result->view_src->ne[0],result->view_src->ne[1],result->view_src->ne[2],result->view_src->ne[3],result->view_src->nb[0],result->view_src->nb[1],result->view_src->nb[2],result->view_src->nb[4]);
+                    result->view_src->ne[0],result->view_src->ne[1],result->view_src->ne[2],result->view_src->ne[3],result->view_src->nb[0],result->view_src->nb[1],result->view_src->nb[2],result->view_src->nb[3]);
                 return result;
             }
 
@@ -2200,7 +2200,7 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
             result->view_src = src_result;
             result->view_offs = tensor->view_offs;
             GGML_LOG_INFO("view_src ne0 :%d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d\n",
-                result->view_src->ne[0],result->view_src->ne[1],result->view_src->ne[2],result->view_src->ne[3],result->view_src->nb[0],result->view_src->nb[1],result->view_src->nb[2],result->view_src->nb[4]);
+                result->view_src->ne[0],result->view_src->ne[1],result->view_src->ne[2],result->view_src->ne[3],result->view_src->nb[0],result->view_src->nb[1],result->view_src->nb[2],result->view_src->nb[3]);
         }else{
             for (int i = 0; i < GGML_MAX_SRC; i++) {
                 result->src[i] = create_node(tensor->src[i], ctx, tensor_ptrs, tensor_map);
@@ -2212,7 +2212,7 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
         
         return result;
     } catch (const std::exception & e) {
-        GGML_LOG_ERROR("[%s] tensor %d with not found in tensor_ptrs: %s\n", __func__ , id, e.what());
+        GGML_LOG_ERROR("[%s] tensor %llu with not found in tensor_ptrs: %s\n", __func__ , id, e.what());
         return nullptr;
     }
 }
