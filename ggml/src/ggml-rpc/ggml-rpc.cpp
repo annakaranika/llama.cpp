@@ -1806,10 +1806,10 @@ void rpc_server::alloc_buffer(const rpc_msg_alloc_buffer_req & request, rpc_msg_
     if (buffer != nullptr) {
         response.remote_ptr = reinterpret_cast<uint64_t>(buffer);
         response.remote_size = buffer->size;
-        GGML_PRINT_DEBUG("[%s] size: %" PRIu64 " -> remote_ptr: %" PRIx64 ", remote_size: %" PRIu64 "\n", __func__, request.size, response.remote_ptr, response.remote_size);
+        GGML_LOG_INFO("[%s] size: %" PRIu64 " -> remote_ptr: %" PRIx64 ", remote_size: %" PRIu64 "\n", __func__, request.size, response.remote_ptr, response.remote_size);
         buffers.insert(buffer);
     } else {
-        GGML_LOG_ERROR("[%s] size: %" PRIu64 " -> failed\n", __func__, request.size);
+        GGML_LOG_INFO("[%s] size: %" PRIu64 " -> failed\n", __func__, request.size);
     }
 }
 
@@ -1900,7 +1900,7 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
 
 bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
     // serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes) |
-    GGML_LOG_INFO("SET_TENSOR");
+    // GGML_LOG_INFO("SET_TENSOR");
     if (input.size() < sizeof(rpc_tensor) + sizeof(uint64_t)) {
         GGML_LOG_INFO("[%s] input size too small: %zu\n", __func__, input.size());
         return false;
@@ -1916,7 +1916,7 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
         /*.no_alloc   =*/ true,
     };
     struct ggml_context * ctx = ggml_init(params);
-    GGML_LOG_INFO("[%s] offset: %" PRIu64 ", size: %zu\n", __func__, offset, size);
+    // GGML_LOG_INFO("[%s] offset: %" PRIu64 ", size: %zu\n", __func__, offset, size);
     ggml_tensor * tensor = deserialize_tensor(ctx, in_tensor);
     if (tensor == nullptr) {
         GGML_LOG_INFO("[%s] error deserializing tensor\n", __func__);
