@@ -324,9 +324,9 @@ enum ggml_status ggml_backend_graph_plan_compute(ggml_backend_t backend, ggml_ba
 }
 
 enum ggml_status ggml_backend_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
-    GGML_LOG_INFO("%s: ggml_backend_graph_compute: %s\n", __func__, ggml_backend_name(backend));
+    // GGML_LOG_INFO("%s: ggml_backend_graph_compute: %s\n", __func__, ggml_backend_name(backend));
     enum ggml_status err = ggml_backend_graph_compute_async(backend, cgraph);
-    GGML_LOG_INFO("%s: ggml_backend_graph_compute: %s done\n", __func__, ggml_backend_name(backend));
+    // GGML_LOG_INFO("%s: ggml_backend_graph_compute: %s done\n", __func__, ggml_backend_name(backend));
     ggml_backend_synchronize(backend);
     return err;
 }
@@ -1365,9 +1365,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // copy the input tensors to the split backend
         for (int j = 0; j < split->n_inputs; j++) {
-            GGML_LOG_INFO("%s: split %d/%d, backend %s, input %d/%d: %s",
-                __func__, i + 1, sched->n_splits, ggml_backend_name(split_backend), j + 1, split->n_inputs,
-                split->inputs[j]->name);
+            // GGML_LOG_INFO("%s: split %d/%d, backend %s, input %d/%d: %s",
+                // __func__, i + 1, sched->n_splits, ggml_backend_name(split_backend), j + 1, split->n_inputs,
+                // split->inputs[j]->name);
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[j]);
             struct ggml_tensor * input = split->inputs[j];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
@@ -1402,7 +1402,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
         // GGML_LOG_INFO("%s: graph compute",__func__);
         if (!sched->callback_eval) {
-            GGML_LOG_INFO("ggml_backend_sched_compute_splits: no callback_eval set, using ggml_backend_graph_compute_async");
+            // GGML_LOG_INFO("ggml_backend_sched_compute_splits: no callback_eval set, using ggml_backend_graph_compute_async");
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;

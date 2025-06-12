@@ -141,9 +141,9 @@ static enum ggml_status ggml_backend_cpu_graph_plan_compute(ggml_backend_t backe
 static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
 
-    GGML_LOG_INFO("%s: GRAPH PLAN\n", __func__);
+    // GGML_LOG_INFO("%s: GRAPH PLAN\n", __func__);
     struct ggml_cplan cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, cpu_ctx->threadpool);
-    GGML_LOG_INFO("%s: GRAPH PLAN DONE\n", __func__);
+    // GGML_LOG_INFO("%s: GRAPH PLAN DONE\n", __func__);
 
     if (cpu_ctx->work_size < cplan.work_size) {
         delete[] cpu_ctx->work_data;
@@ -159,7 +159,7 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
     cplan.abort_callback      = cpu_ctx->abort_callback;
     cplan.abort_callback_data = cpu_ctx->abort_callback_data;
     
-    GGML_LOG_INFO("%s: GRAPH COMPUTE\n", __func__);
+    // GGML_LOG_INFO("%s: GRAPH COMPUTE\n", __func__);
     return ggml_graph_compute(cgraph, &cplan);
 }
 

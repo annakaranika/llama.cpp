@@ -12813,7 +12813,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
     // extra_buffer op?
     if (ggml_cpu_extra_compute_forward(params, tensor)) return;
 
-    GGML_LOG_INFO("ggml_compute_forward: %s\n", ggml_op_name(tensor->op));
+    //GGML_LOG_INFO("ggml_compute_forward: %s\n", ggml_op_name(tensor->op));
     switch (tensor->op) {
         case GGML_OP_DUP:
             {
@@ -13176,7 +13176,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 GGML_ABORT("fatal error");
             }
     }
-    GGML_LOG_INFO("ggml_compute_forward: %s done\n", ggml_op_name(tensor->op));
+    //GGML_LOG_INFO("ggml_compute_forward: %s done\n", ggml_op_name(tensor->op));
 }
 
 // Android's libc implementation "bionic" does not support setting affinity
@@ -13927,7 +13927,7 @@ struct ggml_cplan ggml_graph_plan(
 }
 
 static thread_ret_t ggml_graph_compute_thread(void * data) {
-    GGML_LOG_INFO("ggml_graph_compute_thread: thread %d started\n", ((struct ggml_compute_state *)data)->ith);
+    //GGML_LOG_INFO("ggml_graph_compute_thread: thread %d started\n", ((struct ggml_compute_state *)data)->ith);
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
     struct ggml_threadpool    * tp    = state->threadpool;
 
@@ -13944,12 +13944,12 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         /*.threadpool=*/ tp,
     };
 
-    GGML_LOG_INFO("compute graph for each node\n");
+    //GGML_LOG_INFO("compute graph for each node\n");
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
-        GGML_LOG_INFO("compute node %d/%d: %s\n", node_n, cgraph->n_nodes, node->name);
+        //GGML_LOG_INFO("compute node %d/%d: %s\n", node_n, cgraph->n_nodes, node->name);
         ggml_compute_forward(&params, node);
-        GGML_LOG_INFO("compute node %d/%d: %s done\n", node_n, cgraph->n_nodes, node->name);
+        //GGML_LOG_INFO("compute node %d/%d: %s done\n", node_n, cgraph->n_nodes, node->name);
         if (state->ith == 0 && cplan->abort_callback &&
                 cplan->abort_callback(cplan->abort_callback_data)) {
             atomic_store_explicit(&tp->abort, node_n + 1, memory_order_relaxed);
@@ -13957,11 +13957,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         }
 
         if (node_n + 1 < cgraph->n_nodes) {
-            GGML_LOG_INFO("ggml_graph_compute_thread: thread %d waiting for other threads to finish node %d/%d\n", state->ith, node_n + 1, cgraph->n_nodes);
+            //GGML_LOG_INFO("ggml_graph_compute_thread: thread %d waiting for other threads to finish node %d/%d\n", state->ith, node_n + 1, cgraph->n_nodes);
             ggml_barrier(state->threadpool);
         }
     }
-    GGML_LOG_INFO("ggml_graph_compute_thread: thread %d finished\n", state->ith);
+    //GGML_LOG_INFO("ggml_graph_compute_thread: thread %d finished\n", state->ith);
     ggml_barrier(state->threadpool);
 
     return 0;
@@ -14050,7 +14050,7 @@ static thread_ret_t ggml_graph_compute_secondary_thread(void* data) {
     if (ggml_thread_cpumask_is_valid(state->cpumask)) {
         ggml_thread_apply_affinity(state->cpumask);
     }
-    GGML_LOG_INFO("ggml_graph_compute_secondary_thread: thread %d started\n", state->ith);
+    //GGML_LOG_INFO("ggml_graph_compute_secondary_thread: thread %d started\n", state->ith);
     while (true) {
         // Check if we need to sleep
         while (threadpool->pause) {
@@ -14068,12 +14068,12 @@ static thread_ret_t ggml_graph_compute_secondary_thread(void* data) {
 
         // Check if there is new work
         // The main thread is the only one that can dispatch new work
-        GGML_LOG_INFO("thread #%d: checking for work\n", state->ith);
+        //GGML_LOG_INFO("thread #%d: checking for work\n", state->ith);
 
         ggml_graph_compute_check_for_work(state);
         if (state->pending) {
             state->pending = false;
-            GGML_LOG_INFO("thread #%d: new graph/work available\n", state->ith);
+            //GGML_LOG_INFO("thread #%d: new graph/work available\n", state->ith);
             ggml_graph_compute_thread(state);
         }
     }
@@ -14153,7 +14153,7 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
     threadpool->workers = workers;
 
 #ifndef GGML_USE_OPENMP
-    GGML_LOG_INFO("GGML_USE_OPENMP is not defined, using pthreads\n");
+    //GGML_LOG_INFO("GGML_USE_OPENMP is not defined, using pthreads\n");
     ggml_mutex_init(&threadpool->mutex);
     ggml_cond_init(&threadpool->cond);
 
@@ -14188,7 +14188,7 @@ struct ggml_threadpool * ggml_threadpool_new(struct ggml_threadpool_params * tpp
 }
 
 enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
-    GGML_LOG_INFO("CPU_INIT\n");
+    //GGML_LOG_INFO("CPU_INIT\n");
     ggml_cpu_init();
 
     GGML_ASSERT(cplan);
@@ -14201,7 +14201,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     bool disposable_threadpool = false;
 
     if (threadpool == NULL) {
-        GGML_LOG_INFO("Threadpool is not specified. Will create a disposable threadpool : n_threads %d\n", n_threads);
+        //GGML_LOG_INFO("Threadpool is not specified. Will create a disposable threadpool : n_threads %d\n", n_threads);
         disposable_threadpool = true;
 
         struct ggml_threadpool_params ttp = ggml_threadpool_params_default(n_threads);
@@ -14215,11 +14215,11 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         threadpool->abort            = -1;
         threadpool->ec               = GGML_STATUS_SUCCESS;
     }
-    GGML_LOG_INFO("threadpool: n_threads %d, n_threads_max %d, work_size %zu\n",
-            n_threads, threadpool->n_threads_max, cplan->work_size);
+    //GGML_LOG_INFO("threadpool: n_threads %d, n_threads_max %d, work_size %zu\n",
+            // n_threads, threadpool->n_threads_max, cplan->work_size);
 
 #ifdef GGML_USE_OPENMP
-    GGML_LOG_INFO("threadpool: using OpenMP\n");
+    //GGML_LOG_INFO("threadpool: using OpenMP\n");
     if (n_threads > 1) {
         #pragma omp parallel num_threads(n_threads)
         {
@@ -14238,16 +14238,16 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     }
 #else
     if (n_threads > threadpool->n_threads_max) {
-        GGML_LOG_INFO("cplan requested more threads (%d) than available (%d)\n", n_threads, threadpool->n_threads_max);
+        //GGML_LOG_INFO("cplan requested more threads (%d) than available (%d)\n", n_threads, threadpool->n_threads_max);
         n_threads = threadpool->n_threads_max;
     }
 
     // Kick all threads to start the new graph
-    GGML_LOG_INFO("threadpool: kill n_threads %d\n", n_threads);
+    //GGML_LOG_INFO("threadpool: kill n_threads %d\n", n_threads);
     ggml_graph_compute_kickoff(threadpool, n_threads);
 
     // This is a work thread too
-    GGML_LOG_INFO("threadpool: main thread %lx\n", pthread_self());
+    //GGML_LOG_INFO("threadpool: main thread %lx\n", pthread_self());
     ggml_graph_compute_thread(&threadpool->workers[0]);
 #endif
 

@@ -8641,6 +8641,7 @@ static int llama_decode_impl(
         ggml_backend_sched_reset(lctx.sched.get());
         ggml_backend_sched_set_eval_callback(lctx.sched.get(), lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data);
 
+        // auto t_start_us = ggml_time_us();
         ggml_cgraph * gf = llama_build_graph(lctx, ubatch, false);
 
         // the output is always the last tensor in the graph
@@ -8667,9 +8668,11 @@ static int llama_decode_impl(
         }
 
         // LLAMA_LOG_INFO("graph build time: %.3f ms (%d nodes, %d leafs)\n", (ggml_time_us() - t_start_us)/1000.0, gf->n_nodes, gf->n_leafs);
-
+        // LLAMA_LOG_INFO("print first graph\n");
+        // ggml_graph_print(gf);
         ggml_backend_sched_alloc_graph(lctx.sched.get(), gf);
-
+        // LLAMA_LOG_INFO("print second graph\n");
+        // ggml_graph_print(gf);
         llama_set_inputs(lctx, ubatch);
 
         const auto compute_status = llama_graph_compute(lctx, gf, n_threads, threadpool);
@@ -9816,7 +9819,7 @@ struct llama_context * llama_init_from_model(
                 model->params.n_gpu_layers > (int)model->hparams.n_layer &&
                 model->params.split_mode == LLAMA_SPLIT_MODE_LAYER &&
                 params.offload_kqv;
-
+            LLAMA_LOG_INFO("%s: pipeline parallelism = %s\n", __func__, pipeline_parallel ? "enabled" : "disabled");
             // pipeline parallelism requires support for async compute and events in all devices
             if (pipeline_parallel) {
                 for (auto & backend : ctx->backends) {
@@ -9831,6 +9834,8 @@ struct llama_context * llama_init_from_model(
                     if (!props.caps.async || !props.caps.events) {
                         // device does not support async compute or events
                         pipeline_parallel = false;
+                        LLAMA_LOG_WARN("%s: pipeline parallelism disabled for %s backend (%s) - async compute or events not supported\n",
+                                __func__, ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
                         break;
                     }
                 }

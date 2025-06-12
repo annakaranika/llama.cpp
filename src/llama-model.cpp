@@ -4,6 +4,7 @@
 #include "llama-mmap.h"
 #include "llama-model-loader.h"
 
+
 #include "ggml-cpp.h"
 
 #include <algorithm>
@@ -238,9 +239,13 @@ using buft_list_t = std::vector<std::pair<ggml_backend_dev_t, ggml_backend_buffe
 static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hparams, ggml_tensor * tensor, ggml_op op, const buft_list_t & buft_list) {
     GGML_ASSERT(!buft_list.empty());
     for (const auto & cur : buft_list) {
+        
         ggml_backend_dev_t cur_dev = cur.first;
         ggml_backend_buffer_type_t cur_buft = cur.second;
+        // LLAMA_LOG_INFO("%s: checking buffer type %s on device %s for tensor %s with op %s\n",
+            // __func__, ggml_backend_buft_name(cur_buft), ggml_backend_dev_name(cur_dev), tensor->name, ggml_op_name(op));
         if (weight_buft_supported(hparams, tensor, op, cur_buft, cur_dev)) {
+            // LLAMA_LOG_INFO("SUPPORTED\n");
             return cur_buft;
         }
     }
@@ -297,16 +302,24 @@ static buft_list_t make_cpu_buft_list(const std::vector<ggml_backend_dev_t> & de
             buft_list.emplace_back(dev, ggml_backend_dev_buffer_type(dev));
         }
     }
-
+    // Log the contents of buft_list
+    LLAMA_LOG_INFO("%s: buft_list contents:\n", __func__);
+    for (const auto & pair : buft_list) {
+        ggml_backend_dev_t dev = pair.first;
+        ggml_backend_buffer_type_t buft = pair.second;
+        LLAMA_LOG_INFO("  device: %s, buffer type: %s\n",
+            ggml_backend_dev_name(dev),
+            ggml_backend_buft_name(buft));
+    }
     return buft_list;
 }
 
 // GPU: split if LLAMA_SPLIT_MODE_ROW -> GPU
 static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, enum llama_split_mode split_mode, const float * tensor_split) {
     buft_list_t buft_list;
-
     // add the device split buffer type if requested and available
     if (split_mode == LLAMA_SPLIT_MODE_ROW) {
+        LLAMA_LOG_INFO("%s :using split buffer type for device %s\n", __func__,ggml_backend_dev_name(dev));
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
         auto ggml_backend_split_buffer_type_fn = (ggml_backend_split_buffer_type_t)
             ggml_backend_reg_get_proc_address(reg, "ggml_backend_split_buffer_type");
@@ -323,13 +336,16 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, enum llama_split_m
             auto * buft = ggml_backend_split_buffer_type_fn(dev_index, tensor_split);
             if (buft != nullptr) {
                 buft_list.emplace_back(dev, buft);
+                LLAMA_LOG_INFO("%s :device %s split buffer type %s\n", __func__, ggml_backend_dev_name(dev), ggml_backend_buft_name(buft));
             }
+        }else{
+            LLAMA_LOG_INFO("%s :device %s does not support split buffer type\n", __func__,ggml_backend_dev_name(dev));
         }
     }
 
     // add the device default buffer type
     buft_list.emplace_back(dev, ggml_backend_dev_buffer_type(dev));
-
+    LLAMA_LOG_INFO("%s :device %s default buffer type %s\n", __func__, ggml_backend_dev_name(dev), ggml_backend_buft_name(ggml_backend_dev_buffer_type(dev)));
     return buft_list;
 }
 
@@ -1281,12 +1297,15 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     // build a list of buffer types for the CPU and GPU devices
     pimpl->cpu_buft_list = make_cpu_buft_list(devices);
     for (auto * dev : devices) {
+
         buft_list_t buft_list = make_gpu_buft_list(dev, split_mode, tensor_split);
         // add CPU buffer types as a fallback
         buft_list.insert(buft_list.end(), pimpl->cpu_buft_list.begin(), pimpl->cpu_buft_list.end());
         pimpl->gpu_buft_list.emplace(dev, std::move(buft_list));
+        LLAMA_LOG_INFO("%s: using %zu CPU buffer types and %zu GPU buffer types\n",
+                     __func__, pimpl->cpu_buft_list.size(), pimpl->gpu_buft_list[dev].size());
     }
-
+    
     // calculate the split points
     bool all_zero = tensor_split == nullptr || std::all_of(tensor_split, tensor_split + n_devices(), [](float x) { return x == 0.0f; });
     std::vector<float> splits(n_devices());
@@ -1401,6 +1420,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         ggml_backend_buffer_type_t first_moved_to_buft = nullptr;
 
         auto create_tensor = [&](const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) -> ggml_tensor * {
+            LLAMA_LOG_INFO("create_tensor: %s\n", tn.str().c_str());
             ggml_tensor * t_meta = ml.get_tensor_meta(tn.str().c_str());
 
             if (!t_meta) {
@@ -3545,40 +3565,40 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     }
 
     // load tensor data
-    // for (auto & it : ctx_bufs) {
-    //     ggml_context * ctx = it.first;
-    //     auto & bufs = it.second;
-    //     if (!ml.load_all_data(ctx, bufs, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
-    //         return false;
-    //     }
-    //     LLAMA_LOG_INFO("%s: loaded tensors from context %p\n", __func__, (void*)ctx);
-    // }
-    {
-    std::vector<std::thread> threads;
-    std::atomic<bool> all_success{true};
-
     for (auto & it : ctx_bufs) {
         ggml_context * ctx = it.first;
         auto & bufs = it.second;
+        if (!ml.load_all_data(ctx, bufs, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
+            return false;
+        }
+        LLAMA_LOG_INFO("%s: loaded tensors from context %p\n", __func__, (void*)ctx);
+    }
+    // {
+    // std::vector<std::thread> threads;
+    // std::atomic<bool> all_success{true};
 
-        threads.emplace_back([&, ctx]() {
+    // for (auto & it : ctx_bufs) {
+    //     ggml_context * ctx = it.first;
+    //     auto & bufs = it.second;
+
+    //     threads.emplace_back([&, ctx]() {
             
-            if (!ml.load_all_data(ctx, bufs, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
-                all_success = false;
-            }
-        });
-    }
+    //         if (!ml.load_all_data(ctx, bufs, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
+    //             all_success = false;
+    //         }
+    //     });
+    // }
 
-    for (auto & t : threads) {
-        t.join();
-    }
+    // for (auto & t : threads) {
+    //     t.join();
+    // }
 
-    if (!all_success) {
-        LLAMA_LOG_ERROR("%s: failed to load all tensors\n", __func__);
-        LLAMA_LOG_INFO("fail\n");
-        return false;
-    }
-    }
+    // if (!all_success) {
+    //     LLAMA_LOG_ERROR("%s: failed to load all tensors\n", __func__);
+    //     LLAMA_LOG_INFO("fail\n");
+    //     return false;
+    // }
+    // }
 
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
