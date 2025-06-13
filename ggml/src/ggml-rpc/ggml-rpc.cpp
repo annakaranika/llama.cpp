@@ -631,16 +631,18 @@ static rpc_tensor split_serialize_tensor(const ggml_tensor * tensor, const ggml_
 }
 
 static void ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
-
-
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
-    ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *)buffer->  buft->context;
+    ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *)buffer->buft->context;
 
     //if split, store a copy of tensor on every rpc server, and store the buffer context for each server in extra
     if(split){   
         ggml_tensor_extra_rpc * extra = new ggml_tensor_extra_rpc();
         
         //allocate buffer on other servers
+        if (strncmp(tensor->name, "ffn_gate-", 9) == 0) {
+            GGML_LOG_INFO("tensor %s is being initialized with tensor->ne: [%lld, %lld, %lld, %lld]\n", tensor->name,
+                (long long)tensor->ne[0], (long long)tensor->ne[1], (long long)tensor->ne[2], (long long)tensor->ne[3]);
+        }
         rpc_msg_alloc_buffer_req request = {ggml_nbytes(tensor)};  //the size to allocate
         rpc_msg_alloc_buffer_rsp response;
         for (int id = 0; id < ggml_backend_rpc_get_device_count(); ++id) {
@@ -1528,6 +1530,9 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                 std::vector<uint8_t> data;
                 ggml_tensor* tensor= cgraph->nodes[count_nodes];
                 data.resize(ggml_nbytes(tensor)); 
+
+                GGML_LOG_INFO("[%s] tensor %s, rows=%d, size=%d\n",
+                    __func__, tensor->name, tensor->ne[0], tensor->nb[0] * tensor->ne[0] * tensor->ne[1]);
                 
                 //compute concurrently
                 std::mutex rpc_mutex; 
@@ -1618,8 +1623,8 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                             int64_t ncol_split = column_high - column_low;
                             if (ncol_split == 0) return;
 
-                            // GGML_LOG_INFO("[%s] device %d, tensor %s, nrows_split=%" PRId64 ", offset=%d, size=%d\n",
-                            //     __func__, id, tensor->name, nrows_split, row_low * tensor->nb[0] * tensor->ne[1], nrows_split*ggml_row_size(tensor->type, tensor->ne[1]));
+                            GGML_LOG_INFO("[%s] device %d, tensor %s, ncol_split=%" PRId64 ", column_low=%d, offset=%d, size=%d\n",
+                                __func__, id, tensor->name, ncol_split, column_low, column_low * tensor->nb[0] * tensor->ne[1], ncol_split*ggml_row_size(tensor->type, tensor->ne[1]));
                             size_t offset_split = column_low * tensor->nb[0] * tensor->ne[1];
                             size_t split_size = ncol_split*ggml_row_size(tensor->type, tensor->ne[1]);
 
