@@ -4,6 +4,9 @@
 #include "llama-batch.h"
 #include "llama-cparams.h"
 #include "llama-model.h"
+#include "../ggml/src/ggml-backend-impl.h"
+#include "../ggml/include/ggml-backend.h"
+#include "../ggml/src/ggml-rpc/ggml-rpc.cpp"
 
 #include <algorithm>
 #include <limits>
@@ -112,6 +115,27 @@ bool llama_kv_cache_init(
         ggml_backend_buffer_clear(buf, 0);
         LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
         cache.bufs.emplace_back(buf);
+        if(ggml_backend_buft_name(buft)[0] == 'R' && ggml_backend_buft_name(buft)[1] == 'P' && ggml_backend_buft_name(buft)[2] == 'C'){
+        struct ggml_tensor * first = ggml_get_first_tensor(ctx);
+            for (struct ggml_tensor * t = first; t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+                if (t->extra!= NULL) {
+                    // LLAMA_LOG_INFO("%s: adding tensor %s to kv cache\n", __func__, t->name);
+                    ggml_tensor_extra_rpc * t_extra = (ggml_tensor_extra_rpc *) t->extra;
+                    for(int i = 0; i < RPC_MAX_DEVICES; i++) {
+                        if (t_extra->buffer_ctx[i] != NULL && t_extra->buffer_ctx[i]->remote_ptr!= ((ggml_backend_rpc_buffer_context *)buf)->remote_ptr) {
+                            ggml_backend_buffer_t new_buf= ggml_backend_buffer_init(buft,buf->iface,t_extra->buffer_ctx[i],ggml_nbytes(t));
+                            if (new_buf == NULL) {
+                                LLAMA_LOG_ERROR("%s: failed to initialize RPC buffer for tensor %s\n", __func__, t->name);
+                                return false;
+                            }
+                            ggml_backend_buffer_clear(new_buf, 0);
+                            cache.bufs.emplace_back(new_buf);
+                        }    
+                    }
+                    
+                }
+            }
+        }
     }
 
     return true;
@@ -362,6 +386,7 @@ void llama_kv_cache_clear(struct llama_kv_cache & cache) {
 
     for (auto & buf : cache.bufs) {
         ggml_backend_buffer_clear(buf.get(), 0);
+        // LLAMA_LOG_INFO("[%s]clear buffer\n",__func__);
     }
 }
 

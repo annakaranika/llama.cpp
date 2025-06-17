@@ -26,11 +26,11 @@ if [[ "$restart" == "yes" ]]; then
 fi
 
 if [[ "$compile" == "yes" ]]; then
-    cd build
+    cd build-rpc
     cmake .. -DGGML_RPC=ON -DGGML_VULKAN=OFF -DGGML_METAL=OFF -DGGML_CUDA=OFF
     cmake --build . --config Release
     cd ..
 fi
 
 # GGML_SCHED_DEBUG=2 ./build/bin/llama-cli -v -m models/tinyllama-1.1b-chat-v1.0.Q2_K.gguf --rpc 172.16.107.154:50052,172.16.112.192:50052 -ngl 23
-./build/bin/llama-cli -v -m models/tinyllama-1.1b-chat-v1.0.Q2_K.gguf --rpc 172.16.107.154:50052,172.16.112.192:50052 -ngl 23 -sm row
+./build-rpc/bin/llama-cli -v -m models/tinyllama-1.1b-chat-v1.0.Q2_K.gguf --rpc 172.16.107.154:50052,172.16.112.192:50052 -ngl 23 -sm row --temp 0

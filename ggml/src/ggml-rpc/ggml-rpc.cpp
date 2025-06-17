@@ -24,6 +24,7 @@
 
 #include <thread>
 #include <errno.h>
+#include <fstream>
 
 #include <cinttypes>
 #include <string>
@@ -505,6 +506,7 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
 
 static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     //how to free a buffer on other servers?
+    GGML_LOG_INFO("ggml_backend_rpc_buffer_free_buffer: remote_ptr=%" PRIx64 "\n", ((ggml_backend_rpc_buffer_context *)buffer->context)->remote_ptr);
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_msg_free_buffer_req request = {ctx->remote_ptr};
     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_FREE_BUFFER, &request, sizeof(request), nullptr, 0);
@@ -635,15 +637,16 @@ static void ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_t buffer, gg
 
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *)buffer->  buft->context;
+    // GGML_LOG_INFO("[%s] initializing tensor %s, type=%d, buffer=%" PRIx64 "data=%" PRIx64 "\n", __func__, tensor->name, tensor->type, ctx->remote_ptr, tensor->data);
 
     //if split, store a copy of tensor on every rpc server, and store the buffer context for each server in extra
     if(split){   
         ggml_tensor_extra_rpc * extra = new ggml_tensor_extra_rpc();
         
         //allocate buffer on other servers
-        rpc_msg_alloc_buffer_req request = {ggml_nbytes(tensor)};  //the size to allocate
-        rpc_msg_alloc_buffer_rsp response;
         for (int id = 0; id < ggml_backend_rpc_get_device_count(); ++id) {
+            rpc_msg_alloc_buffer_req request = {ggml_nbytes(tensor)};  //the size to allocate
+            rpc_msg_alloc_buffer_rsp response;
             ggml_backend_rpc_device_context * dev_ctx = (ggml_backend_rpc_device_context *)reg_ctx->devices[id]->context;
             if(dev_ctx->endpoint==buft_ctx->endpoint) {  //for the main device, we already have the buffer context
                 extra->buffer_ctx[id] = ctx; 
@@ -708,6 +711,7 @@ static void ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_t buffer, gg
 }
 
 static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    // GGML_LOG_INFO("[%s] setting tensor %s, offset=%zu, size=%zu\n", __func__, tensor->name, offset, size);
     ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *)buffer->buft->context;
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     // input serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes) |
@@ -741,7 +745,6 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
                 if (extra->buffer_ctx[id] == nullptr) {
                     GGML_LOG_INFO("[%s] buffer context for device %d is null\n", __func__, id);
                 }else{
-                    // GGML_LOG_INFO("reset data for device %d\n", id);
                     rpc_tensor2.buffer = extra->buffer_ctx[id]->remote_ptr;
                     rpc_tensor2.data = reinterpret_cast<uint64_t>(ggml_backend_rpc_buffer_context_get_base(reinterpret_cast<ggml_backend_rpc_buffer_context *>(extra->buffer_ctx[id])));
                     // GGML_LOG_INFO("rpc_tensor.data=%" PRIx64 ", rpc_tensor.buffer=%" PRIx64 "\n", rpc_tensor2.data, rpc_tensor2.buffer);
@@ -749,23 +752,6 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
                 memcpy(input_.data(), &rpc_tensor2, sizeof(rpc_tensor));
                 memcpy(input_.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
                 memcpy(input_.data() + sizeof(rpc_tensor) + sizeof(offset), data, size);
-
-                const rpc_tensor * in_tensor = (const rpc_tensor *)input_.data();
-                
-                struct ggml_init_params params {
-                    /*.mem_size   =*/ ggml_tensor_overhead(),
-                    /*.mem_buffer =*/ NULL,
-                    /*.no_alloc   =*/ true,
-                };
-                struct ggml_context * ctx_ = ggml_init(params);
-                ggml_tensor * result = ggml_new_tensor_4d(ctx_, (ggml_type) tensor->type,
-                in_tensor->ne[0], in_tensor->ne[1], in_tensor->ne[2], in_tensor->ne[3]);
-                for (uint32_t i = 0; i < GGML_MAX_DIMS; i++) {
-                    result->nb[i] = in_tensor->nb[i];
-                }
-                result->buffer = reinterpret_cast<ggml_backend_buffer_t>(in_tensor->buffer);
-                // GGML_LOG_INFO("result->buffer=%p\n", result->buffer);
-                        
 
                 bool status = send_rpc_cmd(get_socket(dev_ctx->endpoint), RPC_CMD_SET_TENSOR, input_.data(), input_.size(), nullptr, 0);
                 if(!status) {
@@ -853,6 +839,7 @@ static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, con
 
 static void ggml_backend_rpc_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     //how to clear the buffer on other servers?
+    // GGML_LOG_INFO("[%s] clearing buffer, remote_ptr=%" PRIx64 ", value=%d\n", __func__, ((ggml_backend_rpc_buffer_context *)buffer->context)->remote_ptr, value);
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_msg_buffer_clear_req request = {ctx->remote_ptr, value};
     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_BUFFER_CLEAR, &request, sizeof(request), nullptr, 0);
@@ -1017,21 +1004,6 @@ static void ggml_backend_rpc_split_buffer_set_tensor(ggml_backend_buffer_t buffe
         std::vector<uint8_t> input(input_size, 0);
         rpc_tensor rpc_tensor = split_serialize_tensor(tensor, (ggml_tensor_extra_rpc*)tensor->extra, id);
 
-        struct ggml_init_params params {
-                /*.mem_size   =*/ ggml_tensor_overhead(),
-                /*.mem_buffer =*/ NULL,
-                /*.no_alloc   =*/ true,
-            };
-        struct ggml_context * ten_ctx = ggml_init(params);
-        ggml_tensor * result = ggml_new_tensor_4d(ten_ctx, (ggml_type) rpc_tensor.type,
-        rpc_tensor.ne[0], rpc_tensor.ne[1], rpc_tensor.ne[2], rpc_tensor.ne[3]);
-        for (uint32_t i = 0; i < GGML_MAX_DIMS; i++) {
-            result->nb[i] = rpc_tensor.nb[i];
-       }
-
-        uint64_t tensor_size = (uint64_t) ggml_nbytes(result);
-        // GGML_LOG_INFO("[%s] after serialization tensor %s on device %d, size=%" PRIu64 "\n", __func__, tensor->name, id, tensor_size);
-
         memcpy(input.data(), &rpc_tensor, sizeof(rpc_tensor));
         memcpy(input.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
         memcpy(input.data() + sizeof(rpc_tensor) + sizeof(offset), ((const char*)data)+offset_split, split_size);
@@ -1061,13 +1033,14 @@ static void ggml_backend_rpc_split_buffer_get_tensor(ggml_backend_buffer_t buffe
 
         const size_t offset_split = row_low*nb1;
         size_t split_size = ggml_nbytes_split(tensor, nrows_split);
+        GGML_LOG_INFO("[%s] getting tensor %s on device %d, offset=%zu, size=%zu\n", __func__, tensor->name, id, offset_split, split_size);
 
         rpc_msg_get_tensor_req request;
         request.tensor = split_serialize_tensor(tensor, (ggml_tensor_extra_rpc*)tensor->extra, id);
         request.offset = offset;
         request.size = split_size;
         ggml_backend_rpc_device_context * dev_ctx= (ggml_backend_rpc_device_context *)reg_ctx->devices[id]->context;
-        bool status = send_rpc_cmd(get_socket(dev_ctx->endpoint), RPC_CMD_GET_TENSOR, &request, sizeof(request), (char *)data+offset_split, split_size);
+        bool status = send_rpc_cmd(get_socket(dev_ctx->endpoint), RPC_CMD_GET_TENSOR, &request, sizeof(request), data+offset_split, split_size);
         GGML_ASSERT(status);
     }
 }
@@ -1377,17 +1350,29 @@ static void add_tensor_part(ggml_tensor * tensor, std::vector<rpc_tensor> & tens
             if(split_ && i==0){
                 tensors.push_back(split_serialize_tensor(src, (ggml_tensor_extra_rpc*)src->extra, id));
                 tensor_extras.push_back((ggml_tensor_extra_rpc*)src->extra);
-                continue;
+                // GGML_LOG_INFO("[%s] split tensor %s on device %d\n", __func__, src->name, id);
+                // GGML_LOG_INFO("for tensor %s, ne0: %d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d\n",
+                //     tensors.back().name,
+                //     tensors.back().ne[0],tensors.back().ne[1],tensors.back().ne[2],tensors.back().ne[3],
+                //     tensors.back().nb[0],tensors.back().nb[1],tensors.back().nb[2],tensors.back().nb[3]);
+                // GGML_LOG_INFO("original tensor %s, ne0: %d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d\n",
+                //     src->name,
+                //     src->ne[0],src->ne[1],src->ne[2],src->ne[3],
+                //     src->nb[0],src->nb[1],src->nb[2],src->nb[3]);
 
-            }
-            tensors.push_back(serialize_tensor(src));
-            tensor_extras.push_back((ggml_tensor_extra_rpc*)src->extra);
-            if(split_){
-                if (tensor_extras.back()->buffer_ctx[id] == nullptr) {
-                    GGML_LOG_INFO("[%s] buffer context for device %d is null\n", __func__, id);
-                }else{
-                    tensors.back().buffer = tensor_extras.back()->buffer_ctx[id]->remote_ptr;
-                    tensors.back().data = reinterpret_cast<uint64_t>(ggml_backend_rpc_buffer_context_get_base(reinterpret_cast<ggml_backend_rpc_buffer_context *>(tensor_extras.back()->buffer_ctx[id])));
+            }else{
+                tensors.push_back(serialize_tensor(src));
+                tensor_extras.push_back((ggml_tensor_extra_rpc*)src->extra);
+                // for(int j=0;j<ggml_backend_rpc_get_device_count();++j){
+                //     GGML_LOG_INFO("[%s] tensor %s with extra remote ptr %p on device %d\n", __func__, src->name, tensor_extras.back()->buffer_ctx[j], j);
+                // }
+                if(split_&&tensors.back().buffer != tensor_extras.back()->buffer_ctx[id]->remote_ptr){
+                    if (tensor_extras.back()->buffer_ctx[id] == nullptr) {
+                        GGML_LOG_INFO("[%s] buffer context for device %d is null\n", __func__, id);
+                    }else{
+                        tensors.back().buffer = tensor_extras.back()->buffer_ctx[id]->remote_ptr;
+                        tensors.back().data = reinterpret_cast<uint64_t>(ggml_backend_rpc_buffer_context_get_base(reinterpret_cast<ggml_backend_rpc_buffer_context *>(tensor_extras.back()->buffer_ctx[id])));
+                    }
                 }
             }
             
@@ -1395,7 +1380,11 @@ static void add_tensor_part(ggml_tensor * tensor, std::vector<rpc_tensor> & tens
                 visited.insert(src->view_src);
                 tensors.push_back(serialize_tensor(src->view_src));
                 tensor_extras.push_back((ggml_tensor_extra_rpc*)src->view_src->extra);
-                if(split_){
+                
+                // for(int j=0;j<ggml_backend_rpc_get_device_count();++j){
+                //     GGML_LOG_INFO("[%s] tensor %s with extra remote ptr %p on device %d\n", __func__, src->view_src->name, tensor_extras.back()->buffer_ctx[j], j);
+                // }
+                if(split_&&tensors.back().buffer != tensor_extras.back()->buffer_ctx[id]->remote_ptr){
                     if (tensor_extras.back()->buffer_ctx[id] == nullptr) {
                         GGML_LOG_INFO("[%s] buffer context for device %d is null\n", __func__, id);
                     }else{
@@ -1410,6 +1399,9 @@ static void add_tensor_part(ggml_tensor * tensor, std::vector<rpc_tensor> & tens
     visited.insert(tensor);
     tensors.push_back(serialize_tensor(tensor));
     tensor_extras.push_back((ggml_tensor_extra_rpc*)tensor->extra);
+    // for(int j=0;j<ggml_backend_rpc_get_device_count();++j){
+    //     GGML_LOG_INFO("[%s] tensor %s with extra remote ptr %p on device %d\n", __func__, tensor->name, tensor_extras.back()->buffer_ctx[j], j);
+    // }
 
     if(split_){
         auto extra = (ggml_tensor_extra_rpc*)tensor->src[0]->extra;
@@ -1421,11 +1413,13 @@ static void add_tensor_part(ggml_tensor * tensor, std::vector<rpc_tensor> & tens
         tensors.back().nb[1] = ggml_row_size(tensor->type, tensors.back().ne[0]);
         tensors.back().nb[2] = tensors.back().ne[1] * tensors.back().nb[1];
         tensors.back().nb[3] = tensors.back().ne[2] * tensors.back().nb[2];
-        if (tensor_extras.back()->buffer_ctx[id] == nullptr) {
-            GGML_LOG_INFO("[%s] buffer context for device %d is null\n", __func__, id);
-        }else{
-            tensors.back().buffer = tensor_extras.back()->buffer_ctx[id]->remote_ptr;
-            tensors.back().data = reinterpret_cast<uint64_t>(ggml_backend_rpc_buffer_context_get_base(reinterpret_cast<ggml_backend_rpc_buffer_context *>(tensor_extras.back()->buffer_ctx[id])));
+        if(tensors.back().buffer != tensor_extras.back()->buffer_ctx[id]->remote_ptr){
+            if (tensor_extras.back()->buffer_ctx[id] == nullptr) {
+                GGML_LOG_INFO("[%s] buffer context for device %d is null\n", __func__, id);
+            }else{
+                tensors.back().buffer = tensor_extras.back()->buffer_ctx[id]->remote_ptr;
+                tensors.back().data = reinterpret_cast<uint64_t>(ggml_backend_rpc_buffer_context_get_base(reinterpret_cast<ggml_backend_rpc_buffer_context *>(tensor_extras.back()->buffer_ctx[id])));
+            }
         }
 
     }
@@ -1434,7 +1428,7 @@ static void add_tensor_part(ggml_tensor * tensor, std::vector<rpc_tensor> & tens
         visited.insert(tensor->view_src);
         tensors.push_back(serialize_tensor(tensor->view_src));
         tensor_extras.push_back((ggml_tensor_extra_rpc*)tensor->view_src->extra);
-        if(split_){
+        if(split_&&tensors.back().buffer != tensor_extras.back()->buffer_ctx[id]->remote_ptr){
             if (tensor_extras.back()->buffer_ctx[id] == nullptr) {
                 GGML_LOG_INFO("[%s] buffer context for device %d is null\n", __func__, id);
             }else{
@@ -1500,15 +1494,15 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                 bool check_end=false;
                 for (; count_nodes < cgraph->n_nodes; count_nodes++) {
                     ggml_tensor * node = cgraph->nodes[count_nodes];
-                    // GGML_LOG_INFO("\ntensor %s ne0 :%d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d \n",
-                    //     node->name,node->ne[0],node->ne[1],node->ne[2],node->ne[3],node->nb[0],node->nb[1],node->nb[2],node->nb[3]);
-                    // for(int i=0;i<GGML_MAX_SRC;i++){
-                    //     ggml_tensor* src=node->src[i];
-                    //     if(src){
-                    //         GGML_LOG_INFO("src %d ne0 :%d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d \n",
-                    //             i,src->ne[0],src->ne[1],src->ne[2],src->ne[3],src->nb[0],src->nb[1],src->nb[2],src->nb[3]);
-                    //     }
-                    // }
+                    GGML_LOG_INFO("\ntensor %s ne0 :%d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d \n",
+                        node->name,node->ne[0],node->ne[1],node->ne[2],node->ne[3],node->nb[0],node->nb[1],node->nb[2],node->nb[3]);
+                    for(int i=0;i<GGML_MAX_SRC;i++){
+                        ggml_tensor* src=node->src[i];
+                        if(src){
+                            GGML_LOG_INFO("src %d %s ne0 :%d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d \n",
+                                i,src->name,src->ne[0],src->ne[1],src->ne[2],src->ne[3],src->nb[0],src->nb[1],src->nb[2],src->nb[3]);
+                        }
+                    }
                     if(!ggml_is_empty(node) && node->src[0] != nullptr 
                         && ggml_backend_buft_is_rpc_split(node->src[0]->buffer->buft) 
                         && (node->op == GGML_OP_MUL_MAT|| node->op == GGML_OP_MUL_MAT_ID)) {
@@ -1528,6 +1522,10 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                 std::vector<uint8_t> data;
                 ggml_tensor* tensor= cgraph->nodes[count_nodes];
                 data.resize(ggml_nbytes(tensor)); 
+                // GGML_LOG_INFO("data %p, tensor %s, ne0: %d, ne1: %d, ne2: %d, ne3: %d\n",
+                //     data.data(), tensor->name,
+                //     tensor->ne[0], tensor->ne[1],
+                //     tensor->ne[2], tensor->ne[3]);
                 
                 //compute concurrently
                 std::mutex rpc_mutex; 
@@ -1535,34 +1533,47 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                 int device_count = ggml_backend_rpc_get_device_count();
                 std::vector<std::thread> threads;
 
+                int sync_count = 0;
+
                 for (int id = 0; id < device_count; ++id) {
                     threads.emplace_back([&, id]() {
+                        auto dev_ctx = (ggml_backend_rpc_device_context*)reg_ctx->devices[id]->context;
+                        auto sock = get_socket(dev_ctx->endpoint);
                         std::vector<rpc_tensor> tensors_id = tensors;
-                        for(int i=0;i<tensors_id.size();i++) {
-                            rpc_tensor & rpc_t = tensors_id[i];
-                            if (tensor_extras[i]->buffer_ctx[id] == nullptr) {
-                                GGML_LOG_INFO("[%s] buffer context for device %d is null\n", __func__, id);
-                            }else{
-                                rpc_t.buffer = tensor_extras[i]->buffer_ctx[id]->remote_ptr;
-                                rpc_t.data = reinterpret_cast<uint64_t>(ggml_backend_rpc_buffer_context_get_base(reinterpret_cast<ggml_backend_rpc_buffer_context *>(tensor_extras[i]->buffer_ctx[id])));
-                            }
+                        std::vector<ggml_tensor_extra_rpc*> tensor_extras_id = tensor_extras;
+                        // for(auto extra: tensor_extras_id) {
+                        //     GGML_LOG_INFO("remote_ptr: %" PRIx64 ", device %d\n",
+                        //         extra->buffer_ctx[id]->remote_ptr, id);
+                        // }
+                        if(get_socket(rpc_ctx->endpoint)!= sock){
+                            for(int i=0;i<tensors_id.size();i++) {
+                                rpc_tensor & rpc_t = tensors_id[i];
+                                if (tensor_extras_id[i]->buffer_ctx[id] == nullptr) {
+                                    GGML_LOG_INFO("[%s] buffer context for device %d is null\n", __func__, id);
+                                }else{
+                                    rpc_t.buffer = tensor_extras_id[i]->buffer_ctx[id]->remote_ptr;
+                                    rpc_t.data = reinterpret_cast<uint64_t>(ggml_backend_rpc_buffer_context_get_base(reinterpret_cast<ggml_backend_rpc_buffer_context *>(tensor_extras_id[i]->buffer_ctx[id])));
+                                }
 
+                            }
                         }
                         std::unordered_set<ggml_tensor*> visited_id = visited;
                         // for(int i=0;i<tensors_id.size();i++) {
-                        //         GGML_LOG_INFO("[%s] device %d, tensor %s, ne0: %d, ne1: %d, ne2: %d, ne3: %d\n",
+                        //         GGML_LOG_INFO("[%s] device %d, tensor %s, ne0: %d, ne1: %d, ne2: %d, ne3: %d, buffer: %" PRIx64 ", data: %" PRIx64 "\n",
                         //             __func__, id, tensors_id[i].name,
                         //             tensors_id[i].ne[0], tensors_id[i].ne[1],
-                        //             tensors_id[i].ne[2], tensors_id[i].ne[3]);
+                        //             tensors_id[i].ne[2], tensors_id[i].ne[3],
+                        //             tensors_id[i].buffer, tensors_id[i].data);
                         // }
                         if(!check_end) {
-                            add_tensor_part(cgraph->nodes[count_nodes], tensors_id, tensor_extras, visited_id, true, id);
+                            add_tensor_part(cgraph->nodes[count_nodes], tensors_id, tensor_extras_id, visited_id, true, id);
 
                             // for(int i=0;i<tensors_id.size();i++) {
-                            //         GGML_LOG_INFO("[%s] device %d, tensor %s, ne0: %d, ne1: %d, ne2: %d, ne3: %d\n",
-                            //             __func__, id, tensors_id[i].name,
-                            //             tensors_id[i].ne[0], tensors_id[i].ne[1],
-                            //             tensors_id[i].ne[2], tensors_id[i].ne[3]);
+                            //         GGML_LOG_INFO("[%s] device %d, tensor %s, ne0: %d, ne1: %d, ne2: %d, ne3: %d, buffer: %" PRIx64 ", data: %" PRIx64 "\n",
+                            //         __func__, id, tensors_id[i].name,
+                            //         tensors_id[i].ne[0], tensors_id[i].ne[1],
+                            //         tensors_id[i].ne[2], tensors_id[i].ne[3],
+                            //         tensors_id[i].buffer, tensors_id[i].data);
                             // }
                         }
 
@@ -1593,8 +1604,6 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                         memcpy(in_tensors, tensors_id.data(), n_tensors * sizeof(rpc_tensor));
 
                         rpc_msg_graph_compute_rsp response;
-                        auto dev_ctx = (ggml_backend_rpc_device_context*)reg_ctx->devices[id]->context;
-                        auto sock = get_socket(dev_ctx->endpoint);
 
                         bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE,
                                                 input.data(), input.size(),
@@ -1620,8 +1629,8 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
 
                             // GGML_LOG_INFO("[%s] device %d, tensor %s, nrows_split=%" PRId64 ", offset=%d, size=%d\n",
                             //     __func__, id, tensor->name, nrows_split, row_low * tensor->nb[0] * tensor->ne[1], nrows_split*ggml_row_size(tensor->type, tensor->ne[1]));
-                            size_t offset_split = column_low * tensor->nb[0] * tensor->ne[1];
-                            size_t split_size = ncol_split*ggml_row_size(tensor->type, tensor->ne[1]);
+                            // size_t offset_split = column_low * tensor->nb[0] * tensor->ne[1];
+                            size_t split_size = tensor->ne[1]*ggml_row_size(tensor->type, ncol_split);
 
                             rpc_msg_get_tensor_req request;
 
@@ -1630,8 +1639,11 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                             if (extra_->buffer_ctx[id] == nullptr) {
                                 GGML_LOG_INFO("[%s] buffer context for device %d is null\n", __func__, id);
                             }else{
-                                request.tensor.buffer = extra_->buffer_ctx[id]->remote_ptr;
-                                request.tensor.data = reinterpret_cast<uint64_t>(ggml_backend_rpc_buffer_context_get_base(reinterpret_cast<ggml_backend_rpc_buffer_context *>(extra_->buffer_ctx[id])));
+                                if(get_socket(rpc_ctx->endpoint)!= sock){
+                                    // GGML_LOG_INFO("CHANGE BUFFER AND DATA\n");
+                                    request.tensor.buffer = extra_->buffer_ctx[id]->remote_ptr;
+                                    request.tensor.data = reinterpret_cast<uint64_t>(ggml_backend_rpc_buffer_context_get_base(reinterpret_cast<ggml_backend_rpc_buffer_context *>(extra_->buffer_ctx[id])));
+                                }
                                 request.tensor.ne[0] = extra->rows[id].second - extra->rows[id].first;
             
                                 request.tensor.nb[0] = ggml_type_size(tensor->type);
@@ -1645,17 +1657,88 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
 
                             std::vector<uint8_t> curr_data;
                             curr_data.resize(split_size);
-
+                            
                             status = send_rpc_cmd(get_socket(dev_ctx->endpoint),
                                                 RPC_CMD_GET_TENSOR,
                                                 &request, sizeof(request),
                                                 curr_data.data(), split_size);
                             GGML_ASSERT(status);
 
+
+                            std::ofstream out("tensor_dump.txt", std::ios::app);  
+
+                            out << "[" << __func__ << "] device " << id
+                                << ", received data for tensor " << tensor->name
+                                << ", size=" << curr_data.size() << "\n";
+
+                            for (size_t i = 0; i < curr_data.size(); ++i) {
+                                if(i%1024==0 && i!=0) {
+                                    out << "\n";
+                                }
+                                out << static_cast<int>(curr_data[i]) << " ";  
+                            }
+                            out << "\n";
+
+                            try{
+
+                                std::vector<uint8_t> src_data;
+                                for (int i = GGML_MAX_SRC; i >0; i--){
+                                    ggml_tensor * src = tensor->src[i];
+                                    if (src) {
+                                        GGML_LOG_INFO("[%s] device %d, src %d, tensor %s, ne0: %d, ne1: %d, ne2: %d, ne3: %d\n",
+                                            __func__, id, i, src->name,
+                                            src->ne[0], src->ne[1],
+                                            src->ne[2], src->ne[3]);
+                                        size_t src_size = ggml_nbytes(src);
+                                        src_data.resize(src_size);
+                                        ggml_backend_buffer_t buf = src->view_src ? src->view_src->buffer : src->buffer;
+                                        rpc_msg_get_tensor_req src_request;
+                                        src_request.tensor = serialize_tensor(src);
+                                        if (src->extra && ((ggml_tensor_extra_rpc*)src->extra)->buffer_ctx[id] == nullptr) {
+                                            GGML_LOG_INFO("[%s] buffer context for device %d is null\n", __func__, id);
+                                        }else{
+                                            if(get_socket(rpc_ctx->endpoint)!= sock){
+                                                src_request.tensor.buffer = ((ggml_tensor_extra_rpc*)src->extra)->buffer_ctx[id]->remote_ptr;
+                                                src_request.tensor.data = reinterpret_cast<uint64_t>(ggml_backend_rpc_buffer_context_get_base(reinterpret_cast<ggml_backend_rpc_buffer_context *>(((ggml_tensor_extra_rpc*)src->extra)->buffer_ctx[id])));
+                                            }
+                                        }
+                                        src_request.offset = 0;
+                                        src_request.size = src_size;
+                                        status = send_rpc_cmd(get_socket(dev_ctx->endpoint),
+                                                            RPC_CMD_GET_TENSOR,
+                                                            &src_request, sizeof(src_request),
+                                                            src_data.data(), src_size);
+                                        GGML_ASSERT(status);
+                                    
+                                        out << "[" << __func__ << "] device " << id
+                                            << ", get data for tensor " << src->name
+                                            << ", size=" << src_size << "\n";
+                                        for (size_t j = 0; j < src_size; ++j) {
+                                            if(j%1024==0 && j!=0) {
+                                                out << "\n";
+                                            }
+                                            out << static_cast<int>(src_data[j]) << " ";  
+                                        }
+                                        out << "\n";
+                                    }
+                                }
+                            }catch(const std::exception &e) {
+                                GGML_LOG_ERROR("[%s] device %d, exception while getting src data: %s\n", __func__, id, e.what());
+                            }
+
+
+                            out.close();
+
+                            size_t total_size = 0;
+
                             for(int row=0;row<request.tensor.ne[1];row++){
+                                
                                 size_t offset=row * tensor->nb[1] + column_low * tensor->nb[0];
                                 memcpy(data.data() + offset, curr_data.data() + row * request.tensor.nb[1], request.tensor.nb[1]);
+                                total_size += request.tensor.nb[1];
                             }
+                            GGML_ASSERT(total_size == split_size);
+                            // memcpy(data.data() + offset_split, curr_data.data(), split_size);
                         }
                     });
                 }
@@ -1667,6 +1750,47 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                     }
                 }
                 if(!check_end) {
+                    std::vector<uint8_t> src_data;
+                    std::ofstream out("tensor_dump.txt", std::ios::app);  
+                    ggml_tensor * src = tensor->src[0];
+                    GGML_LOG_INFO("[%s] src %d, tensor %s, ne0: %d, ne1: %d, ne2: %d, ne3: %d\n",
+                                            __func__, 0, src->name,
+                                            src->ne[0], src->ne[1],
+                                            src->ne[2], src->ne[3]);
+                    size_t src_size = ggml_nbytes(src);
+                    src_data.resize(src_size);
+                    rpc_msg_get_tensor_req src_request;
+                    out << "[" << __func__ << "] device "
+                                << ", received data for tensor " << tensor->name
+                                << ", size=" << src_data.size() << "\n";
+
+                    if(ggml_backend_buft_is_rpc_split(src->buffer->buft)) {
+                        src->buffer->iface.get_tensor(src->buffer, src, src_data.data(), 0, src_size);
+                    }else{
+                        GGML_LOG_INFO("[%s] tensor %s is not split\n", __func__, src->name);
+                    }
+                
+                    for (size_t i = 0; i < src_data.size(); ++i) {
+                        if(i%1024==0 && i!=0) {
+                            out << "\n";
+                        }
+                        out << static_cast<int>(src_data[i]) << " ";  
+                    }
+                    out << "\n";
+
+
+                    out << "[" << __func__ << "]"
+                        << ", set data for tensor " << tensor->name
+                        << ", size=" << data.size() << "\n";
+
+                    for (size_t i = 0; i < data.size(); ++i) {
+                        if(i%1024==0 && i!=0) {
+                            out << "\n";
+                        }
+                        out << static_cast<int>(data[i]) << " ";  
+                    }
+                    out << "\n";
+                    out.close();
                     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
                     buf->iface.set_tensor(tensor->buffer, tensor, data.data(), 0, data.size());
                 }
@@ -1685,6 +1809,21 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         auto sock = get_socket(rpc_ctx->endpoint);
         bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size(), &response, sizeof(response));
         GGML_ASSERT(status);
+        // for(uint32_t i = 0; i < cgraph->n_nodes; i++) {
+        //     ggml_tensor * node = cgraph->nodes[i];
+        //     std::vector<uint8_t> data;
+        //     data.resize(ggml_nbytes(node));
+        //     rpc_msg_get_tensor_req request;
+        //     request.tensor = serialize_tensor(node);
+        //     request.offset = 0;
+        //     request.size = ggml_nbytes(node);
+        //     bool status = send_rpc_cmd(sock, RPC_CMD_GET_TENSOR, &request, sizeof(request), data.data(), data.size());
+        //     GGML_LOG_INFO(" data for tensor %s: ", node->name);
+        //     for (size_t j = 0; j < data.size(); j++) {
+        //         GGML_LOG_INFO("%d ", data[j]);
+        //     }
+        //     GGML_LOG_INFO("\n");
+        // }
         return (enum ggml_status)response.result;
     }
 }

@@ -1007,6 +1007,7 @@ bool llama_model_loader::load_all_data(
 
             GGML_ASSERT(buf_mmap || cur->data); // either we have a buffer to allocate the tensor in, or it is already allocated
             if (buf_mmap && cur->data == nullptr) {
+                LLAMA_LOG_INFO("%s: allocating tensor '%s' in mmap buffer %p\n", __func__, ggml_get_name(cur), (void*)buf_mmap);
                 ggml_backend_tensor_alloc(buf_mmap, cur, data);
                 if (lmlocks) {
                     LLAMA_LOG_DEBUG("%s: growing mmap lock for tensor '%s' from %ld to %zu\n", __func__, ggml_get_name(cur), weight->offs, n_size);
@@ -1018,6 +1019,7 @@ bool llama_model_loader::load_all_data(
                 mmap_used.first  = std::min(mmap_used.first,  weight->offs);
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
             } else {
+                LLAMA_LOG_DEBUG("%s: setting tensor '%s' data from mmap %p\n", __func__, ggml_get_name(cur), (void*)data);
                 ggml_backend_tensor_set(cur, data, 0, n_size);
             }
         } else {
