@@ -8426,7 +8426,24 @@ static void ggml_compute_forward_view(
     // NOP
     if(dst->buffer!=dst->src[0]->buffer) {
         // if the dst tensor is not in the same buffer as the src tensor, we need to copy the data
-        ggml_compute_forward_dup(params, dst);
+        const struct ggml_tensor * src = dst->src[0];
+        struct ggml_tensor dst_copy = {
+        /*.type         =*/ dst->type,
+        /*.buffer       =*/ dst->buffer,
+        /*.ne           =*/ src->ne,
+        /*.nb           =*/ src->nb,
+        /*.op           =*/ dst->op,
+        /*.op_params    =*/ dst->op_params,
+        /*.flags        =*/ dst->flags,
+        /*.src          =*/ dst->src,
+        /*.view_src     =*/ dst->view_src,
+        /*.view_offs    =*/ dst->view_offs,
+        /*.data         =*/ dst->data,
+        /*.name         =*/ dst->name,
+        /*.extra        =*/ dst->extra,
+        /*.padding      =*/ dst->padding,
+        };
+        ggml_compute_forward_dup(params, &dst_copy);
     }
     // UNUSED(params);
     // UNUSED(dst);
