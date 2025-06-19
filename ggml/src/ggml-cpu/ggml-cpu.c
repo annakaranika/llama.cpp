@@ -3817,8 +3817,6 @@ static void ggml_compute_forward_dup_bytes(
         struct ggml_tensor * dst) {
 
     const struct ggml_tensor * src0 = dst->src[0];
-    GGML_LOG_INFO("ggml_compute_forward_dup_bytes: src0 %s, dst %s", src0->name, dst->name);
-    GGML_LOG_INFO("nelements src0 %zu, dst %zu", ggml_nelements(src0), ggml_nelements(dst));
     GGML_ASSERT(ggml_nelements(dst) == ggml_nelements(src0));
     GGML_ASSERT(src0->type == dst->type);
 

@@ -2126,7 +2126,10 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
         result->nb[i] = tensor->nb[i];
     }
     result->buffer = reinterpret_cast<ggml_backend_buffer_t>(tensor->buffer);
-    GGML_LOG_INFO("result->buffer: %p, tensor->buffer: %p\n", (void*)result->buffer, (void*)tensor->buffer);
+    // GGML_LOG_INFO("[%s] tensor name: %s, type: %d, ne: [%d, %d, %d, %d], buffer: %p, data: %p\n",
+    //     __func__, tensor->name, tensor->type,
+    //     tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3],
+    //     (void*)result->buffer, (void*)tensor->data);
     if (result->buffer && buffers.find(result->buffer) == buffers.end()) {
         GGML_LOG_INFO("[%s] buffer not found: %p\n", __func__, (void*)result->buffer);
         result->buffer = nullptr;
@@ -2137,8 +2140,8 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
         uint64_t tensor_size = (uint64_t) ggml_nbytes(result);
         uint64_t buffer_start = (uint64_t) ggml_backend_buffer_get_base(result->buffer);
         uint64_t buffer_size = (uint64_t) ggml_backend_buffer_get_size(result->buffer);
-        // GGML_LOG_INFO("[%s] tensor name: %s, buffer: %p, data: %p, size: %" PRIu64 ", buffer_start: %" PRIx64 ", buffer_size: %" PRIu64 "\n",
-            // __func__, tensor->name, (void*)result->buffer, tensor->data, tensor_size, buffer_start, buffer_size);
+        GGML_LOG_INFO("[%s] tensor name: %s, buffer: %p, data: %p, size: %" PRIu64 ", buffer_start: %" PRIx64 ", buffer_size: %" PRIu64 "\n",
+            __func__, tensor->name, (void*)result->buffer, tensor->data, tensor_size, buffer_start, buffer_size);
         GGML_ASSERT(tensor->data + tensor_size >= tensor->data); // check for overflow
         GGML_ASSERT(tensor->data >= buffer_start);
         GGML_ASSERT(tensor->data + tensor_size <= buffer_start + buffer_size);
