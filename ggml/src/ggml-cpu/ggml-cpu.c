@@ -8408,10 +8408,10 @@ static void ggml_compute_forward_reshape(
         const struct ggml_compute_params * params,
         struct ggml_tensor * dst) {
     // NOP
-    // if(dst->buffer!=dst->src[0]->buffer) {
-    //     // if the dst tensor is not in the same buffer as the src tensor, we need to copy the data
-    //     ggml_compute_forward_dup(params, dst);
-    // }
+    if(dst->buffer!=dst->src[0]->buffer) {
+        // if the dst tensor is not in the same buffer as the src tensor, we need to copy the data
+        ggml_compute_forward_dup(params, dst);
+    }
     // UNUSED(params);
     // UNUSED(dst);
 }
