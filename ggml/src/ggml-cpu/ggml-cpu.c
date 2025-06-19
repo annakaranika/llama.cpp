@@ -8422,44 +8422,16 @@ static void ggml_compute_forward_view(
         const struct ggml_compute_params * params,
         const struct ggml_tensor * dst) {
     // NOP
-    if(dst->buffer!=dst->src[0]->buffer) {
-        // if the dst tensor is not in the same buffer as the src tensor, we need to copy the data
-        const struct ggml_tensor * src = dst->src[0];
-        // struct ggml_tensor dst_copy = {
-        // /*.type         =*/ dst->type,
-        // /*.buffer       =*/ dst->buffer,
-        // /*.ne           =*/ {src->ne[0], src->ne[1], src->ne[2], src->ne[3]},
-        // /*.nb           =*/ {src->nb[0], src->nb[1], src->nb[2], src->nb[3]},
-        // /*.op           =*/ dst->op,
-        // /*.op_params    =*/ {},
-        // /*.flags        =*/ dst->flags,
-        // /*.src          =*/ {},
-        // /*.view_src     =*/ dst->view_src,
-        // /*.view_offs    =*/ dst->view_offs,
-        // /*.data         =*/ dst->data,
-        // /*.name         =*/ {},
-        // /*.extra        =*/ dst->extra,
-        // /*.padding      =*/ {},
-        // };
-        // for(int i=0;i<GGML_MAX_OP_PARAMS / sizeof(int32_t); i++) {
-        //     dst_copy.op_params[i] = dst->op_params[i];
-        // }
-        // for(int i=0;i<GGML_MAX_SRC; i++) {
-        //     dst_copy.src[i] = dst->src[i];
-        // }
-        // for(int i=0;i<GGML_MAX_NAME; i++) {
-        //     dst_copy.name[i] = dst->name[i];
-        // }
-        // for(int i=0;i<8;i++){
-        //     dst_copy.padding[i] = dst->padding[i];
-        // }
-        struct ggml_tensor dst_copy = *dst;  
-        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
-            dst_copy.ne[i] = src->ne[i];
-            dst_copy.nb[i] = src->nb[i];
-        }
-        ggml_compute_forward_dup(params, &dst_copy);
-    }
+    // if(dst->buffer!=dst->src[0]->buffer) {
+    //     // if the dst tensor is not in the same buffer as the src tensor, we need to copy the data
+    //     const struct ggml_tensor * src = dst->src[0];
+    //     struct ggml_tensor dst_copy = *dst;  
+    //     for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+    //         dst_copy.ne[i] = src->ne[i];
+    //         dst_copy.nb[i] = src->nb[i];
+    //     }
+    //     ggml_compute_forward_dup(params, &dst_copy);
+    // }
     // UNUSED(params);
     // UNUSED(dst);
 }
