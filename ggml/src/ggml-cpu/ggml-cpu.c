@@ -8422,16 +8422,16 @@ static void ggml_compute_forward_view(
         const struct ggml_compute_params * params,
         const struct ggml_tensor * dst) {
     // NOP
-    // if(dst->buffer!=dst->src[0]->buffer) {
-    //     // if the dst tensor is not in the same buffer as the src tensor, we need to copy the data
-    //     const struct ggml_tensor * src = dst->src[0];
-    //     struct ggml_tensor dst_copy = *dst;  
-    //     for (int i = 0; i < GGML_MAX_DIMS; ++i) {
-    //         dst_copy.ne[i] = src->ne[i];
-    //         dst_copy.nb[i] = src->nb[i];
-    //     }
-    //     ggml_compute_forward_dup(params, &dst_copy);
-    // }
+    if(dst->buffer!=dst->src[0]->buffer) {
+        // if the dst tensor is not in the same buffer as the src tensor, we need to copy the data
+        const struct ggml_tensor * src = dst->src[0];
+        struct ggml_tensor dst_copy = *dst;  
+        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+            dst_copy.ne[i] = src->ne[i];
+            dst_copy.nb[i] = src->nb[i];
+        }
+        ggml_compute_forward_dup(params, &dst_copy);
+    }
     // UNUSED(params);
     // UNUSED(dst);
 }
