@@ -8433,15 +8433,15 @@ static void ggml_compute_forward_view(
         /*.ne           =*/ {src->ne[0], src->ne[1], src->ne[2], src->ne[3]},
         /*.nb           =*/ {src->nb[0], src->nb[1], src->nb[2], src->nb[3]},
         /*.op           =*/ dst->op,
-        /*.op_params    =*/ NULL,
+        /*.op_params    =*/ {},
         /*.flags        =*/ dst->flags,
-        /*.src          =*/ NULL,
+        /*.src          =*/ {},
         /*.view_src     =*/ dst->view_src,
         /*.view_offs    =*/ dst->view_offs,
         /*.data         =*/ dst->data,
-        /*.name         =*/ NULL,
+        /*.name         =*/ {},
         /*.extra        =*/ dst->extra,
-        /*.padding      =*/ NULL,
+        /*.padding      =*/ {},
         };
         for(int i=0;i<GGML_MAX_OP_PARAMS / sizeof(int32_t); i++) {
             dst_copy.op_params[i] = dst->op_params[i];
