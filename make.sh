@@ -27,7 +27,7 @@ set -e
 
 rpis=("172.16.107.154" "172.16.112.192")
 model="models/tinyllama-1.1b-chat-v1.0.Q2_K.gguf"
-build_dir="build"
+build_dir="build-rpc"
 
 # Parse arguments
 restart=""

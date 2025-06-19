@@ -8409,8 +8409,12 @@ static void ggml_compute_forward_reshape(
         const struct ggml_compute_params * params,
         struct ggml_tensor * dst) {
     // NOP
-    UNUSED(params);
-    UNUSED(dst);
+    if(dst->buffer!=dst->src[0]->buffer) {
+        // if the dst tensor is not in the same buffer as the src tensor, we need to copy the data
+        ggml_compute_forward_dup(params, dst);
+    }
+    // UNUSED(params);
+    // UNUSED(dst);
 }
 
 // ggml_compute_forward_view
@@ -8419,8 +8423,12 @@ static void ggml_compute_forward_view(
         const struct ggml_compute_params * params,
         const struct ggml_tensor * dst) {
     // NOP
-    UNUSED(params);
-    UNUSED(dst);
+    if(dst->buffer!=dst->src[0]->buffer) {
+        // if the dst tensor is not in the same buffer as the src tensor, we need to copy the data
+        ggml_compute_forward_dup(params, dst);
+    }
+    // UNUSED(params);
+    // UNUSED(dst);
 }
 
 // ggml_compute_forward_permute
@@ -8429,8 +8437,12 @@ static void ggml_compute_forward_permute(
         const struct ggml_compute_params * params,
         const struct ggml_tensor * dst) {
     // NOP
-    UNUSED(params);
-    UNUSED(dst);
+    if(dst->buffer!=dst->src[0]->buffer) {
+        // if the dst tensor is not in the same buffer as the src tensor, we need to copy the data
+        ggml_compute_forward_dup(params, dst);
+    }
+    // UNUSED(params);
+    // UNUSED(dst);
 }
 
 // ggml_compute_forward_transpose
@@ -8439,8 +8451,12 @@ static void ggml_compute_forward_transpose(
         const struct ggml_compute_params * params,
         const struct ggml_tensor * dst) {
     // NOP
-    UNUSED(params);
-    UNUSED(dst);
+    if(dst->buffer!=dst->src[0]->buffer) {
+        // if the dst tensor is not in the same buffer as the src tensor, we need to copy the data
+        ggml_compute_forward_dup(params, dst);
+    }
+    // UNUSED(params);
+    // UNUSED(dst);
 }
 
 // ggml_compute_forward_get_rows
@@ -8603,6 +8619,8 @@ static void ggml_compute_forward_get_rows_f32(
         const int64_t i11 = (i - i12*ne11*ne10)/ne10;
         const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
         const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
+
+        GGML_LOG_INFO("get_rows_f32: i01 = %lld, ne01 = %lld", i01, ne01);
 
         GGML_ASSERT(i01 >= 0 && i01 < ne01);
 
