@@ -635,7 +635,7 @@ static rpc_tensor split_serialize_tensor(const ggml_tensor * tensor, const ggml_
 static void ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *)buffer->  buft->context;
-    // GGML_LOG_INFO("[%s] initializing tensor %s, type=%d, buffer=%" PRIx64 "data=%" PRIx64 "\n", __func__, tensor->name, tensor->type, ctx->remote_ptr, tensor->data);
+    GGML_LOG_INFO("[%s] initializing tensor %s, type=%d, buffer=%" PRIx64 "data=%" PRIx64 "\n", __func__, tensor->name, tensor->type, ctx->remote_ptr, tensor->data);
 
     //if split, store a copy of tensor on every rpc server, and store the buffer context for each server in extra
     if(split){   
