@@ -254,13 +254,13 @@ void ggml_backend_tensor_get_async(ggml_backend_t backend, const struct ggml_ten
 void ggml_backend_tensor_set(struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     GGML_ASSERT(tensor);
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
-    if (strcmp(tensor->name, "inp_tokens") == 0) {
-        GGML_LOG_INFO("%s: tensor %s, data:\n", __func__, tensor->name);
-        for (int64_t i = 0; i < tensor->ne[0]; i++) {
-            GGML_LOG_INFO(" %d", ((const uint8_t *)data)[i]);
-        }
-        GGML_LOG_INFO("\n");
-    }
+    // if (strcmp(tensor->name, "inp_tokens") == 0) {
+    //     GGML_LOG_INFO("%s: tensor %s, data:\n", __func__, tensor->name);
+    //     for (int64_t i = 0; i < tensor->ne[0]; i++) {
+    //         GGML_LOG_INFO(" %d", ((const uint8_t *)data)[i]);
+    //     }
+    //     GGML_LOG_INFO("\n");
+    // }
 
     if (size == 0) {
         return;

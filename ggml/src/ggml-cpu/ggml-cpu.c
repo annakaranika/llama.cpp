@@ -8412,8 +8412,8 @@ static void ggml_compute_forward_reshape(
     //     // if the dst tensor is not in the same buffer as the src tensor, we need to copy the data
     //     ggml_compute_forward_dup(params, dst);
     // }
-    // UNUSED(params);
-    // UNUSED(dst);
+    UNUSED(params);
+    UNUSED(dst);
 }
 
 // ggml_compute_forward_view
@@ -8432,8 +8432,8 @@ static void ggml_compute_forward_view(
     //     }
     //     ggml_compute_forward_dup(params, &dst_copy);
     // }
-    // UNUSED(params);
-    // UNUSED(dst);
+    UNUSED(params);
+    UNUSED(dst);
 }
 
 // ggml_compute_forward_permute
@@ -8446,8 +8446,8 @@ static void ggml_compute_forward_permute(
     //     // if the dst tensor is not in the same buffer as the src tensor, we need to copy the data
     //     ggml_compute_forward_dup(params, dst);
     // }
-    // UNUSED(params);
-    // UNUSED(dst);
+    UNUSED(params);
+    UNUSED(dst);
 }
 
 // ggml_compute_forward_transpose
@@ -8460,8 +8460,8 @@ static void ggml_compute_forward_transpose(
     //     // if the dst tensor is not in the same buffer as the src tensor, we need to copy the data
     //     ggml_compute_forward_dup(params, dst);
     // }
-    // UNUSED(params);
-    // UNUSED(dst);
+    UNUSED(params);
+    UNUSED(dst);
 }
 
 // ggml_compute_forward_get_rows

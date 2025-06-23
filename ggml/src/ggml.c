@@ -1150,6 +1150,10 @@ int64_t ggml_nrows(const struct ggml_tensor * tensor) {
     return tensor->ne[1]*tensor->ne[2]*tensor->ne[3];
 }
 
+int64_t ggml_ncols(const struct ggml_tensor * tensor) {
+    return tensor->ne[0];
+}
+
 size_t ggml_nbytes(const struct ggml_tensor * tensor) {
     size_t nbytes;
     const size_t blck_size = ggml_blck_size(tensor->type);

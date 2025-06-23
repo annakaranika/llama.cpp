@@ -71,4 +71,4 @@ done
 rpc_arg="${rpc_arg%,}"
 
 # GGML_SCHED_DEBUG=2 ./$build_dir/bin/llama-cli -v -m $model --rpc $rpc_arg -ngl 23 -sm row
-./$build_dir/bin/llama-cli -v -m $model --rpc $rpc_arg -ngl 23 -sm row
+./$build_dir/bin/llama-cli -m $model --rpc $rpc_arg -ngl 23 -sm row
