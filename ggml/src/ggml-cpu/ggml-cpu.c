@@ -14004,6 +14004,25 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             fprintf(out, "\n");
             printed+=1;
         }
+        if(strcmp(node->name,"node_696")==0||strcmp(node->name,"node_697")==0){
+            struct ggml_tensor* src0= node->src[0];
+            struct ggml_tensor* src1= node->src[1];
+            fprintf(out, "src0: \n",src0->name);
+            size_t size = ggml_nbytes(src0);
+            const float * float_ptr = (const float *) src0->data;
+            for (size_t j = 0; j < size / sizeof(float); ++j) {
+                fprintf(out, "%f ", float_ptr[j]);
+            }
+            fprintf(out, "\n");
+
+            fprintf(out, "src1: \n",src1->name);
+            size_t size = ggml_nbytes(src1);
+            const float * float_ptr = (const float *) src1->data;
+            for (size_t j = 0; j < size / sizeof(float); ++j) {
+                fprintf(out, "%f ", float_ptr[j]);
+            }
+            fprintf(out, "\n");
+        }
         pthread_mutex_unlock(&file_mutex);
     }
     printed=-1;
