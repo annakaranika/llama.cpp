@@ -14006,6 +14006,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         }
         pthread_mutex_unlock(&file_mutex);
     }
+    printed=-1;
     fclose(out);
     //GGML_LOG_INFO("ggml_graph_compute_thread: thread %d finished\n", state->ith);
     ggml_barrier(state->threadpool);
