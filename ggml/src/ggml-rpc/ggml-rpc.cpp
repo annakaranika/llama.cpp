@@ -60,7 +60,7 @@ struct socket_t {
     sockfd_t fd;
 
     socket_t(sockfd_t fd) : fd(fd) {}
-
+    
     ~socket_t() {
         GGML_PRINT_DEBUG("[%s] closing socket %d\n", __func__, this->fd);
 #ifdef _WIN32
@@ -73,7 +73,6 @@ struct socket_t {
 
 // all RPC structures must be packed
 #pragma pack(push, 1)
-
 // ggml_tensor is serialized into rpc_tensor
 struct rpc_tensor {
     uint64_t id;
@@ -88,7 +87,7 @@ struct rpc_tensor {
     uint64_t view_src;
     uint64_t view_offs;
     uint64_t data;
-    char     name[GGML_MAX_NAME];
+    char name[GGML_MAX_NAME];
 
     char padding[4];
 };
@@ -128,8 +127,8 @@ struct rpc_msg_init_tensor_req {
 
 struct rpc_msg_split_init_tensor_req {
     rpc_tensor tensor;
-    int64_t    row_low;
-    int64_t    row_high;
+    int64_t row_low;
+    int64_t row_high;
 };
 
 struct rpc_msg_alloc_buffer_req {
@@ -163,13 +162,13 @@ struct rpc_msg_free_buffer_req {
 
 struct rpc_msg_buffer_clear_req {
     uint64_t remote_ptr;
-    uint8_t  value;
+    uint8_t value;
 };
 
 struct rpc_msg_get_tensor_req {
     rpc_tensor tensor;
-    uint64_t   offset;
-    uint64_t   size;
+    uint64_t offset;
+    uint64_t size;
 };
 
 struct rpc_msg_copy_tensor_req {
@@ -191,10 +190,9 @@ struct rpc_msg_get_device_memory_rsp {
     uint64_t total_mem;
 };
 
-struct rpc_msg_set_split_rsp {
+struct rpc_msg_set_split_rsp{
     uint8_t result;
 };
-
 #pragma pack(pop)
 
 // RPC data structures
@@ -208,8 +206,8 @@ static ggml_guid_t ggml_backend_rpc_guid() {
 struct ggml_backend_rpc_buffer_type_context {
     std::string endpoint;
     std::string name;
-    size_t      alignment;
-    size_t      max_size;
+    size_t alignment;
+    size_t max_size;
 };
 
 struct ggml_backend_rpc_context {
@@ -219,8 +217,8 @@ struct ggml_backend_rpc_context {
 
 struct ggml_backend_rpc_buffer_context {
     std::shared_ptr<socket_t> sock;
-    void *                    base_ptr;
-    uint64_t                  remote_ptr;
+    void * base_ptr;
+    uint64_t remote_ptr;
 };
 
 struct ggml_tensor_extra_rpc {
@@ -229,24 +227,24 @@ struct ggml_tensor_extra_rpc {
     std::pair<int64_t, int64_t>              rows[RPC_MAX_DEVICES];
     int                                      split_dim = -1;
 };
-
 //split context
 struct ggml_backend_rpc_split_buffer_type_context {
     // int main_device;
-    std::string                        endpoint;
-    size_t                             alignment;
-    size_t                             max_size;
+    std::string endpoint;
+    size_t alignment;
+    size_t max_size;
     std::array<float, RPC_MAX_DEVICES> tensor_split;
-    std::string                        name;
+    std::string name;
 };
 
 static bool split = false;
+
 
 struct ggml_backend_rpc_reg_context {
     std::vector<ggml_backend_dev_t> devices;
 };
 
-static ggml_backend_rpc_reg_context * reg_ctx = new ggml_backend_rpc_reg_context;
+static ggml_backend_rpc_reg_context* reg_ctx = new ggml_backend_rpc_reg_context;
 
 struct ggml_backend_rpc_device_context {
     std::string endpoint;
@@ -259,15 +257,13 @@ static int ggml_backend_rpc_get_device_count() {
 
 static int ggml_backend_rpc_get_device_id(const char * endpoint) {
     for (int i = 0; i < ggml_backend_rpc_get_device_count(); ++i) {
-        if (reg_ctx->devices[i]->context &&
-            std::strcmp(((ggml_backend_rpc_device_context *) reg_ctx->devices[i]->context)->endpoint.c_str(),
-                        endpoint) == 0) {
+        if (reg_ctx->devices[i]->context && 
+            std::strcmp(((ggml_backend_rpc_device_context *)reg_ctx->devices[i]->context)->endpoint.c_str(), endpoint) == 0) {
             return i;
         }
     }
     return -1;
 }
-
 // RPC helper functions
 
 static std::shared_ptr<socket_t> make_socket(sockfd_t fd) {
@@ -286,20 +282,20 @@ static std::shared_ptr<socket_t> make_socket(sockfd_t fd) {
 static bool set_no_delay(sockfd_t sockfd) {
     int flag = 1;
     // set TCP_NODELAY to disable Nagle's algorithm
-    int ret  = setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, (char *) &flag, sizeof(int));
+    int ret = setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
     return ret == 0;
 }
 
 static bool set_reuse_addr(sockfd_t sockfd) {
     int flag = 1;
-    int ret  = setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, (char *) &flag, sizeof(int));
+    int ret = setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, (char *)&flag, sizeof(int));
     return ret == 0;
 }
 
 static std::shared_ptr<socket_t> socket_connect(const char * host, int port) {
     struct sockaddr_in addr;
-    auto               sockfd   = socket(AF_INET, SOCK_STREAM, 0);
-    auto               sock_ptr = make_socket(sockfd);
+    auto sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    auto sock_ptr = make_socket(sockfd);
     if (sock_ptr == nullptr) {
         return nullptr;
     }
@@ -307,15 +303,15 @@ static std::shared_ptr<socket_t> socket_connect(const char * host, int port) {
         fprintf(stderr, "Failed to set TCP_NODELAY\n");
         return nullptr;
     }
-    addr.sin_family         = AF_INET;
-    addr.sin_port           = htons(port);
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
     struct hostent * server = gethostbyname(host);
     if (server == NULL) {
         fprintf(stderr, "Cannot resolve host '%s'\n", host);
         return nullptr;
     }
     memcpy(&addr.sin_addr.s_addr, server->h_addr, server->h_length);
-    if (connect(sock_ptr->fd, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
+    if (connect(sock_ptr->fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         return nullptr;
     }
     return sock_ptr;
@@ -323,7 +319,7 @@ static std::shared_ptr<socket_t> socket_connect(const char * host, int port) {
 
 static std::shared_ptr<socket_t> socket_accept(sockfd_t srv_sockfd) {
     auto client_socket_fd = accept(srv_sockfd, NULL, NULL);
-    auto client_socket    = make_socket(client_socket_fd);
+    auto client_socket = make_socket(client_socket_fd);
     if (client_socket == nullptr) {
         return nullptr;
     }
@@ -336,7 +332,7 @@ static std::shared_ptr<socket_t> socket_accept(sockfd_t srv_sockfd) {
 
 static std::shared_ptr<socket_t> create_server_socket(const char * host, int port) {
     auto sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    auto sock   = make_socket(sockfd);
+    auto sock = make_socket(sockfd);
     if (sock == nullptr) {
         return nullptr;
     }
@@ -349,9 +345,9 @@ static std::shared_ptr<socket_t> create_server_socket(const char * host, int por
         return nullptr;
     }
     struct sockaddr_in serv_addr;
-    serv_addr.sin_family      = AF_INET;
+    serv_addr.sin_family = AF_INET;
     serv_addr.sin_addr.s_addr = inet_addr(host);
-    serv_addr.sin_port        = htons(port);
+    serv_addr.sin_port = htons(port);
 
     if (bind(sockfd, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) < 0) {
         return nullptr;
@@ -365,7 +361,7 @@ static std::shared_ptr<socket_t> create_server_socket(const char * host, int por
 static bool send_data(sockfd_t sockfd, const void * data, size_t size) {
     size_t bytes_sent = 0;
     while (bytes_sent < size) {
-        ssize_t n = send(sockfd, (const char *) data + bytes_sent, size - bytes_sent, 0);
+        ssize_t n = send(sockfd, (const char *)data + bytes_sent, size - bytes_sent, 0);
         if (n < 0) {
             return false;
         }
@@ -377,12 +373,12 @@ static bool send_data(sockfd_t sockfd, const void * data, size_t size) {
 static bool recv_data(sockfd_t sockfd, void * data, size_t size) {
     size_t bytes_recv = 0;
     while (bytes_recv < size) {
-        ssize_t n = recv(sockfd, (char *) data + bytes_recv, size - bytes_recv, 0);
+        ssize_t n = recv(sockfd, (char *)data + bytes_recv, size - bytes_recv, 0);
         if (n <= 0) {
             if (n < 0) {
                 GGML_LOG_INFO("recv failed: %s\n", strerror(errno));
             } else {
-                GGML_LOG_INFO("Connection closed by peer\n");
+                GGML_LOG_INFO( "Connection closed by peer\n");
             }
             return false;
         }
@@ -435,8 +431,7 @@ static bool parse_endpoint(const std::string & endpoint, std::string & host, int
 
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // RPC response: | response_size (8 bytes) | response_data (response_size bytes) |
-static bool send_rpc_cmd(const std::shared_ptr<socket_t> & sock, enum rpc_cmd cmd, const void * input,
-                         size_t input_size, void * output, size_t output_size) {
+static bool send_rpc_cmd(const std::shared_ptr<socket_t> & sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
     uint8_t cmd_byte = cmd;
     if (!send_data(sock->fd, &cmd_byte, sizeof(cmd_byte))) {
         GGML_LOG_INFO("Failed to send command byte %d\n", cmd_byte);
@@ -471,10 +466,10 @@ static bool send_rpc_cmd(const std::shared_ptr<socket_t> & sock, enum rpc_cmd cm
 // RPC client-side implementation
 
 static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
-    static std::mutex                                               mutex;
-    std::lock_guard<std::mutex>                                     lock(mutex);
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
     static std::unordered_map<std::string, std::weak_ptr<socket_t>> sockets;
-    static bool                                                     initialized = false;
+    static bool initialized = false;
 
     auto it = sockets.find(endpoint);
     if (it != sockets.end()) {
@@ -483,14 +478,14 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
         }
     }
     std::string host;
-    int         port;
+    int port;
     if (!parse_endpoint(endpoint, host, port)) {
         return nullptr;
     }
 #ifdef _WIN32
     if (!initialized) {
         WSADATA wsaData;
-        int     res = WSAStartup(MAKEWORD(2, 2), &wsaData);
+        int res = WSAStartup(MAKEWORD(2, 2), &wsaData);
         if (res != 0) {
             return nullptr;
         }
@@ -510,22 +505,21 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
 
 static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     //how to free a buffer on other servers?
-    ggml_backend_rpc_buffer_context * ctx     = (ggml_backend_rpc_buffer_context *) buffer->context;
-    rpc_msg_free_buffer_req           request = { ctx->remote_ptr };
+    ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+    rpc_msg_free_buffer_req request = {ctx->remote_ptr};
     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_FREE_BUFFER, &request, sizeof(request), nullptr, 0);
     GGML_ASSERT(status);
     delete ctx;
 }
 
 static void * ggml_backend_rpc_buffer_get_base(ggml_backend_buffer_t buffer) {
-    ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *) buffer->context;
+    ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     if (ctx->base_ptr != nullptr) {
         return ctx->base_ptr;
     }
-    rpc_msg_buffer_get_base_req request = { ctx->remote_ptr };
+    rpc_msg_buffer_get_base_req request = {ctx->remote_ptr};
     rpc_msg_buffer_get_base_rsp response;
-    bool                        status =
-        send_rpc_cmd(ctx->sock, RPC_CMD_BUFFER_GET_BASE, &request, sizeof(request), &response, sizeof(response));
+    bool status = send_rpc_cmd(ctx->sock, RPC_CMD_BUFFER_GET_BASE, &request, sizeof(request), &response, sizeof(response));
     GGML_ASSERT(status);
     ctx->base_ptr = reinterpret_cast<void *>(response.base_ptr);
     return ctx->base_ptr;
@@ -535,7 +529,7 @@ static void * ggml_backend_rpc_buffer_context_get_base(ggml_backend_rpc_buffer_c
     if (ctx->base_ptr != nullptr) {
         return ctx->base_ptr;
     }
-    rpc_msg_buffer_get_base_req request = { ctx->remote_ptr };
+    rpc_msg_buffer_get_base_req request = {ctx->remote_ptr};
     rpc_msg_buffer_get_base_rsp response;
     bool                        status =
         send_rpc_cmd(ctx->sock, RPC_CMD_BUFFER_GET_BASE, &request, sizeof(request), &response, sizeof(response));
@@ -567,9 +561,9 @@ static rpc_tensor serialize_tensor(const ggml_tensor * tensor) {
     for (uint32_t i = 0; i < GGML_MAX_SRC; i++) {
         result.src[i] = reinterpret_cast<uint64_t>(tensor->src[i]);
     }
-    result.view_src  = reinterpret_cast<uint64_t>(tensor->view_src);
+    result.view_src = reinterpret_cast<uint64_t>(tensor->view_src);
     result.view_offs = tensor->view_offs;
-    result.data      = reinterpret_cast<uint64_t>(tensor->data);
+    result.data = reinterpret_cast<uint64_t>(tensor->data);
     snprintf(result.name, GGML_MAX_NAME, "%s", tensor->name);
     return result;
 }
@@ -577,13 +571,12 @@ static rpc_tensor serialize_tensor(const ggml_tensor * tensor) {
 //struct description: spilt buffer needs to have a context. Here define the context to store the information 
 struct ggml_backend_rpc_split_buffer_context {
     ~ggml_backend_rpc_split_buffer_context() {
-        for (ggml_tensor_extra_rpc * extra : tensor_extras) {
+        for(ggml_tensor_extra_rpc * extra : tensor_extras) {
             auto ctx_item = extra->buffer_ctx;
             for (int i = 0; i < RPC_MAX_DEVICES; ++i) {
                 if (ctx_item[i]) {
-                    rpc_msg_free_buffer_req request = { ctx_item[i]->remote_ptr };
-                    bool                    status =
-                        send_rpc_cmd(ctx_item[i]->sock, RPC_CMD_FREE_BUFFER, &request, sizeof(request), nullptr, 0);
+                    rpc_msg_free_buffer_req request = {ctx_item[i]->remote_ptr};
+                    bool status = send_rpc_cmd(ctx_item[i]->sock, RPC_CMD_FREE_BUFFER, &request, sizeof(request), nullptr, 0);
                     GGML_ASSERT(status);
                 }
                 delete ctx_item[i];
@@ -591,21 +584,18 @@ struct ggml_backend_rpc_split_buffer_context {
             delete extra;
         }
     }
-
     std::vector<ggml_tensor_extra_rpc *> tensor_extras;
 };
 
-//by rows or columns
-static rpc_tensor split_serialize_tensor(const ggml_tensor * tensor, const ggml_tensor_extra_rpc * extra,
-                                         int device_id) {
+//by rows
+static rpc_tensor split_serialize_tensor(const ggml_tensor * tensor, const ggml_tensor_extra_rpc * extra, int device_id) {
     rpc_tensor result;
-    result.id   = reinterpret_cast<uint64_t>(tensor);
+    result.id = reinterpret_cast<uint64_t>(tensor);
     result.type = tensor->type;
     if (extra) {
         ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *) extra->buffer_ctx[device_id];
         result.buffer = ctx->remote_ptr;  //use remote_ptr to find the exact buffer on the remote server
-        result.data   = reinterpret_cast<uint64_t>(
-            ggml_backend_rpc_buffer_context_get_base(reinterpret_cast<ggml_backend_rpc_buffer_context *>(ctx)));
+        result.data = reinterpret_cast<uint64_t>(ggml_backend_rpc_buffer_context_get_base(reinterpret_cast<ggml_backend_rpc_buffer_context *>(ctx)));
     } else {
         result.buffer = 0;
         GGML_LOG_INFO("Error: tensor %s has no extra info for split\n", tensor->name);
@@ -655,7 +645,7 @@ static rpc_tensor split_serialize_tensor(const ggml_tensor * tensor, const ggml_
     for (uint32_t i = 0; i < GGML_MAX_SRC; i++) {
         result.src[i] = reinterpret_cast<uint64_t>(tensor->src[i]);
     }
-    result.view_src  = reinterpret_cast<uint64_t>(tensor->view_src);
+    result.view_src = reinterpret_cast<uint64_t>(tensor->view_src);
     result.view_offs = tensor->view_offs;
 
     snprintf(result.name, GGML_MAX_NAME, "%s", tensor->name);
@@ -708,25 +698,21 @@ static void ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_t buffer, gg
                     }else{
                         size=ggml_nbytes(tensor);
                     }
-                    rpc_msg_alloc_buffer_req          request = { size };  //the size to allocate
+                    rpc_msg_alloc_buffer_req request = { size };  //the size to allocate
                     // GGML_LOG_INFO("[%s] allocating buffer for tensor %s on device %d, size=%zu\n", __func__, tensor->name, id, request.size);
-                    rpc_msg_alloc_buffer_rsp          response;
-                    ggml_backend_rpc_device_context * dev_ctx =
-                        (ggml_backend_rpc_device_context *) reg_ctx->devices[id]->context;
-                    if (dev_ctx->endpoint ==
-                        buft_ctx->endpoint) {  //for the main device, we already have the buffer context
+                    rpc_msg_alloc_buffer_rsp response;
+                    ggml_backend_rpc_device_context * dev_ctx = (ggml_backend_rpc_device_context *)reg_ctx->devices[id]->context;
+                    if(dev_ctx->endpoint==buft_ctx->endpoint) {  //for the main device, we already have the buffer context
                         extra->buffer_ctx[id] = ctx;
-                        extra->rows[id]       = { 0, tensor->ne[0] };
+                        extra->rows[id] = {0, tensor->ne[0]};
                         continue;
                     }
-                    auto sock   = get_socket(dev_ctx->endpoint);
-                    bool status = send_rpc_cmd(sock, RPC_CMD_ALLOC_BUFFER, &request, sizeof(request), &response,
-                                               sizeof(response));
+                    auto sock = get_socket(dev_ctx->endpoint);
+                    bool status = send_rpc_cmd(sock, RPC_CMD_ALLOC_BUFFER, &request, sizeof(request), &response, sizeof(response));
                     GGML_ASSERT(status);
                     if (response.remote_ptr != 0) {
-                        extra->buffer_ctx[id] =
-                            new ggml_backend_rpc_buffer_context{ sock, nullptr, response.remote_ptr };
-                        extra->rows[id] = { 0, tensor->ne[0] };
+                        extra->buffer_ctx[id] = new ggml_backend_rpc_buffer_context{sock, nullptr, response.remote_ptr};
+                        extra->rows[id] = {0, tensor->ne[0]};
                         // GGML_LOG_INFO("[%s] allocated buffer for tensor %s device %d, remote_ptr=%" PRIx64 ", remote_size=%" PRIu64 "\n", __func__, tensor->name, id, response.remote_ptr, response.remote_size);
                     } else {
                         GGML_LOG_INFO("[%s] failed to allocate buffer for device %d\n", __func__, id);
@@ -788,8 +774,7 @@ static void ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_t buffer, gg
                     }
                 }
 
-                bool status = send_rpc_cmd(get_socket(dev_ctx->endpoint), RPC_CMD_INIT_TENSOR, &request,
-                                           sizeof(request), nullptr, 0);
+                bool status = send_rpc_cmd(get_socket(dev_ctx->endpoint), RPC_CMD_INIT_TENSOR, &request, sizeof(request), nullptr, 0);
                 GGML_ASSERT(status);
             }
         }else{
@@ -803,58 +788,52 @@ static void ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_t buffer, gg
     }
 }
 
-static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data,
-                                               size_t offset, size_t size) {
+static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     // GGML_LOG_INFO("[%s] setting tensor %s, offset=%zu, size=%zu\n", __func__, tensor->name, offset, size);
     // GGML_LOG_INFO("ne0 = %ld ne1 = %ld nb0 = %ld nb1 =%ld nb2 = %ld\n",tensor->ne[0],tensor->ne[1],tensor->nb[0],tensor->nb[1],tensor->nb[2]);
-    ggml_backend_rpc_buffer_type_context * buft_ctx   = (ggml_backend_rpc_buffer_type_context *) buffer->buft->context;
-    ggml_backend_rpc_buffer_context *      ctx        = (ggml_backend_rpc_buffer_context *) buffer->context;
+    ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *)buffer->buft->context;
+    ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     // input serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes) |
-    size_t                                 input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + size;
-    std::vector<uint8_t>                   input(input_size, 0);
-    rpc_tensor                             rpc_tensor1 = serialize_tensor(tensor);
+    size_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + size;
+    std::vector<uint8_t> input(input_size, 0);
+    rpc_tensor rpc_tensor1 = serialize_tensor(tensor);
     // GGML_LOG_INFO("[%s] rpc_tensor.data=%" PRIx64 ", rpc_tensor.buffer=%" PRIx64 "\n", __func__, rpc_tensor1.data, rpc_tensor1.buffer);
     memcpy(input.data(), &rpc_tensor1, sizeof(rpc_tensor));
     memcpy(input.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
     memcpy(input.data() + sizeof(rpc_tensor) + sizeof(offset), data, size);
     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR, input.data(), input.size(), nullptr, 0);
-    if (!status) {
+    if(!status) {
         GGML_LOG_INFO("[%s] failed to set tensor %s, offset=%zu, size=%zu\n", __func__, tensor->name, offset, size);
     }
     GGML_ASSERT(status);
 
     // if split, we need to set the tensor on all other devices
-    if (split&&multi_cpy) {
-        ggml_tensor_extra_rpc * extra = (ggml_tensor_extra_rpc *) tensor->extra;
+    if(split&&multi_cpy){
+        ggml_tensor_extra_rpc * extra = (ggml_tensor_extra_rpc *)tensor->extra;
         for (int id = 0; id < ggml_backend_rpc_get_device_count(); ++id) {
-            ggml_backend_rpc_device_context * dev_ctx =
-                (ggml_backend_rpc_device_context *) reg_ctx->devices[id]->context;
-            if (dev_ctx->endpoint == buft_ctx->endpoint) {
+            ggml_backend_rpc_device_context * dev_ctx = (ggml_backend_rpc_device_context *)reg_ctx->devices[id]->context;
+            if(dev_ctx->endpoint==buft_ctx->endpoint){
                 continue;
             }
-
             // input serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes) |
-            size_t               input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + size;
+            size_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + size;
             std::vector<uint8_t> input_(input_size, 0);
-            rpc_tensor           rpc_tensor2 = serialize_tensor(tensor);
+            rpc_tensor rpc_tensor2 = serialize_tensor(tensor);
             //change the buffer and data pointer for this device
             if (extra->buffer_ctx[id] == nullptr) {
                 GGML_LOG_INFO("[%s] buffer context for device %d is null\n", __func__, id);
-            } else {
+            }else{
                 rpc_tensor2.buffer = extra->buffer_ctx[id]->remote_ptr;
-                rpc_tensor2.data   = reinterpret_cast<uint64_t>(ggml_backend_rpc_buffer_context_get_base(
-                    reinterpret_cast<ggml_backend_rpc_buffer_context *>(extra->buffer_ctx[id])));
+                rpc_tensor2.data = reinterpret_cast<uint64_t>(ggml_backend_rpc_buffer_context_get_base(reinterpret_cast<ggml_backend_rpc_buffer_context *>(extra->buffer_ctx[id])));
                 // GGML_LOG_INFO("rpc_tensor.data=%" PRIx64 ", rpc_tensor.buffer=%" PRIx64 "\n", rpc_tensor2.data, rpc_tensor2.buffer);
             }
             memcpy(input_.data(), &rpc_tensor2, sizeof(rpc_tensor));
             memcpy(input_.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
             memcpy(input_.data() + sizeof(rpc_tensor) + sizeof(offset), data, size);
 
-            bool status = send_rpc_cmd(get_socket(dev_ctx->endpoint), RPC_CMD_SET_TENSOR, input_.data(), input_.size(),
-                                       nullptr, 0);
-            if (!status) {
-                GGML_LOG_INFO("[%s] failed to set tensor %s, offset=%zu, size=%zu\n", __func__, tensor->name, offset,
-                              size);
+            bool status = send_rpc_cmd(get_socket(dev_ctx->endpoint), RPC_CMD_SET_TENSOR, input_.data(), input_.size(), nullptr, 0);
+            if(!status) {
+                GGML_LOG_INFO("[%s] failed to set tensor %s, offset=%zu, size=%zu\n", __func__, tensor->name, offset, size);
             }
             GGML_ASSERT(status);
         }
@@ -1143,8 +1122,7 @@ static void ggml_backend_rpc_split_buffer_init_tensor(ggml_backend_buffer_t buff
             ggml_backend_rpc_device_context * dev_ctx =
                 (ggml_backend_rpc_device_context *) reg_ctx->devices[id]->context;
             //now use the same command, the server don't know it just has part of the tensor
-            bool status =
-                send_rpc_cmd(get_socket(dev_ctx->endpoint), RPC_CMD_INIT_TENSOR, &request, sizeof(request), nullptr, 0);
+            bool status = send_rpc_cmd(get_socket(dev_ctx->endpoint), RPC_CMD_INIT_TENSOR, &request, sizeof(request), nullptr, 0);
             GGML_ASSERT(status);
         }
     }
@@ -1584,7 +1562,7 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_split_buffer_type(int main_de
     if (all_zero) {
         // TODO: tensor_split_arr = ggml_rpc_info().default_tensor_split;
         // For now, we just use equal split
-        float split_sum     = 0.0f;
+        float split_sum = 0.0f;
         float default_split = 1.0f / ggml_backend_rpc_get_device_count();
         for (int i = 0; i < ggml_backend_rpc_get_device_count(); ++i) {
             tensor_split_arr[i] = split_sum;
@@ -1669,22 +1647,16 @@ static void ggml_backend_rpc_synchronize(ggml_backend_t backend) {
 
 static void add_tensor(ggml_tensor * tensor, std::vector<rpc_tensor> & tensors,
                        std::unordered_set<ggml_tensor *> & visited) {
-    // GGML_LOG_INFO("tensor: %p\n",tensor);
     if (tensor == nullptr) {
-        // GGML_LOG_INFO("NONE TENSOR\n");
         return;
     }
-    // GGML_LOG_INFO("tensor name: %s\n",tensor->name);
     if (visited.find(tensor) != visited.end()) {
         return;
     }
     visited.insert(tensor);
-    // GGML_LOG_INFO("\nadd src\n");
     for (int i = 0; i < GGML_MAX_SRC; i++) {
-        // GGML_LOG_INFO("\nadd src %d\n",i);
         add_tensor(tensor->src[i], tensors, visited);
-    }
-    // GGML_LOG_INFO("add view_src\n");
+    };
     add_tensor(tensor->view_src, tensors, visited);
     tensors.push_back(serialize_tensor(tensor));
 }

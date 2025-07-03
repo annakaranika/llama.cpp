@@ -8625,7 +8625,7 @@ static void ggml_compute_forward_get_rows_f32(
         const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
         const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
 
-        GGML_LOG_INFO("get_rows_f32: i01 = %lld, ne01 = %lld", i01, ne01);
+        GGML_LOG_INFO("name: %s, get_rows_f32: i01 = %lld, ne01 = %lld", dst->name, i01, ne01);
 
         GGML_ASSERT(i01 >= 0 && i01 < ne01);
 
@@ -13968,6 +13968,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     };
 
     //GGML_LOG_INFO("compute graph for each node\n");
+    FILE *out = fopen("tensor_dump.txt","a");
+    if (!out) {
+        fprintf(stderr, "Failed to open file for writing\n");
+        return;
+    }
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
         //GGML_LOG_INFO("compute node %d/%d: %s\n", node_n, cgraph->n_nodes, node->name);
@@ -13983,7 +13988,15 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             //GGML_LOG_INFO("ggml_graph_compute_thread: thread %d waiting for other threads to finish node %d/%d\n", state->ith, node_n + 1, cgraph->n_nodes);
             ggml_barrier(state->threadpool);
         }
+        fprintf(out, "tensor data for %s after computation: \n",node->name);
+        size_t size = ggml_nbytes(node);
+        const float * float_ptr = (const float *) node->data;
+        for (size_t j = 0; j < size / sizeof(float); ++j) {
+            fprintf(out, "%f ", float_ptr[j]);
+        }
+        fprintf(out, "\n");
     }
+    fclose(out);
     //GGML_LOG_INFO("ggml_graph_compute_thread: thread %d finished\n", state->ith);
     ggml_barrier(state->threadpool);
 
