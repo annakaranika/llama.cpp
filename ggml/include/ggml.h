@@ -607,6 +607,8 @@ extern "C" {
         char padding[8];
     };
 
+    
+
     static const size_t GGML_TENSOR_SIZE = sizeof(struct ggml_tensor);
 
     // Abort callback
@@ -641,6 +643,7 @@ extern "C" {
 
     GGML_API int64_t ggml_nelements (const struct ggml_tensor * tensor);
     GGML_API int64_t ggml_nrows     (const struct ggml_tensor * tensor);
+    GGML_API int64_t ggml_ncols     (const struct ggml_tensor * tensor);
     GGML_API size_t  ggml_nbytes    (const struct ggml_tensor * tensor);
     GGML_API size_t  ggml_nbytes_pad(const struct ggml_tensor * tensor); // same as ggml_nbytes() but padded to GGML_MEM_ALIGN
 
