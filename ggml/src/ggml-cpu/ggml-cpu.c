@@ -1249,8 +1249,7 @@ typedef SRWLOCK            ggml_mutex_t;
 
 typedef pthread_cond_t     ggml_cond_t;
 typedef pthread_mutex_t    ggml_mutex_t;
-pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
-bool printed = false;
+
 
 #define ggml_mutex_init(m)          pthread_mutex_init(m, NULL)
 #define ggml_mutex_destroy(m)       pthread_mutex_destroy(m)
