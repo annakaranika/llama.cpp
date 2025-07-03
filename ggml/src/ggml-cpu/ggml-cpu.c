@@ -1249,6 +1249,8 @@ typedef SRWLOCK            ggml_mutex_t;
 
 typedef pthread_cond_t     ggml_cond_t;
 typedef pthread_mutex_t    ggml_mutex_t;
+pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
+bool printed = false;
 
 #define ggml_mutex_init(m)          pthread_mutex_init(m, NULL)
 #define ggml_mutex_destroy(m)       pthread_mutex_destroy(m)
@@ -1276,6 +1278,9 @@ typedef pthread_mutex_t    ggml_mutex_t;
 #define ggml_thread_join   pthread_join
 
 #endif
+
+pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
+int printed = -1;
 
 // Threadpool def
 struct ggml_threadpool {
@@ -13988,13 +13993,19 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             //GGML_LOG_INFO("ggml_graph_compute_thread: thread %d waiting for other threads to finish node %d/%d\n", state->ith, node_n + 1, cgraph->n_nodes);
             ggml_barrier(state->threadpool);
         }
-        fprintf(out, "tensor data for %s after computation: \n",node->name);
-        size_t size = ggml_nbytes(node);
-        const float * float_ptr = (const float *) node->data;
-        for (size_t j = 0; j < size / sizeof(float); ++j) {
-            fprintf(out, "%f ", float_ptr[j]);
+
+        pthread_mutex_lock(&file_mutex);
+        if(printed==node_n-1){
+            fprintf(out, "tensor data for %s after computation: \n",node->name);
+            size_t size = ggml_nbytes(node);
+            const float * float_ptr = (const float *) node->data;
+            for (size_t j = 0; j < size / sizeof(float); ++j) {
+                fprintf(out, "%f ", float_ptr[j]);
+            }
+            fprintf(out, "\n");
+            printed+=1;
         }
-        fprintf(out, "\n");
+        pthread_mutex_unlock(&file_mutex);
     }
     fclose(out);
     //GGML_LOG_INFO("ggml_graph_compute_thread: thread %d finished\n", state->ith);
