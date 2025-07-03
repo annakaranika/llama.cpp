@@ -14016,10 +14016,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             fprintf(out, "\n");
 
             fprintf(out, "src1: \n",src1->name);
-            size_t size = ggml_nbytes(src1);
-            const float * float_ptr = (const float *) src1->data;
+            size = ggml_nbytes(src1);
+            const float * float_ptr2 = (const float *) src1->data;
             for (size_t j = 0; j < size / sizeof(float); ++j) {
-                fprintf(out, "%f ", float_ptr[j]);
+                fprintf(out, "%f ", float_ptr2[j]);
             }
             fprintf(out, "\n");
         }
