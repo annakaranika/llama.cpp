@@ -14000,6 +14000,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             fprintf(out, "size: %ld ne0: %ld ne1: %ld ne2: %ld ne3: %ld\n", size,node->ne[0],node->ne[1],node->ne[2],node->ne[3]);
             const float * float_ptr = (const float *) node->data;
             for (size_t j = 0; j < size / sizeof(float); ++j) {
+                if(j%1024==0){
+                    fprintf(out, "\n");
+                }
                 fprintf(out, "%f ", float_ptr[j]);
             }
             fprintf(out, "\n");
@@ -14010,6 +14013,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
                 size_t size = ggml_nbytes(src0);
                 const float * float_ptr = (const float *) src0->data;
                 for (size_t j = 0; j < size / sizeof(float); ++j) {
+                    if(j%1024==0){
+                        fprintf(out, "\n");
+                    }
                     fprintf(out, "%f ", float_ptr[j]);
                 }
                 fprintf(out, "\n");
@@ -14018,6 +14024,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
                 size = ggml_nbytes(src1);
                 const float * float_ptr2 = (const float *) src1->data;
                 for (size_t j = 0; j < size / sizeof(float); ++j) {
+                    if(j%1024==0){
+                        fprintf(out, "\n");
+                    }
                     fprintf(out, "%f ", float_ptr2[j]);
                 }
                 fprintf(out, "\n");
