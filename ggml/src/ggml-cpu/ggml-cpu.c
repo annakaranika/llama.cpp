@@ -1278,7 +1278,7 @@ typedef pthread_mutex_t    ggml_mutex_t;
 
 #endif
 
-int printed = -1;
+static int printed = -1;
 
 // Threadpool def
 struct ggml_threadpool {
