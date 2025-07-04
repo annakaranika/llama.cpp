@@ -13995,6 +13995,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         pthread_mutex_lock(&file_mutex);
         if(printed==node_n-1){
+            printed+=1;
             fprintf(out, "tensor data for %s after computation: \n",node->name);
             size_t size = ggml_nbytes(node);
             fprintf(out, "size: %ld ne0: %ld ne1: %ld ne2: %ld ne3: %ld\n", size,node->ne[0],node->ne[1],node->ne[2],node->ne[3]);
@@ -14003,28 +14004,28 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
                 fprintf(out, "%f ", float_ptr[j]);
             }
             fprintf(out, "\n");
-            printed+=1;
             if(strcmp(node->name,"node_696")==0||strcmp(node->name,"node_697")==0){
-            struct ggml_tensor* src0= node->src[0];
-            struct ggml_tensor* src1= node->src[1];
-            fprintf(out, "src0: \n",src0->name);
-            size_t size = ggml_nbytes(src0);
-            const float * float_ptr = (const float *) src0->data;
-            for (size_t j = 0; j < size / sizeof(float); ++j) {
-                fprintf(out, "%f ", float_ptr[j]);
-            }
-            fprintf(out, "\n");
+                struct ggml_tensor* src0= node->src[0];
+                struct ggml_tensor* src1= node->src[1];
+                fprintf(out, "src0: \n",src0->name);
+                size_t size = ggml_nbytes(src0);
+                const float * float_ptr = (const float *) src0->data;
+                for (size_t j = 0; j < size / sizeof(float); ++j) {
+                    fprintf(out, "%f ", float_ptr[j]);
+                }
+                fprintf(out, "\n");
 
-            fprintf(out, "src1: \n",src1->name);
-            size = ggml_nbytes(src1);
-            const float * float_ptr2 = (const float *) src1->data;
-            for (size_t j = 0; j < size / sizeof(float); ++j) {
-                fprintf(out, "%f ", float_ptr2[j]);
+                fprintf(out, "src1: \n",src1->name);
+                size = ggml_nbytes(src1);
+                const float * float_ptr2 = (const float *) src1->data;
+                for (size_t j = 0; j < size / sizeof(float); ++j) {
+                    fprintf(out, "%f ", float_ptr2[j]);
+                }
+                fprintf(out, "\n");
             }
-            fprintf(out, "\n");
-        }
         }
         pthread_mutex_unlock(&file_mutex);
+        ggml_barrier(state->threadpool);
     }
     printed=-1;
     fclose(out);
