@@ -13952,6 +13952,8 @@ struct ggml_cplan ggml_graph_plan(
     return cplan;
 }
 
+static ggml_mutex_t file_mutex;
+
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     //GGML_LOG_INFO("ggml_graph_compute_thread: thread %d started\n", ((struct ggml_compute_state *)data)->ith);
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
@@ -13971,6 +13973,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     };
 
     //GGML_LOG_INFO("compute graph for each node\n");
+    ggml_mutex_init(&file_mutex);
     FILE *out = fopen("tensor_dump.txt","a");
     if (!out) {
         fprintf(stderr, "Failed to open file for writing\n");
@@ -13978,7 +13981,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     }
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
-        //GGML_LOG_INFO("compute node %d/%d: %s\n", node_n, cgraph->n_nodes, node->name);
+        GGML_LOG_INFO("compute node %d/%d: %s\n", node_n, cgraph->n_nodes, node->name);
         ggml_compute_forward(&params, node);
         //GGML_LOG_INFO("compute node %d/%d: %s done\n", node_n, cgraph->n_nodes, node->name);
         if (state->ith == 0 && cplan->abort_callback &&
@@ -13992,7 +13995,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             ggml_barrier(state->threadpool);
         }
 
-        ggml_mutex_lock(&tp->mutex);
+        ggml_mutex_lock(&file_mutex);
         if(printed==node_n-1){
             printed+=1;
             fprintf(out, "tensor data for %s after computation: \n",node->name);
@@ -14032,7 +14035,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
                 fprintf(out, "\n");
             }
         }
-        ggml_mutex_unlock(&tp->mutex);
+        ggml_mutex_unlock(&file_mutex);
         ggml_barrier(state->threadpool);
     }
     printed=-1;
