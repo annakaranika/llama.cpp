@@ -1278,7 +1278,6 @@ typedef pthread_mutex_t    ggml_mutex_t;
 
 #endif
 
-pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
 int printed = -1;
 
 // Threadpool def
@@ -13993,7 +13992,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             ggml_barrier(state->threadpool);
         }
 
-        pthread_mutex_lock(&file_mutex);
+        ggml_mutex_lock(&tp->mutex);
         if(printed==node_n-1){
             printed+=1;
             fprintf(out, "tensor data for %s after computation: \n",node->name);
@@ -14024,7 +14023,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
                 fprintf(out, "\n");
             }
         }
-        pthread_mutex_unlock(&file_mutex);
+        ggml_mutex_unlock(&tp->mutex);
         ggml_barrier(state->threadpool);
     }
     printed=-1;
