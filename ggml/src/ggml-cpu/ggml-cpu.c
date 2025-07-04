@@ -13997,6 +13997,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         if(printed==node_n-1){
             fprintf(out, "tensor data for %s after computation: \n",node->name);
             size_t size = ggml_nbytes(node);
+            fprintf(out, "size: %ld ne0: %ld ne1: %ld ne2: %ld ne3: %ld\n", size,node->ne[0],node->ne[1],node->ne[2],node->ne[3]);
             const float * float_ptr = (const float *) node->data;
             for (size_t j = 0; j < size / sizeof(float); ++j) {
                 fprintf(out, "%f ", float_ptr[j]);
