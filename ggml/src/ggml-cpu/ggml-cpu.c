@@ -13953,6 +13953,7 @@ struct ggml_cplan ggml_graph_plan(
 }
 
 static ggml_mutex_t file_mutex;
+static bool mutex_init=false;
 
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     //GGML_LOG_INFO("ggml_graph_compute_thread: thread %d started\n", ((struct ggml_compute_state *)data)->ith);
@@ -13973,7 +13974,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     };
 
     //GGML_LOG_INFO("compute graph for each node\n");
-    ggml_mutex_init(&file_mutex);
+    if(!mutex_init){
+        ggml_mutex_init(&file_mutex);
+    }
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
         GGML_LOG_INFO("compute node %d/%d: %s\n", node_n, cgraph->n_nodes, node->name);
@@ -13996,6 +13999,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             FILE *out = fopen("tensor_dump.txt","a");
             if (!out) {
                 fprintf(stderr, "Failed to open file for writing\n");
+                ggml_mutex_unlock(&file_mutex);
                 return;
             }
             fprintf(out, "tensor data for %s after computation: \n",node->name);
@@ -14013,13 +14017,13 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
                 struct ggml_tensor* src0= node->src[0];
                 struct ggml_tensor* src1= node->src[1];
                 fprintf(out, "src0: \n",src0->name);
-                size_t size = ggml_nbytes(src0);
-                const float * float_ptr = (const float *) src0->data;
+                size = ggml_nbytes(src0);
+                const float * float_ptr1 = (const float *) src0->data;
                 for (size_t j = 0; j < size / sizeof(float); ++j) {
                     if(j%1024==0){
                         fprintf(out, "\n");
                     }
-                    fprintf(out, "%f ", float_ptr[j]);
+                    fprintf(out, "%f ", float_ptr1[j]);
                 }
                 fprintf(out, "\n");
 
@@ -14041,7 +14045,6 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     printed=-1;
     //GGML_LOG_INFO("ggml_graph_compute_thread: thread %d finished\n", state->ith);
     ggml_barrier(state->threadpool);
-
     return 0;
 }
 
