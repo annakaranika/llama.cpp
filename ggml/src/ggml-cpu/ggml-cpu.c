@@ -14037,10 +14037,6 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             fclose(out);
         }
         ggml_mutex_unlock(&file_mutex);
-        if (node_n + 1 < cgraph->n_nodes) {
-            //GGML_LOG_INFO("ggml_graph_compute_thread: thread %d waiting for other threads to finish node %d/%d\n", state->ith, node_n + 1, cgraph->n_nodes);
-            ggml_barrier(state->threadpool);
-        }
     }
     printed=-1;
     //GGML_LOG_INFO("ggml_graph_compute_thread: thread %d finished\n", state->ith);
