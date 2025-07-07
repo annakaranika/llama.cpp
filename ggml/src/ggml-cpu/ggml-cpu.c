@@ -13976,12 +13976,13 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     //GGML_LOG_INFO("compute graph for each node\n");
     if(!mutex_init){
         ggml_mutex_init(&file_mutex);
+        mutex_init=true;
     }
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
-        GGML_LOG_INFO("compute node %d/%d: %s\n", node_n, cgraph->n_nodes, node->name);
+        GGML_LOG_INFO("thread %d compute node %d/%d: %s\n", state->ith,node_n, cgraph->n_nodes, node->name);
         ggml_compute_forward(&params, node);
-        GGML_LOG_INFO("compute node %d/%d: %s done\n", node_n, cgraph->n_nodes, node->name);
+        GGML_LOG_INFO("thread %d compute node %d/%d: %s done\n", state->ith,node_n, cgraph->n_nodes, node->name);
         if (state->ith == 0 && cplan->abort_callback &&
                 cplan->abort_callback(cplan->abort_callback_data)) {
             atomic_store_explicit(&tp->abort, node_n + 1, memory_order_relaxed);
@@ -13993,11 +13994,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             ggml_barrier(state->threadpool);
         }
 
-        GGML_LOG_INFO("before lock area\n");
+        GGML_LOG_INFO("thread %d before lock area\n",state->ith);
         ggml_mutex_lock(&file_mutex);
-        GGML_LOG_INFO("go into lock\n");
+        GGML_LOG_INFO("thread %d go into lock\n",state->ith);
         if(printed==node_n-1){
-            GGML_LOG_INFO("print\n");
+            GGML_LOG_INFO("thread %d print\n",state->ith);
             printed+=1;
             FILE *out = fopen("tensor_dump.txt","a");
             if (!out) {
@@ -14042,7 +14043,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             //     fprintf(out, "\n");
             // }
             fclose(out);
-            GGML_LOG_INFO("Finish print\n");
+            GGML_LOG_INFO("thread %d Finish print\n",state->ith);
         }
         ggml_mutex_unlock(&file_mutex);
     }
