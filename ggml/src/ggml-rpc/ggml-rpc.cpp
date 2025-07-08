@@ -1780,15 +1780,19 @@ static int change_ne_and_nb(ggml_tensor* tensor,rpc_tensor & rpc_t, std::map<ggm
         case GGML_OP_VIEW:{
             //Assuming that view will always happen after the first split
             if(rpc_t.ne[2]!=1){
-                int low = rpc_t.ne[2] * tensor_splits[id];
-                int high;
-                if (id == ggml_backend_rpc_get_device_count() - 1) {
-                    high = rpc_t.ne[2];
-                } else {
-                    high = rpc_t.ne[2] * tensor_splits[id + 1];
-                }
-                rpc_t.ne[2]=high-low;
-                rpc_t.nb[3]=rpc_t.nb[2]*rpc_t.ne[2];
+                    int low = rpc_t.ne[2] * tensor_splits[id];
+                    int high;
+                    if (id == ggml_backend_rpc_get_device_count() - 1) {
+                        high = rpc_t.ne[2];
+                    } else {
+                        high = rpc_t.ne[2] * tensor_splits[id + 1];
+                    }
+                    rpc_t.ne[2]=high-low;
+                    rpc_t.nb[3]=rpc_t.nb[2]*rpc_t.ne[2];
+                    if(strncmp(tensor->name,"k",1)==0){
+                        rpc_t.nb[1]=rpc_t.nb[3];
+                    }
+                
             }else{
                 rpc_tensor & src_tensor=visited[tensor->src[0]];
                 // GGML_LOG_INFO("ne0: %ld ne1: %ld, ne2: %ld ne3: %ld nb0: %ld nb1: %ld, nb2: %ld nb3: %ld",src_tensor.ne[0],src_tensor.ne[1],src_tensor.ne[2],src_tensor.ne[3],src_tensor.nb[0],src_tensor.nb[1],src_tensor.nb[2],src_tensor.nb[3]);
@@ -2276,6 +2280,11 @@ static void add_data_to_data(std::vector<uint8_t> & data, ggml_tensor * tensor, 
         bool status = send_rpc_cmd(get_socket(dev_ctx->endpoint), RPC_CMD_GET_TENSOR, &request, sizeof(request),
                                         output_data.data(), split_size);
         GGML_ASSERT(status);
+        std::ofstream out("d.bin", std::ios::app|std::ios::binary );
+        const float * float_ptr = reinterpret_cast<const float *>(data.data());
+        size_t float_count = data.size() / sizeof(float);
+        out.write(reinterpret_cast<const char*>(float_ptr), float_count * sizeof(float));
+        out.close();
         set_split_col_data(output_data.data(), tensor, col_low, col_high, data.data());
     }else{
         GGML_ASSERT(data.size()==ggml_nbytes(tensor));
@@ -2331,16 +2340,22 @@ static void add_data_to_data(std::vector<uint8_t> & data, ggml_tensor * tensor, 
         bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size(), &response, sizeof(response));
         GGML_ASSERT(status);
         buf->iface.get_tensor(add_out->buffer,add_out,data.data(),0,data.size());
+        // GGML_LOG_INFO("\n-------------print data-------------\n");
+        // GGML_LOG_INFO("%s\n",tensor->name);
+        // const float * float_ptr = reinterpret_cast<const float *>(data.data());
+        // for(size_t i=0;i<data.size()/sizeof(float);i++){
+        //     GGML_LOG_INFO("%f ",float_ptr[i]);
+        // }
+        // GGML_LOG_INFO("\n-------------end of print data-------------\n");
+        std::ofstream out("d.bin", std::ios::app|std::ios::binary );
+        const float * float_ptr = reinterpret_cast<const float *>(data.data());
+        size_t float_count = data.size() / sizeof(float);
+        out.write(reinterpret_cast<const char*>(float_ptr), float_count * sizeof(float));
+        out.close();
 
         ggml_backend_buffer_free(temp->buffer);
         ggml_backend_buffer_free(add_out->buffer);
     }
-    // GGML_LOG_INFO("\n-------------print data-------------\n");
-    // const float * float_ptr = reinterpret_cast<const float *>(data.data());
-    // for(size_t i=0;i<data.size()/sizeof(float);i++){
-    //     GGML_LOG_INFO("%f ",float_ptr[i]);
-    // }
-    // GGML_LOG_INFO("\n-------------end of print data-------------\n");
 }
 
 static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
@@ -2550,22 +2565,22 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         rpc_msg_graph_compute_rsp response;
         auto sock = get_socket(rpc_ctx->endpoint);
         bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size(), &response, sizeof(response));
-        std::ofstream out("tensor_dump.txt", std::ios::app);
-        for (int i=0; i < cgraph->n_nodes; i++) {
-            ggml_tensor * node = cgraph->nodes[i];
-            std::vector<uint8_t> data(ggml_nbytes(node));
-            ggml_backend_buffer_t buf=node->view_src ? node->view_src->buffer :node->buffer;
-            buf->iface.get_tensor(node->buffer,node,data.data(),0,data.size());
-            out << "[" << __func__ << "]" << ", get data for tensor " << node->name
-                << ", size=" << ggml_nbytes(node) << "\n";
-            const float * float_ptr = reinterpret_cast<const float *>(data.data());
-            for (size_t j = 0; j < ggml_nbytes(node)/sizeof(float); ++j) {
+        // std::ofstream out("tensor_dump.txt", std::ios::app);
+        // for (int i=0; i < cgraph->n_nodes; i++) {
+        //     ggml_tensor * node = cgraph->nodes[i];
+        //     std::vector<uint8_t> data(ggml_nbytes(node));
+        //     ggml_backend_buffer_t buf=node->view_src ? node->view_src->buffer :node->buffer;
+        //     buf->iface.get_tensor(node->buffer,node,data.data(),0,data.size());
+        //     out << "[" << __func__ << "]" << ", get data for tensor " << node->name
+        //         << ", size=" << ggml_nbytes(node) << "\n";
+        //     const float * float_ptr = reinterpret_cast<const float *>(data.data());
+        //     for (size_t j = 0; j < ggml_nbytes(node)/sizeof(float); ++j) {
                 
-                out << static_cast<float>(float_ptr[j]) << " ";
-            }
-            out << "\n";
-        }
-        out.close();
+        //         out << static_cast<float>(float_ptr[j]) << " ";
+        //     }
+        //     out << "\n";
+        // }
+        // out.close();
         GGML_ASSERT(status);
         return (enum ggml_status) response.result;
     }
@@ -2931,6 +2946,11 @@ bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<
 
     response.resize(request.size, 0);
     ggml_backend_tensor_get(tensor, response.data(), request.offset, request.size);
+    std::ofstream out("dump.bin", std::ios::app|std::ios::binary );
+    const float * float_ptr = reinterpret_cast<const float *>(response.data());
+    size_t float_count = request.size / sizeof(float);
+    out.write(reinterpret_cast<const char*>(float_ptr), float_count * sizeof(float));
+    out.close();
     ggml_free(ctx);
     return true;
 }
