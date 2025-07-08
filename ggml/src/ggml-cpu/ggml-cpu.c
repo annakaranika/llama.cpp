@@ -13980,75 +13980,39 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     }
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
-        GGML_LOG_INFO("thread %d compute node %d/%d: %s\n", state->ith,node_n, cgraph->n_nodes, node->name);
+        // GGML_LOG_INFO("thread %d compute node %d/%d: %s\n", state->ith,node_n, cgraph->n_nodes, node->name);
         ggml_compute_forward(&params, node);
-        GGML_LOG_INFO("thread %d compute node %d/%d: %s done\n", state->ith,node_n, cgraph->n_nodes, node->name);
+        // GGML_LOG_INFO("thread %d compute node %d/%d: %s done\n", state->ith,node_n, cgraph->n_nodes, node->name);
         if (state->ith == 0 && cplan->abort_callback &&
                 cplan->abort_callback(cplan->abort_callback_data)) {
             atomic_store_explicit(&tp->abort, node_n + 1, memory_order_relaxed);
             tp->ec    = GGML_STATUS_ABORTED;
         }
 
-        if (node_n + 1 < cgraph->n_nodes) {
-            GGML_LOG_INFO("ggml_graph_compute_thread: thread %d waiting for other threads to finish node %d/%d\n", state->ith, node_n + 1, cgraph->n_nodes);
-            ggml_barrier(state->threadpool);
-        }
+        // if (node_n + 1 < cgraph->n_nodes) {
+        ggml_barrier(state->threadpool);
+        // }
 
-        GGML_LOG_INFO("thread %d before lock area\n",state->ith);
         ggml_mutex_lock(&file_mutex);
-        GGML_LOG_INFO("thread %d go into lock\n",state->ith);
+        // GGML_LOG_INFO("thread %d go into lock\n",state->ith);
         if(printed==node_n-1){
-            GGML_LOG_INFO("thread %d print\n",state->ith);
+            // GGML_LOG_INFO("thread %d print\n",state->ith);
             printed+=1;
-            FILE *out = fopen("tensor_dump.txt","a");
+            FILE *out = fopen("tensor_dump.txt","ab");
             if (!out) {
-                fprintf(stderr, "Failed to open file for writing\n");
+                GGML_LOG_INFO("fail to open file\n");
                 ggml_mutex_unlock(&file_mutex);
                 return;
             }
-            fprintf(out, "tensor data for %s after computation: \n",node->name);
             size_t size = ggml_nbytes(node);
-            fprintf(out, "size: %ld ne0: %ld ne1: %ld ne2: %ld ne3: %ld\n", size,node->ne[0],node->ne[1],node->ne[2],node->ne[3]);
-            const float * float_ptr = (const float *) node->data;
-            for (size_t j = 0; j < size / sizeof(float); ++j) {
-                if(j%1024==0){
-                    fprintf(out, "\n");
-                }
-                fprintf(out, "%f ", float_ptr[j]);
-            }
-            fprintf(out, "\n");
-            // if(strcmp(node->name,"node_696")==0||strcmp(node->name,"node_697")==0){
-            //     struct ggml_tensor* src0= node->src[0];
-            //     struct ggml_tensor* src1= node->src[1];
-            //     fprintf(out, "src0: \n",src0->name);
-            //     size = ggml_nbytes(src0);
-            //     const float * float_ptr1 = (const float *) src0->data;
-            //     for (size_t j = 0; j < size / sizeof(float); ++j) {
-            //         if(j%1024==0){
-            //             fprintf(out, "\n");
-            //         }
-            //         fprintf(out, "%f ", float_ptr1[j]);
-            //     }
-            //     fprintf(out, "\n");
-
-            //     fprintf(out, "src1: \n",src1->name);
-            //     size = ggml_nbytes(src1);
-            //     const float * float_ptr2 = (const float *) src1->data;
-            //     for (size_t j = 0; j < size / sizeof(float); ++j) {
-            //         if(j%1024==0){
-            //             fprintf(out, "\n");
-            //         }
-            //         fprintf(out, "%f ", float_ptr2[j]);
-            //     }
-            //     fprintf(out, "\n");
-            // }
+            fwrite(node->data,sizeof(float),size/sizeof(float),out);
             fclose(out);
-            GGML_LOG_INFO("thread %d Finish print\n",state->ith);
+            // GGML_LOG_INFO("thread %d Finish print\n",state->ith);
         }
         ggml_mutex_unlock(&file_mutex);
     }
     printed=-1;
-    GGML_LOG_INFO("ggml_graph_compute_thread: thread %d finished\n", state->ith);
+    // GGML_LOG_INFO("ggml_graph_compute_thread: thread %d finished\n", state->ith);
     ggml_barrier(state->threadpool);
     return 0;
 }
