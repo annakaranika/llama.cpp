@@ -7051,16 +7051,18 @@ static void ggml_compute_forward_rms_norm(
 
     const struct ggml_tensor * src0 = dst->src[0];
 
-    switch (src0->type) {
-        case GGML_TYPE_F32:
-            {
-                ggml_compute_forward_rms_norm_f32(params, dst);
-            } break;
-        default:
-            {
-                GGML_ABORT("fatal error");
-            }
-    }
+    return;
+
+    // switch (src0->type) {
+    //     case GGML_TYPE_F32:
+    //         {
+    //             ggml_compute_forward_rms_norm_f32(params, dst);
+    //         } break;
+    //     default:
+    //         {
+    //             GGML_ABORT("fatal error");
+    //         }
+    // }
 }
 
 static void ggml_compute_forward_rms_norm_back_f32(
@@ -14000,7 +14002,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             if (!out) {
                 fprintf(stderr, "Failed to open file for writing\n");
                 ggml_mutex_unlock(&file_mutex);
-                return;
+                return 0;
             }
             fprintf(out, "tensor data for %s after computation: \n",node->name);
             size_t size = ggml_nbytes(node);
