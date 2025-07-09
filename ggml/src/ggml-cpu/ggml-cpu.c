@@ -13993,23 +13993,29 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             ggml_barrier(state->threadpool);
         }
 
-        // ggml_mutex_lock(&file_mutex);
-        // // GGML_LOG_INFO("thread %d go into lock\n",state->ith);
-        // if(printed==node_n-1){
-        //     // GGML_LOG_INFO("thread %d print\n",state->ith);
-        //     printed+=1;
-        //     FILE *out = fopen("tensor_dump.bin","ab");
-        //     if (!out) {
-        //         GGML_LOG_INFO("fail to open file\n");
-        //         ggml_mutex_unlock(&file_mutex);
-        //         return;
-        //     }
-        //     size_t size = ggml_nbytes(node);
-        //     fwrite(node->data,sizeof(float),size/sizeof(float),out);
-        //     fclose(out);
-        //     // GGML_LOG_INFO("thread %d Finish print\n",state->ith);
-        // }
-        // ggml_mutex_unlock(&file_mutex);
+        ggml_mutex_lock(&file_mutex);
+        if(printed==node_n-1){
+            printed+=1;
+            FILE *out = fopen("tensor_dump.txt","a");
+            if (!out) {
+                fprintf(stderr, "Failed to open file for writing\n");
+                ggml_mutex_unlock(&file_mutex);
+                return;
+            }
+            fprintf(out, "tensor data for %s after computation: \n",node->name);
+            size_t size = ggml_nbytes(node);
+            fprintf(out, "size: %ld ne0: %ld ne1: %ld ne2: %ld ne3: %ld\n", size,node->ne[0],node->ne[1],node->ne[2],node->ne[3]);
+            const float * float_ptr = (const float *) node->data;
+            for (size_t j = 0; j < size / sizeof(float); ++j) {
+                if(j%1024==0){
+                    fprintf(out, "\n");
+                }
+                fprintf(out, "%f ", float_ptr[j]);
+            }
+            fprintf(out, "\n");
+            fclose(out);
+        }
+        ggml_mutex_unlock(&file_mutex);
     }
     printed=-1;
     // GGML_LOG_INFO("ggml_graph_compute_thread: thread %d finished\n", state->ith);
