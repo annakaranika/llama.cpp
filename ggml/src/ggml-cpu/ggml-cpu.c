@@ -7051,7 +7051,7 @@ static void ggml_compute_forward_rms_norm(
 
     const struct ggml_tensor * src0 = dst->src[0];
 
-    if(strcmp(dst->name, "norm-2")==0){
+    if(strcmp(dst->name, "norm-2")==0&&strncmp(src0->name, "ffn_inp",7)==0) {
         ggml_compute_forward_dup(params, dst);
         return;
     }
