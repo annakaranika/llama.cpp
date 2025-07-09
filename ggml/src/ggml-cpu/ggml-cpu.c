@@ -7051,10 +7051,10 @@ static void ggml_compute_forward_rms_norm(
 
     const struct ggml_tensor * src0 = dst->src[0];
 
-    if(strcmp(dst->name, "norm-2")==0&&strncmp(src0->name, "ffn_inp",7)==0) {
-        ggml_compute_forward_dup(params, dst);
-        return;
-    }
+    // if(strcmp(dst->name, "norm-2")==0&&strncmp(src0->name, "ffn_inp",7)==0) {
+    //     ggml_compute_forward_dup(params, dst);
+    //     return;
+    // }
     switch (src0->type) {
         case GGML_TYPE_F32:
             {
@@ -14009,12 +14009,12 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             fprintf(out, "tensor data for %s after computation: \n",node->name);
             size_t size = ggml_nbytes(node);
             fprintf(out, "size: %ld ne0: %ld ne1: %ld ne2: %ld ne3: %ld\n", size,node->ne[0],node->ne[1],node->ne[2],node->ne[3]);
-            const float * float_ptr = (const float *) node->data;
-            for (size_t j = 0; j < size / sizeof(float); ++j) {
+            const uint32_t * float_ptr = (const uint32_t *) node->data;
+            for (size_t j = 0; j < size / sizeof(uint32_t); ++j) {
                 if(j%1024==0){
                     fprintf(out, "\n");
                 }
-                fprintf(out, "%.8f ", float_ptr[j]);
+                fprintf(out, "%d", float_ptr[j]);
             }
             fprintf(out, "\n");
             fclose(out);
