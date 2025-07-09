@@ -7051,18 +7051,19 @@ static void ggml_compute_forward_rms_norm(
 
     const struct ggml_tensor * src0 = dst->src[0];
 
-    return;
-
-    // switch (src0->type) {
-    //     case GGML_TYPE_F32:
-    //         {
-    //             ggml_compute_forward_rms_norm_f32(params, dst);
-    //         } break;
-    //     default:
-    //         {
-    //             GGML_ABORT("fatal error");
-    //         }
-    // }
+    if(strcmp(dst->name, "norm-2")==0){
+        return;
+    }
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_rms_norm_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
 }
 
 static void ggml_compute_forward_rms_norm_back_f32(
