@@ -14014,7 +14014,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
                 if(j%1024==0){
                     fprintf(out, "\n");
                 }
-                fprintf(out, "%d", float_ptr[j]);
+                fprintf(out, "%d ", float_ptr[j]);
             }
             fprintf(out, "\n");
             fclose(out);
