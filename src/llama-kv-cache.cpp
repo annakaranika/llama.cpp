@@ -121,9 +121,11 @@ bool llama_kv_cache_init(
                 if (t->extra!= NULL) {
                     // LLAMA_LOG_INFO("%s: adding tensor %s to kv cache\n", __func__, t->name);
                     ggml_tensor_extra_rpc * t_extra = (ggml_tensor_extra_rpc *) t->extra;
-                    for(int i = 0; i < RPC_MAX_DEVICES; i++) {
-                        if (t_extra->buffer_ctx[i] != NULL && t_extra->buffer_ctx[i]->remote_ptr!= ((ggml_backend_rpc_buffer_context *)buf)->remote_ptr) {
-                            ggml_backend_buffer_t new_buf= ggml_backend_buffer_init(buft,buf->iface,t_extra->buffer_ctx[i],ggml_nbytes(t));
+                    for(int i = 0; i < ggml_backend_rpc_get_device_count(); i++) {
+                        if (t_extra->buffer_ctx[i] != NULL && t_extra->buffer_ctx[i]->remote_ptr!= ((ggml_backend_rpc_buffer_context *)buf->context)->remote_ptr) {
+                            ggml_backend_rpc_device_context * dev_ctx = (ggml_backend_rpc_device_context *)ggml_backend_rpc_get_device(i)->context;
+                            auto new_buft=ggml_backend_rpc_buffer_type(dev_ctx->endpoint.c_str());
+                            ggml_backend_buffer_t new_buf= ggml_backend_buffer_init(new_buft,buf->iface,t_extra->buffer_ctx[i],ggml_nbytes(t));
                             if (new_buf == NULL) {
                                 LLAMA_LOG_ERROR("%s: failed to initialize RPC buffer for tensor %s\n", __func__, t->name);
                                 return false;

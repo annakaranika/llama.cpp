@@ -255,6 +255,13 @@ static int ggml_backend_rpc_get_device_count() {
     return reg_ctx->devices.size();
 }
 
+static ggml_backend_dev_t ggml_backend_rpc_get_device(int id) {
+    if (id < 0 || id >= ggml_backend_rpc_get_device_count()) {
+        return nullptr;
+    }
+    return reg_ctx->devices[id];
+}
+
 static int ggml_backend_rpc_get_device_id(const char * endpoint) {
     for (int i = 0; i < ggml_backend_rpc_get_device_count(); ++i) {
         if (reg_ctx->devices[i]->context && 
@@ -658,17 +665,19 @@ static void ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_t buffer, gg
     ggml_backend_rpc_buffer_context *      ctx      = (ggml_backend_rpc_buffer_context *) buffer->context;
     ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *) buffer->buft->context;
     // GGML_LOG_INFO("[%s] initializing tensor %s, type=%d, buffer=%" PRIx64 " data=%" PRIx64 " operation:%d\n", __func__, tensor->name, tensor->type, ctx->remote_ptr, reinterpret_cast<uint64_t>(tensor->data), tensor->op);
-    bool                    cache=false;
+    // bool                    cache=false;
     //if split, store a copy of tensor on every rpc server, and store the buffer context for each server in extra
     if (split&&multi_cpy) {
         if (tensor->extra == NULL) {
             ggml_tensor_extra_rpc * extra;
             bool                    found = false;
-            if(strncmp(tensor->name,"cache",5)==0){
-                // GGML_LOG_INFO("tensor is cache: %s\n",tensor->name);
-                cache = true;
-                extra = new ggml_tensor_extra_rpc();
-            }else 
+            // if(strncmp(tensor->name,"cache",5)==0){
+            //     GGML_LOG_INFO("[%s] initializing tensor %s, type=%d, buffer=%" PRIx64 " data=%" PRIx64 " operation:%d\n", __func__, tensor->name, tensor->type, ctx->remote_ptr, reinterpret_cast<uint64_t>(tensor->data), tensor->op);
+            // }
+            //     // GGML_LOG_INFO("tensor is cache: %s\n",tensor->name);
+            //     cache = true;
+            //     extra = new ggml_tensor_extra_rpc();
+            // }else 
             if (tensor->op == GGML_OP_RESHAPE || tensor->op == GGML_OP_VIEW || tensor->op == GGML_OP_PERMUTE ||
                 tensor->op == GGML_OP_TRANSPOSE) {
                 found = true;
@@ -686,18 +695,18 @@ static void ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_t buffer, gg
                 if (!found) {
 
                     size_t size;
-                    if(cache){
-                        float split_part=(id==ggml_backend_rpc_get_device_count()-1)?(1-tensor_splits[id]):(tensor_splits[id+1]-tensor_splits[id]);
-                        // GGML_LOG_INFO("tensor_splits: %f %f",tensor_splits[id],split_part);
-                        size=split_part*tensor->ne[0]*tensor->nb[0]/ggml_blck_size(tensor->type);
-                        for (int i = 1; i < GGML_MAX_DIMS; ++i) {
-                            size += (tensor->ne[i] - 1)*tensor->nb[i];
-                        }
-                        // GGML_LOG_INFO("size = %ld\n",size);
-                        // size=ggml_nbytes(tensor);
-                    }else{
-                        size=ggml_nbytes(tensor);
-                    }
+                    // if(cache){
+                    //     float split_part=(id==ggml_backend_rpc_get_device_count()-1)?(1-tensor_splits[id]):(tensor_splits[id+1]-tensor_splits[id]);
+                    //     // GGML_LOG_INFO("tensor_splits: %f %f",tensor_splits[id],split_part);
+                    //     size=split_part*tensor->ne[0]*tensor->nb[0]/ggml_blck_size(tensor->type);
+                    //     for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+                    //         size += (tensor->ne[i] - 1)*tensor->nb[i];
+                    //     }
+                    //     // GGML_LOG_INFO("size = %ld\n",size);
+                    //     // size=ggml_nbytes(tensor);
+                    // }else{
+                    size=ggml_nbytes(tensor);
+                    // }
                     rpc_msg_alloc_buffer_req request = { size };  //the size to allocate
                     // GGML_LOG_INFO("[%s] allocating buffer for tensor %s on device %d, size=%zu\n", __func__, tensor->name, id, request.size);
                     rpc_msg_alloc_buffer_rsp response;
@@ -713,7 +722,7 @@ static void ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_t buffer, gg
                     if (response.remote_ptr != 0) {
                         extra->buffer_ctx[id] = new ggml_backend_rpc_buffer_context{sock, nullptr, response.remote_ptr};
                         extra->rows[id] = {0, tensor->ne[0]};
-                        // GGML_LOG_INFO("[%s] allocated buffer for tensor %s device %d, remote_ptr=%" PRIx64 ", remote_size=%" PRIu64 "\n", __func__, tensor->name, id, response.remote_ptr, response.remote_size);
+                        // GGML_LOG_INFO("[%s] allocated buffer for tensor %s device %d, remote_ptr=%" PRIx64 ", remote_size=%" PRIu64 ", sock=%d\n", __func__, tensor->name, id, response.remote_ptr, response.remote_size,sock->fd);
                     } else {
                         GGML_LOG_INFO("[%s] failed to allocate buffer for device %d\n", __func__, id);
                         delete extra;
@@ -740,13 +749,13 @@ static void ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_t buffer, gg
                 if (dev_ctx->endpoint == buft_ctx->endpoint) {
                     rpc_msg_init_tensor_req request;
                     request.tensor = serialize_tensor(tensor);
-                    if(cache){
-                        size_t split_part=(id==ggml_backend_rpc_get_device_count()-1)?(1-tensor_splits[id]):(tensor_splits[id+1]-tensor_splits[id]);     
-                        request.tensor.ne[0]=split_part*tensor->ne[0];
-                        request.tensor.nb[1]=request.tensor.ne[0]*request.tensor.nb[0]/ggml_blck_size(tensor->type);
-                        request.tensor.nb[2]=request.tensor.ne[1]*request.tensor.nb[1];
-                        request.tensor.nb[3]=request.tensor.ne[2]*request.tensor.nb[2];
-                    }
+                    // if(cache){
+                    //     size_t split_part=(id==ggml_backend_rpc_get_device_count()-1)?(1-tensor_splits[id]):(tensor_splits[id+1]-tensor_splits[id]);     
+                    //     request.tensor.ne[0]=split_part*tensor->ne[0];
+                    //     request.tensor.nb[1]=request.tensor.ne[0]*request.tensor.nb[0]/ggml_blck_size(tensor->type);
+                    //     request.tensor.nb[2]=request.tensor.ne[1]*request.tensor.nb[1];
+                    //     request.tensor.nb[3]=request.tensor.ne[2]*request.tensor.nb[2];
+                    // }
                     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_INIT_TENSOR, &request, sizeof(request), nullptr, 0);
                     GGML_ASSERT(status);    
                     continue;
@@ -755,13 +764,13 @@ static void ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_t buffer, gg
 
                 //serialize tensor for the specific device
                 request.tensor = serialize_tensor(tensor);
-                if(cache){
-                    size_t split_part=(id==ggml_backend_rpc_get_device_count()-1)?(1-tensor_splits[id]):(tensor_splits[id+1]-tensor_splits[id]);     
-                    request.tensor.ne[0]=split_part*tensor->ne[0];
-                    request.tensor.nb[1]=request.tensor.ne[0]*request.tensor.nb[0]/ggml_blck_size(tensor->type);
-                    request.tensor.nb[2]=request.tensor.ne[1]*request.tensor.nb[1];
-                    request.tensor.nb[3]=request.tensor.ne[2]*request.tensor.nb[2];
-                }
+                // if(cache){
+                //     size_t split_part=(id==ggml_backend_rpc_get_device_count()-1)?(1-tensor_splits[id]):(tensor_splits[id+1]-tensor_splits[id]);     
+                //     request.tensor.ne[0]=split_part*tensor->ne[0];
+                //     request.tensor.nb[1]=request.tensor.ne[0]*request.tensor.nb[0]/ggml_blck_size(tensor->type);
+                //     request.tensor.nb[2]=request.tensor.ne[1]*request.tensor.nb[1];
+                //     request.tensor.nb[3]=request.tensor.ne[2]*request.tensor.nb[2];
+                // }
                 //change the buffer and data pointer for this device
                 if (extra->buffer_ctx[id] == nullptr) {
                     GGML_LOG_INFO("[%s] buffer context for device %d is null\n", __func__, id);
@@ -789,7 +798,7 @@ static void ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_t buffer, gg
 }
 
 static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
-    // GGML_LOG_INFO("[%s] setting tensor %s, offset=%zu, size=%zu\n", __func__, tensor->name, offset, size);
+    // GGML_LOG_INFO("[%s] setting tensor %s, offset=%zu, size=%zu, view_offs=%ld\n", __func__, tensor->name, offset, size,tensor->view_offs);
     // GGML_LOG_INFO("ne0 = %ld ne1 = %ld nb0 = %ld nb1 =%ld nb2 = %ld\n",tensor->ne[0],tensor->ne[1],tensor->nb[0],tensor->nb[1],tensor->nb[2]);
     ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *)buffer->buft->context;
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
@@ -920,9 +929,9 @@ static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, con
 
 static void ggml_backend_rpc_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     //how to clear the buffer on other servers?
-    // GGML_LOG_INFO("[%s] clearing buffer, remote_ptr=%" PRIx64 ", value=%d\n", __func__, ((ggml_backend_rpc_buffer_context *)buffer->context)->remote_ptr, value);
     ggml_backend_rpc_buffer_context * ctx     = (ggml_backend_rpc_buffer_context *) buffer->context;
     rpc_msg_buffer_clear_req          request = { ctx->remote_ptr, value };
+    GGML_LOG_INFO("[%s] clearing buffer, sock=%d, remote_ptr=%" PRIx64 ", value=%d\n", __func__, ctx->sock->fd,((ggml_backend_rpc_buffer_context *)buffer->context)->remote_ptr, value);
     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_BUFFER_CLEAR, &request, sizeof(request), nullptr, 0);
     GGML_ASSERT(status);
 }
@@ -1037,13 +1046,13 @@ static void ggml_backend_rpc_split_buffer_init_tensor(ggml_backend_buffer_t buff
         ctx->tensor_extras.push_back(extra);
 
         //TODO:define the split dimension here
-        if(ends_with(tensor->name,"attn_output.weight")||ends_with(tensor->name,"ffn_down.weight")){
-            extra->split_dim=0;
+        // if(ends_with(tensor->name,"attn_output.weight")||ends_with(tensor->name,"ffn_down.weight")){
+        //     extra->split_dim=0;
+        //     // GGML_LOG_INFO("split_dim = %d\n",extra->split_dim);
+        // }else{
+        extra->split_dim=1;
             // GGML_LOG_INFO("split_dim = %d\n",extra->split_dim);
-        }else{
-            extra->split_dim=1;
-            // GGML_LOG_INFO("split_dim = %d\n",extra->split_dim);
-        }
+        // }
 
         for (int id = 0; id < ggml_backend_rpc_get_device_count(); ++id) {
             if (extra->split_dim == 1) {
@@ -1661,260 +1670,255 @@ static void add_tensor(ggml_tensor * tensor, std::vector<rpc_tensor> & tensors,
     tensors.push_back(serialize_tensor(tensor));
 }
 
-static int change_ne_and_nb(ggml_tensor* tensor,rpc_tensor & rpc_t, std::map<ggml_tensor *,rpc_tensor> & visited,int id){
-    switch(tensor->op){
-        case GGML_OP_NONE:
-        case GGML_OP_COUNT_EQUAL:
-        case GGML_OP_REPEAT_BACK:
-        case GGML_OP_CONCAT:
-        case GGML_OP_SUM:
-            break;
-        case GGML_OP_DUP:
-        case GGML_OP_ADD:
-        case GGML_OP_ADD1:
-        case GGML_OP_ACC:
-        case GGML_OP_SUB:
-        case GGML_OP_MUL:
-        case GGML_OP_DIV:
-        case GGML_OP_SQR:
-        case GGML_OP_SQRT:
-        case GGML_OP_LOG:
-        case GGML_OP_SIN:
-        case GGML_OP_COS:
-        case GGML_OP_SILU_BACK:
-        case GGML_OP_NORM: // normalize
-        case GGML_OP_RMS_NORM:
-        case GGML_OP_RMS_NORM_BACK:
-        case GGML_OP_GROUP_NORM:
-        case GGML_OP_SCALE:
-        case GGML_OP_SET:
-        case GGML_OP_DIAG:
-        case GGML_OP_SOFT_MAX:
-        case GGML_OP_SOFT_MAX_BACK:
-        case GGML_OP_CLAMP:
-        case GGML_OP_ROPE:
-        case GGML_OP_ROPE_BACK:
-        case GGML_OP_DIAG_MASK_INF:
-        case GGML_OP_DIAG_MASK_ZERO:
-        case GGML_OP_LEAKY_RELU:{
-            //same shape as src0
-            rpc_tensor src_tensor=visited[tensor->src[0]];
-            for(int i=0;i<GGML_MAX_DIMS;i++){
-                rpc_t.ne[i]=src_tensor.ne[i];
-                rpc_t.nb[i]=src_tensor.nb[i];
-            }
-        }break;
-        case GGML_OP_SUM_ROWS:
-        case GGML_OP_MEAN:
-        case GGML_OP_ARGMAX:{
+// static int change_ne_and_nb(ggml_tensor* tensor,rpc_tensor & rpc_t, std::map<ggml_tensor *,rpc_tensor> & visited,int id){
+//     switch(tensor->op){
+//         case GGML_OP_NONE:
+//         case GGML_OP_COUNT_EQUAL:
+//         case GGML_OP_REPEAT_BACK:
+//         case GGML_OP_CONCAT:
+//         case GGML_OP_SUM:
+//             break;
+//         case GGML_OP_DUP:
+//         case GGML_OP_ADD:
+//         case GGML_OP_ADD1:
+//         case GGML_OP_ACC:
+//         case GGML_OP_SUB:
+//         case GGML_OP_MUL:
+//         case GGML_OP_DIV:
+//         case GGML_OP_SQR:
+//         case GGML_OP_SQRT:
+//         case GGML_OP_LOG:
+//         case GGML_OP_SIN:
+//         case GGML_OP_COS:
+//         case GGML_OP_SILU_BACK:
+//         case GGML_OP_NORM: // normalize
+//         case GGML_OP_RMS_NORM:
+//         case GGML_OP_RMS_NORM_BACK:
+//         case GGML_OP_GROUP_NORM:
+//         case GGML_OP_SCALE:
+//         case GGML_OP_SET:
+//         case GGML_OP_DIAG:
+//         case GGML_OP_SOFT_MAX:
+//         case GGML_OP_SOFT_MAX_BACK:
+//         case GGML_OP_CLAMP:
+//         case GGML_OP_ROPE:
+//         case GGML_OP_ROPE_BACK:
+//         case GGML_OP_DIAG_MASK_INF:
+//         case GGML_OP_DIAG_MASK_ZERO:
+//         case GGML_OP_LEAKY_RELU:{
+//             //same shape as src0
+//             rpc_tensor src_tensor=visited[tensor->src[0]];
+//             for(int i=0;i<GGML_MAX_DIMS;i++){
+//                 rpc_t.ne[i]=src_tensor.ne[i];
+//                 rpc_t.nb[i]=src_tensor.nb[i];
+//             }
+//         }break;
+//         case GGML_OP_SUM_ROWS:
+//         case GGML_OP_MEAN:
+//         case GGML_OP_ARGMAX:{
 
-            //same shape as src0 except ne0
-            rpc_tensor src_tensor=visited[tensor->src[0]];
-            for(int i=1;i<GGML_MAX_DIMS;i++){
-                rpc_t.ne[i]=src_tensor.ne[i];
-                rpc_t.nb[i]=src_tensor.nb[i];
-            }
-        }break;
-        case GGML_OP_REPEAT:{
+//             //same shape as src0 except ne0
+//             rpc_tensor src_tensor=visited[tensor->src[0]];
+//             for(int i=1;i<GGML_MAX_DIMS;i++){
+//                 rpc_t.ne[i]=src_tensor.ne[i];
+//                 rpc_t.nb[i]=src_tensor.nb[i];
+//             }
+//         }break;
+//         case GGML_OP_REPEAT:{
 
             
-            rpc_tensor src_tensor=visited[tensor->src[0]];
-            int min=(rpc_t.ne[0]-rpc_t.ne[0]%src_tensor.ne[0])/src_tensor.ne[0];
-            for(int i=1;i<GGML_MAX_DIMS;i++){
-                int curr=(rpc_t.ne[i]-rpc_t.ne[i]%src_tensor.ne[i])/src_tensor.ne[i];
-                if(curr<min){
-                    min=curr;
-                }
-            }
-            for(int i=0;i<GGML_MAX_DIMS;i++){
-                rpc_t.ne[i]=src_tensor.ne[i]*min;
-                rpc_t.nb[i]=i==0?rpc_t.nb[0]:(i==1?rpc_t.nb[0]*(rpc_t.ne[0]/ggml_blck_size(tensor->type)):rpc_t.nb[i-1]*rpc_t.ne[i-1]);
-            }
-        }break;
+//             rpc_tensor src_tensor=visited[tensor->src[0]];
+//             int min=(rpc_t.ne[0]-rpc_t.ne[0]%src_tensor.ne[0])/src_tensor.ne[0];
+//             for(int i=1;i<GGML_MAX_DIMS;i++){
+//                 int curr=(rpc_t.ne[i]-rpc_t.ne[i]%src_tensor.ne[i])/src_tensor.ne[i];
+//                 if(curr<min){
+//                     min=curr;
+//                 }
+//             }
+//             for(int i=0;i<GGML_MAX_DIMS;i++){
+//                 rpc_t.ne[i]=src_tensor.ne[i]*min;
+//                 rpc_t.nb[i]=i==0?rpc_t.nb[0]:(i==1?rpc_t.nb[0]*(rpc_t.ne[0]/ggml_blck_size(tensor->type)):rpc_t.nb[i-1]*rpc_t.ne[i-1]);
+//             }
+//         }break;
 
-        case GGML_OP_MUL_MAT:
-        case GGML_OP_OUT_PROD:{
-            rpc_tensor src_tensor0=visited[tensor->src[0]];
-            rpc_tensor src_tensor1=visited[tensor->src[1]];
-            for(int i=0;i<GGML_MAX_DIMS;i++){
-                rpc_t.ne[i]=i==0?src_tensor0.ne[1]:src_tensor1.ne[i];
-                rpc_t.nb[i]=i==0?rpc_t.nb[0]:(i==1?rpc_t.nb[0]*(rpc_t.ne[0]/ggml_blck_size(tensor->type)):rpc_t.nb[i-1]*rpc_t.ne[i-1]);
-            }
-        }break;
+//         case GGML_OP_MUL_MAT:
+//         case GGML_OP_OUT_PROD:{
+//             rpc_tensor src_tensor0=visited[tensor->src[0]];
+//             rpc_tensor src_tensor1=visited[tensor->src[1]];
+//             for(int i=0;i<GGML_MAX_DIMS;i++){
+//                 rpc_t.ne[i]=i==0?src_tensor0.ne[1]:src_tensor1.ne[i];
+//                 rpc_t.nb[i]=i==0?rpc_t.nb[0]:(i==1?rpc_t.nb[0]*(rpc_t.ne[0]/ggml_blck_size(tensor->type)):rpc_t.nb[i-1]*rpc_t.ne[i-1]);
+//             }
+//         }break;
 
-        case GGML_OP_MUL_MAT_ID:{
-            rpc_tensor src_tensor0=visited[tensor->src[0]];
-            rpc_tensor src_tensor1=visited[tensor->src[1]];
-            for(int i=0;i<GGML_MAX_DIMS;i++){
-                if(i<2){
-                    rpc_t.ne[i]=i==0?src_tensor0.ne[1]:src_tensor1.ne[i];
-                }
-                rpc_t.nb[i]=i==0?rpc_t.nb[0]:(i==1?rpc_t.nb[0]*(rpc_t.ne[0]/ggml_blck_size(tensor->type)):rpc_t.nb[i-1]*rpc_t.ne[i-1]);
-            }
-        }break;
+//         case GGML_OP_MUL_MAT_ID:{
+//             rpc_tensor src_tensor0=visited[tensor->src[0]];
+//             rpc_tensor src_tensor1=visited[tensor->src[1]];
+//             for(int i=0;i<GGML_MAX_DIMS;i++){
+//                 if(i<2){
+//                     rpc_t.ne[i]=i==0?src_tensor0.ne[1]:src_tensor1.ne[i];
+//                 }
+//                 rpc_t.nb[i]=i==0?rpc_t.nb[0]:(i==1?rpc_t.nb[0]*(rpc_t.ne[0]/ggml_blck_size(tensor->type)):rpc_t.nb[i-1]*rpc_t.ne[i-1]);
+//             }
+//         }break;
 
         
-        case GGML_OP_CPY:{
-                rpc_tensor src_tensor=visited[tensor->src[1]];
-                for(int i=0;i<GGML_MAX_DIMS;i++){
-                    rpc_t.ne[i]=src_tensor.ne[i];
-                    rpc_t.nb[i]=src_tensor.nb[i];
-                }
-                // 
-        }break;
-        case GGML_OP_CONT:{
-            rpc_tensor src_tensor=visited[tensor->src[0]];
-            rpc_t.ne[0]=src_tensor.ne[0]*src_tensor.ne[1];
-            for(int i=1;i<GGML_MAX_DIMS;i++){
-                rpc_t.nb[i]=i==1?rpc_t.nb[0]*(rpc_t.ne[0]/ggml_blck_size(tensor->type)):rpc_t.nb[i-1]*rpc_t.ne[i-1];
-            }
-        }break;
-        case GGML_OP_RESHAPE:{
-            rpc_tensor src_tensor=visited[tensor->src[0]];
-            rpc_t.ne[1]=src_tensor.ne[0]/rpc_t.ne[0];
-            for(int i=2;i<GGML_MAX_DIMS;i++){
-                rpc_t.nb[i]=rpc_t.nb[i-1]*rpc_t.ne[i-1];
-            }
+//         case GGML_OP_CPY:{
+//                 rpc_tensor src_tensor=visited[tensor->src[1]];
+//                 for(int i=0;i<GGML_MAX_DIMS;i++){
+//                     rpc_t.ne[i]=src_tensor.ne[i];
+//                     rpc_t.nb[i]=src_tensor.nb[i];
+//                 }
+//                 // 
+//         }break;
+//         case GGML_OP_CONT:{
+//             rpc_tensor src_tensor=visited[tensor->src[0]];
+//             rpc_t.ne[0]=src_tensor.ne[0]*src_tensor.ne[1];
+//             for(int i=1;i<GGML_MAX_DIMS;i++){
+//                 rpc_t.nb[i]=i==1?rpc_t.nb[0]*(rpc_t.ne[0]/ggml_blck_size(tensor->type)):rpc_t.nb[i-1]*rpc_t.ne[i-1];
+//             }
+//         }break;
+//         case GGML_OP_RESHAPE:{
+//             rpc_tensor src_tensor=visited[tensor->src[0]];
+//             rpc_t.ne[1]=src_tensor.ne[0]/rpc_t.ne[0];
+//             for(int i=2;i<GGML_MAX_DIMS;i++){
+//                 rpc_t.nb[i]=rpc_t.nb[i-1]*rpc_t.ne[i-1];
+//             }
 
-        }break;
-        case GGML_OP_VIEW:{
-            //Assuming that view will always happen after the first split
-            if(rpc_t.ne[2]!=1){
-                    int low = rpc_t.ne[2] * tensor_splits[id];
-                    int high;
-                    if (id == ggml_backend_rpc_get_device_count() - 1) {
-                        high = rpc_t.ne[2];
-                    } else {
-                        high = rpc_t.ne[2] * tensor_splits[id + 1];
-                    }
-                    rpc_t.ne[2]=high-low;
-                    rpc_t.nb[3]=rpc_t.nb[2]*rpc_t.ne[2];
-                    if(strncmp(tensor->name,"k",1)==0){
-                        rpc_t.nb[1]=rpc_t.nb[3];
-                    }
-
-                
-            }else{
-                rpc_tensor & src_tensor=visited[tensor->src[0]];
-                // GGML_LOG_INFO("ne0: %ld ne1: %ld, ne2: %ld ne3: %ld nb0: %ld nb1: %ld, nb2: %ld nb3: %ld",src_tensor.ne[0],src_tensor.ne[1],src_tensor.ne[2],src_tensor.ne[3],src_tensor.nb[0],src_tensor.nb[1],src_tensor.nb[2],src_tensor.nb[3]);
-                float split_part=(id==ggml_backend_rpc_get_device_count()-1)?(1-tensor_splits[id]):(tensor_splits[id+1]-tensor_splits[id]);     
-                src_tensor.ne[0]=split_part*src_tensor.ne[0];
-                src_tensor.nb[1]=src_tensor.ne[0]*src_tensor.nb[0]/ggml_blck_size(tensor->src[0]->type);
-                src_tensor.nb[2]=src_tensor.ne[1]*src_tensor.nb[1];
-                src_tensor.nb[3]=src_tensor.ne[2]*src_tensor.nb[2];
-                if(rpc_t.ne[1]!=1){
-                    int64_t row_low;
-                    int64_t row_high;
-                    rpc_get_row_split(&row_low,&row_high,tensor,tensor_splits,id);
-                    // GGML_LOG_INFO("low: %ld high: %ld\n",row_low,row_high);
-                    rpc_t.ne[1]=row_high-row_low;
-                    rpc_t.nb[2]=rpc_t.nb[1]*rpc_t.ne[1];
-                    rpc_t.nb[3]=rpc_t.nb[2]*rpc_t.ne[2];
-                }else if(rpc_t.ne[0]!=1){
-                    int64_t col_low;
-                    int64_t col_high;
-                    rpc_get_col_split(&col_low,&col_high,tensor,tensor_splits,id);
-                    // GGML_LOG_INFO("low: %ld high: %ld\n",col_low,col_high);
-                    rpc_t.ne[0]=col_high-col_low;
-                    for(int i=1;i<GGML_MAX_DIMS;i++){
-                        rpc_t.nb[i]=i==1?rpc_t.nb[0]*(rpc_t.ne[0]/ggml_blck_size(tensor->type)):rpc_t.nb[i-1]*rpc_t.ne[i-1];
-                    }
+//         }break;
+//         case GGML_OP_VIEW:{
+//             //Assuming that view will always happen after the first split
+//             if(rpc_t.ne[2]!=1){
+//                 int low = rpc_t.ne[2] * tensor_splits[id];
+//                 int high;
+//                 if (id == ggml_backend_rpc_get_device_count() - 1) {
+//                     high = rpc_t.ne[2];
+//                 } else {
+//                     high = rpc_t.ne[2] * tensor_splits[id + 1];
+//                 }
+//                 rpc_t.ne[2]=high-low;
+//                 rpc_t.nb[3]=rpc_t.nb[2]*rpc_t.ne[2];
+//             }else{
+//                 rpc_tensor & src_tensor=visited[tensor->src[0]];
+//                 // GGML_LOG_INFO("ne0: %ld ne1: %ld, ne2: %ld ne3: %ld nb0: %ld nb1: %ld, nb2: %ld nb3: %ld",src_tensor.ne[0],src_tensor.ne[1],src_tensor.ne[2],src_tensor.ne[3],src_tensor.nb[0],src_tensor.nb[1],src_tensor.nb[2],src_tensor.nb[3]);
+//                 float split_part=(id==ggml_backend_rpc_get_device_count()-1)?(1-tensor_splits[id]):(tensor_splits[id+1]-tensor_splits[id]);     
+//                 src_tensor.ne[0]=split_part*src_tensor.ne[0];
+//                 src_tensor.nb[1]=src_tensor.ne[0]*src_tensor.nb[0]/ggml_blck_size(tensor->src[0]->type);
+//                 src_tensor.nb[2]=src_tensor.ne[1]*src_tensor.nb[1];
+//                 src_tensor.nb[3]=src_tensor.ne[2]*src_tensor.nb[2];
+//                 if(rpc_t.ne[1]!=1){
+//                     int64_t row_low;
+//                     int64_t row_high;
+//                     rpc_get_row_split(&row_low,&row_high,tensor,tensor_splits,id);
+//                     // GGML_LOG_INFO("low: %ld high: %ld\n",row_low,row_high);
+//                     rpc_t.ne[1]=row_high-row_low;
+//                     rpc_t.nb[2]=rpc_t.nb[1]*rpc_t.ne[1];
+//                     rpc_t.nb[3]=rpc_t.nb[2]*rpc_t.ne[2];
+//                 }else if(rpc_t.ne[0]!=1){
+//                     int64_t col_low;
+//                     int64_t col_high;
+//                     rpc_get_col_split(&col_low,&col_high,tensor,tensor_splits,id);
+//                     // GGML_LOG_INFO("low: %ld high: %ld\n",col_low,col_high);
+//                     rpc_t.ne[0]=col_high-col_low;
+//                     for(int i=1;i<GGML_MAX_DIMS;i++){
+//                         rpc_t.nb[i]=i==1?rpc_t.nb[0]*(rpc_t.ne[0]/ggml_blck_size(tensor->type)):rpc_t.nb[i-1]*rpc_t.ne[i-1];
+//                     }
                     
-                }else{
-                    GGML_LOG_INFO("error view");
-                }
-                return 0;
-            }
-        }break;
+//                 }else{
+//                     GGML_LOG_INFO("error view");
+//                 }
+//                 return 0;
+//             }
+//         }break;
 
 
-        case GGML_OP_PERMUTE:{
-            ggml_tensor * src=tensor->src[0];
-            rpc_tensor src_tensor=visited[tensor->src[0]];
-            for(int i=0;i<GGML_MAX_DIMS;i++){
-                for(int j=0;j<GGML_MAX_DIMS;j++){
-                    if(tensor->ne[i]==src->ne[j]){
-                        rpc_t.ne[i]=src_tensor.ne[j];
-                        rpc_t.nb[i]=src_tensor.nb[j];
-                        continue;
-                    }
-                }
-            }
-        }break;
-        case GGML_OP_TRANSPOSE:{
-            rpc_tensor src_tensor=visited[tensor->src[0]];
-            rpc_t.ne[1]=src_tensor.ne[0];
-            rpc_t.ne[0]=src_tensor.ne[1];
-            rpc_t.nb[1]=src_tensor.nb[0];
-            rpc_t.nb[0]=src_tensor.nb[1];
-            for(int i=2;i<GGML_MAX_DIMS;i++){
-                rpc_t.nb[i]=src_tensor.nb[i];
-            }
-        }break;
-        case GGML_OP_GET_ROWS:{
-            rpc_tensor src_tensor0=visited[tensor->src[0]];
-            rpc_tensor src_tensor1=visited[tensor->src[1]];
-            rpc_t.ne[0]=src_tensor0.ne[0];
-            rpc_t.ne[1]=src_tensor1.ne[0];
-            rpc_t.ne[2]=src_tensor1.ne[1];
-            rpc_t.ne[3]=src_tensor1.ne[2];
-        }break;
-        case GGML_OP_GET_ROWS_BACK:
-        case GGML_OP_CONV_TRANSPOSE_1D:
-        case GGML_OP_IM2COL:
-        case GGML_OP_IM2COL_BACK:
-        case GGML_OP_CONV_TRANSPOSE_2D:
-        case GGML_OP_POOL_1D:
-        case GGML_OP_POOL_2D:
-        case GGML_OP_POOL_2D_BACK:
-        case GGML_OP_UPSCALE: // nearest interpolate
-        case GGML_OP_PAD:
-        case GGML_OP_PAD_REFLECT_1D:
-        case GGML_OP_ARANGE:
-        case GGML_OP_TIMESTEP_EMBEDDING:
-        case GGML_OP_ARGSORT:
+//         case GGML_OP_PERMUTE:{
+//             ggml_tensor * src=tensor->src[0];
+//             rpc_tensor src_tensor=visited[tensor->src[0]];
+//             for(int i=0;i<GGML_MAX_DIMS;i++){
+//                 for(int j=0;j<GGML_MAX_DIMS;j++){
+//                     if(tensor->ne[i]==src->ne[j]){
+//                         rpc_t.ne[i]=src_tensor.ne[j];
+//                         rpc_t.nb[i]=src_tensor.nb[j];
+//                         continue;
+//                     }
+//                 }
+//             }
+//         }break;
+//         case GGML_OP_TRANSPOSE:{
+//             rpc_tensor src_tensor=visited[tensor->src[0]];
+//             rpc_t.ne[1]=src_tensor.ne[0];
+//             rpc_t.ne[0]=src_tensor.ne[1];
+//             rpc_t.nb[1]=src_tensor.nb[0];
+//             rpc_t.nb[0]=src_tensor.nb[1];
+//             for(int i=2;i<GGML_MAX_DIMS;i++){
+//                 rpc_t.nb[i]=src_tensor.nb[i];
+//             }
+//         }break;
+//         case GGML_OP_GET_ROWS:{
+//             rpc_tensor src_tensor0=visited[tensor->src[0]];
+//             rpc_tensor src_tensor1=visited[tensor->src[1]];
+//             rpc_t.ne[0]=src_tensor0.ne[0];
+//             rpc_t.ne[1]=src_tensor1.ne[0];
+//             rpc_t.ne[2]=src_tensor1.ne[1];
+//             rpc_t.ne[3]=src_tensor1.ne[2];
+//         }break;
+//         case GGML_OP_GET_ROWS_BACK:
+//         case GGML_OP_CONV_TRANSPOSE_1D:
+//         case GGML_OP_IM2COL:
+//         case GGML_OP_IM2COL_BACK:
+//         case GGML_OP_CONV_TRANSPOSE_2D:
+//         case GGML_OP_POOL_1D:
+//         case GGML_OP_POOL_2D:
+//         case GGML_OP_POOL_2D_BACK:
+//         case GGML_OP_UPSCALE: // nearest interpolate
+//         case GGML_OP_PAD:
+//         case GGML_OP_PAD_REFLECT_1D:
+//         case GGML_OP_ARANGE:
+//         case GGML_OP_TIMESTEP_EMBEDDING:
+//         case GGML_OP_ARGSORT:
 
-        case GGML_OP_FLASH_ATTN_BACK:
-        case GGML_OP_WIN_PART:
-        case GGML_OP_WIN_UNPART:
-        case GGML_OP_CROSS_ENTROPY_LOSS:
-        case GGML_OP_COUNT:
-            break;
+//         case GGML_OP_FLASH_ATTN_BACK:
+//         case GGML_OP_WIN_PART:
+//         case GGML_OP_WIN_UNPART:
+//         case GGML_OP_CROSS_ENTROPY_LOSS:
+//         case GGML_OP_COUNT:
+//             break;
 
-        case GGML_OP_FLASH_ATTN_EXT:
-        case GGML_OP_SSM_CONV:
-        case GGML_OP_SSM_SCAN:
-        case GGML_OP_GET_REL_POS:
-        case GGML_OP_ADD_REL_POS:
-        case GGML_OP_RWKV_WKV6:
-        case GGML_OP_GATED_LINEAR_ATTN:
+//         case GGML_OP_FLASH_ATTN_EXT:
+//         case GGML_OP_SSM_CONV:
+//         case GGML_OP_SSM_SCAN:
+//         case GGML_OP_GET_REL_POS:
+//         case GGML_OP_ADD_REL_POS:
+//         case GGML_OP_RWKV_WKV6:
+//         case GGML_OP_GATED_LINEAR_ATTN:
 
-        case GGML_OP_UNARY:
+//         case GGML_OP_UNARY:
 
-        case GGML_OP_MAP_UNARY:
-        case GGML_OP_MAP_BINARY:
+//         case GGML_OP_MAP_UNARY:
+//         case GGML_OP_MAP_BINARY:
 
-        case GGML_OP_MAP_CUSTOM1_F32:
-        case GGML_OP_MAP_CUSTOM2_F32:
-        case GGML_OP_MAP_CUSTOM3_F32:
+//         case GGML_OP_MAP_CUSTOM1_F32:
+//         case GGML_OP_MAP_CUSTOM2_F32:
+//         case GGML_OP_MAP_CUSTOM3_F32:
 
-        case GGML_OP_MAP_CUSTOM1:
-        case GGML_OP_MAP_CUSTOM2:
-        case GGML_OP_MAP_CUSTOM3:
+//         case GGML_OP_MAP_CUSTOM1:
+//         case GGML_OP_MAP_CUSTOM2:
+//         case GGML_OP_MAP_CUSTOM3:
 
-        case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
-        case GGML_OP_OPT_STEP_ADAMW:{
-            //same shape as src0
-            rpc_tensor src_tensor=visited[tensor->src[0]];
-            for(int i=0;i<GGML_MAX_DIMS;i++){
-                rpc_t.ne[i]=src_tensor.ne[i];
-                rpc_t.nb[i]=src_tensor.nb[i];
-            }
-        }break;
+//         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
+//         case GGML_OP_OPT_STEP_ADAMW:{
+//             //same shape as src0
+//             rpc_tensor src_tensor=visited[tensor->src[0]];
+//             for(int i=0;i<GGML_MAX_DIMS;i++){
+//                 rpc_t.ne[i]=src_tensor.ne[i];
+//                 rpc_t.nb[i]=src_tensor.nb[i];
+//             }
+//         }break;
 
-    }
-    return -1;
-}
+//     }
+//     return -1;
+// }
 
 static void add_tensor_part(ggml_tensor * tensor, std::vector<rpc_tensor> & tensors,
                             std::map<ggml_tensor *,rpc_tensor> & visited, int split_dim, int id) {
@@ -1933,7 +1937,7 @@ static void add_tensor_part(ggml_tensor * tensor, std::vector<rpc_tensor> & tens
 
                 if (src->view_src && visited.count(src->view_src) == 0) {
                     src_view_tensor=split_serialize_tensor(src->view_src, (ggml_tensor_extra_rpc *) src->view_src->extra, id);
-                    // tensors.push_back(src_view_tensor);
+                    tensors.push_back(src_view_tensor);
                     visited[src->view_src]=src_view_tensor;
                 }
             } else {
@@ -1962,7 +1966,7 @@ static void add_tensor_part(ggml_tensor * tensor, std::vector<rpc_tensor> & tens
                                                         reinterpret_cast<ggml_backend_rpc_buffer_context *>(src_view_src_extra->buffer_ctx[id])));
                         }
                     }
-                    // tensors.push_back(src_view_tensor);
+                    tensors.push_back(src_view_tensor);
                     visited[src->view_src]=src_view_tensor;
                 }
             }
@@ -1971,7 +1975,6 @@ static void add_tensor_part(ggml_tensor * tensor, std::vector<rpc_tensor> & tens
                 src0_idx=tensors.size();
             }
             tensors.push_back(src_tensor);
-            tensors.push_back(src_view_tensor);
             
         }
     }
@@ -1989,9 +1992,12 @@ static void add_tensor_part(ggml_tensor * tensor, std::vector<rpc_tensor> & tens
         }
     }
     
-    int checksrc=change_ne_and_nb(tensor,rpc_t,visited,id);
-    if(checksrc!=-1){
-        tensors[src0_idx]=visited[tensor->src[0]];
+    
+    if(split_dim!=-1){
+        rpc_t.ne[0]=visited[tensor->src[0]].ne[1];
+        rpc_t.nb[1]=rpc_t.ne[0]*rpc_t.nb[0]/ggml_blck_size(tensor->type);
+        rpc_t.nb[2]=rpc_t.nb[1]*rpc_t.ne[1];
+        rpc_t.nb[3]=rpc_t.nb[2]*rpc_t.ne[2];
     }
     tensors.push_back(rpc_t);
     visited[tensor]=rpc_t;
@@ -2240,16 +2246,7 @@ static void output_nodes(uint32_t n_nodes, uint32_t count_nodes_low, ggml_cgraph
 
 static void add_data_to_data(std::vector<uint8_t> & data, ggml_tensor * tensor, std::mutex & data_mutex, int id){
     std::lock_guard<std::mutex> lock(data_mutex);
-    // std::ofstream out("d.txt", std::ios::app);
-    // out << "received data for" << tensor->name << "\n";
-    // const float * float_ptr = reinterpret_cast<const float *>(data.data());
-    // for(size_t i=0;i<data.size()/sizeof(float);i++){
-    //     if (i % 1024 == 0 && i != 0) {
-    //         out << "\n";
-    //     }
-    //     out << static_cast<float>(float_ptr[i]) << " ";
-    // }
-    // out << "\n";
+    // GGML_LOG_INFO("begin add\n");
     ggml_tensor_extra_rpc* src_extra=(ggml_tensor_extra_rpc*)tensor->src[0]->extra;
     ggml_tensor_extra_rpc* extra=(ggml_tensor_extra_rpc*)tensor->extra;
     if(src_extra->split_dim==1){
@@ -2290,12 +2287,6 @@ static void add_data_to_data(std::vector<uint8_t> & data, ggml_tensor * tensor, 
         bool status = send_rpc_cmd(get_socket(dev_ctx->endpoint), RPC_CMD_GET_TENSOR, &request, sizeof(request),
                                         output_data.data(), split_size);
         GGML_ASSERT(status);
-        // std::ofstream out("d.bin", std::ios::app|std::ios::binary );
-        // GGML_LOG_INFO("%s: %ld\n",tensor->name,request.size);
-        // const float * float_ptr = reinterpret_cast<const float *>(data.data());
-        // size_t float_count = data.size() / sizeof(float);
-        // out.write(reinterpret_cast<const char*>(float_ptr), float_count * sizeof(float));
-        // out.close();
         set_split_col_data(output_data.data(), tensor, col_low, col_high, data.data());
     }else{
         GGML_ASSERT(data.size()==ggml_nbytes(tensor));
@@ -2351,32 +2342,16 @@ static void add_data_to_data(std::vector<uint8_t> & data, ggml_tensor * tensor, 
         bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size(), &response, sizeof(response));
         GGML_ASSERT(status);
         buf->iface.get_tensor(add_out->buffer,add_out,data.data(),0,data.size());
-        // GGML_LOG_INFO("\n-------------print data-------------\n");
-        // GGML_LOG_INFO("%s\n",tensor->name);
-        // const float * float_ptr = reinterpret_cast<const float *>(data.data());
-        // for(size_t i=0;i<data.size()/sizeof(float);i++){
-        //     GGML_LOG_INFO("%f ",float_ptr[i]);
-        // }
-        // GGML_LOG_INFO("\n-------------end of print data-------------\n");
-        // std::ofstream out("d.bin", std::ios::app|std::ios::binary );
-        // GGML_LOG_INFO("%s: %ld\n",tensor->name,data.size());
-        // const float * float_ptr = reinterpret_cast<const float *>(data.data());
-        // size_t float_count = data.size() / sizeof(float);
-        // out.write(reinterpret_cast<const char*>(float_ptr), float_count * sizeof(float));
-        // out.close();
 
         ggml_backend_buffer_free(temp->buffer);
         ggml_backend_buffer_free(add_out->buffer);
     }
-    // out << "received data for" << tensor->name << "\n";
+    // GGML_LOG_INFO("\n-------------print data-------------\n");
+    // const float * float_ptr = reinterpret_cast<const float *>(data.data());
     // for(size_t i=0;i<data.size()/sizeof(float);i++){
-    //     if (i % 1024 == 0 && i != 0) {
-    //         out << "\n";
-    //     }
-    //     out << static_cast<float>(float_ptr[i]) << " ";
+    //     GGML_LOG_INFO("%f ",float_ptr[i]);
     // }
-    // out << "\n";
-    // out.close();
+    // GGML_LOG_INFO("\n-------------end of print data-------------\n");
 }
 
 static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
@@ -2396,34 +2371,39 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         uint32_t count_nodes_low=0;
         for (int count_nodes=0; count_nodes < cgraph->n_nodes; count_nodes++) {
             ggml_tensor * node = cgraph->nodes[count_nodes];
-            // GGML_LOG_INFO("\ntensor %s ne0 :%ld ne1: %ld ne2: %ld ne3: %ld nb0: %ld nb1: %ld nb2: %ld nb3: %ld \n",
-            //         node->name,node->ne[0],node->ne[1],node->ne[2],node->ne[3],node->nb[0],node->nb[1],node->nb[2],node->nb[3]);
-            // for(int i=0;i<GGML_MAX_SRC;i++){
-            //     ggml_tensor* src=node->src[i];
-            //     if(src){
-            //         GGML_LOG_INFO("src %d %s ne0 :%ld ne1: %ld ne2: %ld ne3: %ld nb0: %ld nb1: %ld nb2: %ld nb3: %ld \n",
-            //                 i,src->name,src->ne[0],src->ne[1],src->ne[2],src->ne[3],src->nb[0],src->nb[1],src->nb[2],src->nb[3]);
-            //     }
-            // }
+            if(node->op==GGML_OP_VIEW){
+                GGML_LOG_INFO("\ntensor %s ne0 :%ld ne1: %ld ne2: %ld ne3: %ld nb0: %ld nb1: %ld nb2: %ld nb3: %ld data: %p view_src: %s view_offset: %ld\n",
+                    node->name,node->ne[0],node->ne[1],node->ne[2],node->ne[3],node->nb[0],node->nb[1],node->nb[2],node->nb[3],
+                    node->data,node->view_src ? node->view_src->name : "null",node->view_offs);
+                for(int i=0;i<GGML_MAX_SRC;i++){
+                    ggml_tensor* src=node->src[i];
+                    if(src){
+                        GGML_LOG_INFO("src %d %s ne0 :%ld ne1: %ld ne2: %ld ne3: %ld nb0: %ld nb1: %ld nb2: %ld nb3: %ld \n",
+                                i,src->name,src->ne[0],src->ne[1],src->ne[2],src->ne[3],src->nb[0],src->nb[1],src->nb[2],src->nb[3]);
+                    }
+                }
+            }
             if (!ggml_is_empty(node) && node->src[0] != nullptr &&
                 ggml_backend_buft_is_rpc_split(node->src[0]->buffer->buft) &&
                 (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID)) {
                 ggml_tensor_extra_rpc * node_extra = (ggml_tensor_extra_rpc *)node->src[0]->extra;
-                if(node_extra->split_dim==0){
+                if(node_extra->split_dim==1){
                     // this is where to break;
                     GGML_ASSERT(ggml_backend_buft_is_rpc(node->src[1]->buffer->buft));
                     GGML_ASSERT(ggml_backend_buft_is_rpc(node->buffer->buft));
-                    struct sync_split sync_split={{count_nodes_low,count_nodes},false};
-                    sync_splits.push_back(sync_split);
+                    struct sync_split sync_split={{count_nodes_low,count_nodes-1},false};
+                    sync_splits.push_back(sync_split);     
+                    struct sync_split sync_split1={{count_nodes,count_nodes},false};
+                    sync_splits.push_back(sync_split1);
                     count_nodes_low=count_nodes+1;  
                     // GGML_LOG_INFO("\n-----another split-----\n");           
-                }else if(node_extra->split_dim==1){
-                    GGML_ASSERT(ggml_backend_buft_is_rpc(node->src[1]->buffer->buft));
-                    GGML_ASSERT(ggml_backend_buft_is_rpc(node->buffer->buft));
-                    if(strcmp(node->name,"result_output")==0){
-                        struct sync_split sync_split={{count_nodes_low,count_nodes},true};
-                        sync_splits.push_back(sync_split);
-                    }
+                // }else if(node_extra->split_dim==1){
+                //     GGML_ASSERT(ggml_backend_buft_is_rpc(node->src[1]->buffer->buft));
+                //     GGML_ASSERT(ggml_backend_buft_is_rpc(node->buffer->buft));
+                //     if(strcmp(node->name,"result_output")==0){
+                //         struct sync_split sync_split={{count_nodes_low,count_nodes},true};
+                //         sync_splits.push_back(sync_split);
+                //     }
                 }
             } else {
                 if (count_nodes == cgraph->n_nodes - 1) {
@@ -2442,140 +2422,213 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
             uint32_t count_nodes     = sync_split.nodes_split.second;
             // GGML_LOG_INFO("low = %d high = %d\n",count_nodes_low,count_nodes);
             bool checkend = sync_split.checkend;
-
             ggml_tensor *        tensor = cgraph->nodes[count_nodes];
-            std::vector<uint8_t> data(ggml_nbytes(tensor),0);
-            // GGML_LOG_INFO("\n-------------print data-------------\n");
-            // const float * float_ptr = reinterpret_cast<const float *>(data.data());
-            // for(size_t i=0;i<data.size()/sizeof(float);i++){
-            //     GGML_LOG_INFO("%f ",float_ptr[i]);
-            // }
-            // GGML_LOG_INFO("\n-------------end of print data-------------\n");
-
-            //compute concurrently
-            std::mutex rpc_mutex;
-            std::mutex data_mutex;
-
-            int device_count = ggml_backend_rpc_get_device_count();
-            std::vector<std::thread> threads;
-
-            for (int id = 0; id < device_count; ++id) {
-                threads.emplace_back([&, id]() {
-                    //we need to compute the next part of the graph
-                    std::vector<rpc_tensor>              tensors;
-                    std::map<ggml_tensor*,rpc_tensor> visited;
-                    
-
-                    for(uint32_t count=count_nodes_low;count<=count_nodes;count++){
-                        ggml_tensor * node = cgraph->nodes[count];
-                        if (!ggml_is_empty(node) && node->src[0] != nullptr &&
-                        ggml_backend_buft_is_rpc_split(node->src[0]->buffer->buft) &&
-                        (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID)) {
-                            ggml_tensor_extra_rpc * node_extra = (ggml_tensor_extra_rpc *)node->src[0]->extra;
-                            add_tensor_part(node,tensors,visited,node_extra->split_dim,id);
-                        }else{
-                            add_tensor_part(node,tensors,visited,-1,id);
-                        }
-                        // GGML_LOG_INFO("\noperation %d",node->op);
-                        // GGML_LOG_INFO("\ntensor %s ne0 :%d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d \n",
-                        //     node->name,visited[node].ne[0],visited[node].ne[1],visited[node].ne[2],visited[node].ne[3],visited[node].nb[0],visited[node].nb[1],visited[node].nb[2],visited[node].nb[3]);
-                        // for(int i=0;i<GGML_MAX_SRC;i++){
-                        //     ggml_tensor* src=node->src[i];
-                        //     if(src){
-                        //         GGML_LOG_INFO("src %d %s ne0 :%d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d \n",
-                        //             i,src->name,visited[src].ne[0],visited[src].ne[1],visited[src].ne[2],visited[src].ne[3],visited[src].nb[0],visited[src].nb[1],visited[src].nb[2],visited[src].nb[3]);
-                        //     }
-                        // }
-                    }
-
-
-
-                    auto  dev_ctx = (ggml_backend_rpc_device_context *) reg_ctx->devices[id]->context;
-                    auto  sock    = get_socket(dev_ctx->endpoint);
-
-                    std::vector<uint8_t> input;
-                    uint32_t n_nodes = count_nodes - count_nodes_low + 1;
-                    if (n_nodes == 0) {
-                        return;
-                    }
-
-                    uint32_t n_tensors  = tensors.size();
-                    int      input_size = sizeof(uint32_t) + n_nodes * sizeof(uint64_t) + sizeof(uint32_t) +
-                                     n_tensors * sizeof(rpc_tensor);
-                    input.resize(input_size, 0);
-
-                    memcpy(input.data(), &n_nodes, sizeof(n_nodes));
-                    for (uint32_t i = 0; i < n_nodes; i++) {
-                        memcpy(input.data() + sizeof(n_nodes) + i * sizeof(uint64_t),
-                               &cgraph->nodes[count_nodes_low + i], sizeof(uint64_t));
-                    }
-
-                    uint32_t * in_ntensors = (uint32_t *) (input.data() + sizeof(n_nodes) + n_nodes * sizeof(uint64_t));
-                    *in_ntensors           = n_tensors;
-
-                    rpc_tensor * in_tensors =
-                        (rpc_tensor *) (input.data() + sizeof(n_nodes) + n_nodes * sizeof(uint64_t) + sizeof(uint32_t));
-                    memcpy(in_tensors, tensors.data(), n_tensors * sizeof(rpc_tensor));
-
-                    rpc_msg_graph_compute_rsp response;
-
-                    bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size(), &response,
-                                               sizeof(response));
-                    GGML_ASSERT(status);
-
-                    if (response.result != GGML_STATUS_SUCCESS) {
-                        std::lock_guard<std::mutex> lock(rpc_mutex);  // To avoid mixed output
-                        fprintf(stderr, "RPC graph compute failed with status %d\n", response.result);
-                        return;
-                    }
-
-                    if (!checkend) {
-                        // if (first_layer[id]) {
-                        //     output_nodes(n_nodes,count_nodes_low,cgraph,first_layer,id,sock,rpc_ctx,dev_ctx,tensor,curr_data);
-                        // }
-                        add_data_to_data(data,tensor,data_mutex,id);
-                    }else{
-                        
-                        if(strcmp(tensor->name,"result_output")==0){
-                            add_data_to_data(data,tensor,data_mutex,id);
-                        }
-                    }
-                });
-            }
-
-            // Join all threads
-            for (auto & thread : threads) {
-                if (thread.joinable()) {
-                    thread.join();
-                }
-            }
-            if (!checkend) {
-                // if(!std::all_of(first_layer.begin(), first_layer.end(), [](bool v) { return !v; })){
-                //     ouput_src0(tensor,data);
-                // }
-                // GGML_LOG_INFO("tensor: %s",tensor->name);
+            if(ggml_backend_buft_is_rpc_split(tensor->src[0]->buffer->buft) &&
+                (tensor->op == GGML_OP_MUL_MAT || tensor->op == GGML_OP_MUL_MAT_ID)) {
+                std::vector<uint8_t> data(ggml_nbytes(tensor),0);
                 // GGML_LOG_INFO("\n-------------print data-------------\n");
                 // const float * float_ptr = reinterpret_cast<const float *>(data.data());
                 // for(size_t i=0;i<data.size()/sizeof(float);i++){
                 //     GGML_LOG_INFO("%f ",float_ptr[i]);
                 // }
                 // GGML_LOG_INFO("\n-------------end of print data-------------\n");
-                ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
-                // std::ofstream out("tensor_dump_row.txt", std::ios::app);
-                // out << "[" << __func__ << "]" << ", get data for tensor " << tensor->name
-                //         << ", size=" << ggml_nbytes(tensor) << "\n";
-                //     const float * float_ptr = reinterpret_cast<const float *>(data.data());
-                //     for (size_t j = 0; j < ggml_nbytes(tensor)/sizeof(float); ++j) {
+
+                //compute concurrently
+                std::mutex rpc_mutex;
+                std::mutex data_mutex;
+
+                int device_count = ggml_backend_rpc_get_device_count();
+                std::vector<std::thread> threads;
+
+                for (int id = 0; id < device_count; ++id) {
+                    threads.emplace_back([&, id]() {
+                        //we need to compute the next part of the graph
+                        std::vector<rpc_tensor>              tensors;
+                        std::map<ggml_tensor*,rpc_tensor> visited;
                         
-                //         out << static_cast<float>(float_ptr[j]) << " ";
-                //     }
-                //     out << "\n";
-                // out.close();
-                buf->iface.set_tensor(buf, tensor, data.data(), 0, data.size());
-            }else{
-                if(strcmp(tensor->name,"result_output")==0){
+
+                        for(uint32_t count=count_nodes_low;count<=count_nodes;count++){
+                            ggml_tensor * node = cgraph->nodes[count];
+                            if (!ggml_is_empty(node) && node->src[0] != nullptr &&
+                            ggml_backend_buft_is_rpc_split(node->src[0]->buffer->buft) &&
+                            (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID)) {
+                                ggml_tensor_extra_rpc * node_extra = (ggml_tensor_extra_rpc *)node->src[0]->extra;
+                                add_tensor_part(node,tensors,visited,node_extra->split_dim,id);
+                            }else{
+                                add_tensor_part(node,tensors,visited,-1,id);
+                            }
+                            // GGML_LOG_INFO("\noperation %d",node->op);
+                            // GGML_LOG_INFO("\ntensor %s ne0 :%d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d \n",
+                            //     node->name,visited[node].ne[0],visited[node].ne[1],visited[node].ne[2],visited[node].ne[3],visited[node].nb[0],visited[node].nb[1],visited[node].nb[2],visited[node].nb[3]);
+                            // for(int i=0;i<GGML_MAX_SRC;i++){
+                            //     ggml_tensor* src=node->src[i];
+                            //     if(src){
+                            //         GGML_LOG_INFO("src %d %s ne0 :%d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d \n",
+                            //             i,src->name,visited[src].ne[0],visited[src].ne[1],visited[src].ne[2],visited[src].ne[3],visited[src].nb[0],visited[src].nb[1],visited[src].nb[2],visited[src].nb[3]);
+                            //     }
+                            // }
+                        }
+
+
+
+                        auto  dev_ctx = (ggml_backend_rpc_device_context *) reg_ctx->devices[id]->context;
+                        auto  sock    = get_socket(dev_ctx->endpoint);
+
+                        std::vector<uint8_t> input;
+                        uint32_t n_nodes = count_nodes - count_nodes_low + 1;
+                        if (n_nodes == 0) {
+                            return;
+                        }
+
+                        uint32_t n_tensors  = tensors.size();
+                        int      input_size = sizeof(uint32_t) + n_nodes * sizeof(uint64_t) + sizeof(uint32_t) +
+                                        n_tensors * sizeof(rpc_tensor);
+                        input.resize(input_size, 0);
+
+                        memcpy(input.data(), &n_nodes, sizeof(n_nodes));
+                        for (uint32_t i = 0; i < n_nodes; i++) {
+                            memcpy(input.data() + sizeof(n_nodes) + i * sizeof(uint64_t),
+                                &cgraph->nodes[count_nodes_low + i], sizeof(uint64_t));
+                        }
+
+                        uint32_t * in_ntensors = (uint32_t *) (input.data() + sizeof(n_nodes) + n_nodes * sizeof(uint64_t));
+                        *in_ntensors           = n_tensors;
+
+                        rpc_tensor * in_tensors =
+                            (rpc_tensor *) (input.data() + sizeof(n_nodes) + n_nodes * sizeof(uint64_t) + sizeof(uint32_t));
+                        memcpy(in_tensors, tensors.data(), n_tensors * sizeof(rpc_tensor));
+
+                        rpc_msg_graph_compute_rsp response;
+
+                        bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size(), &response,
+                                                sizeof(response));
+                        GGML_ASSERT(status);
+
+                        if (response.result != GGML_STATUS_SUCCESS) {
+                            std::lock_guard<std::mutex> lock(rpc_mutex);  // To avoid mixed output
+                            fprintf(stderr, "RPC graph compute failed with status %d\n", response.result);
+                            return;
+                        }
+
+                        if (!checkend) {
+                            // if (first_layer[id]) {
+                            //     output_nodes(n_nodes,count_nodes_low,cgraph,first_layer,id,sock,rpc_ctx,dev_ctx,tensor,curr_data);
+                            // }
+                            
+                            add_data_to_data(data,tensor,data_mutex,id);
+                        }else{
+                            if(strcmp(tensor->name,"result_output")==0){
+                                add_data_to_data(data,tensor,data_mutex,id);
+                            }
+                        }
+                    });
+                }
+
+                // Join all threads
+                for (auto & thread : threads) {
+                    if (thread.joinable()) {
+                        thread.join();
+                    }
+                }
+                if (!checkend) {
+                    // if(!std::all_of(first_layer.begin(), first_layer.end(), [](bool v) { return !v; })){
+                    //     ouput_src0(tensor,data);
+                    // }
                     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+                    // std::ofstream out("tensor_dump_row.txt", std::ios::app);
+                    // out << "[" << __func__ << "]" << ", get data for tensor " << tensor->name
+                    //         << ", size=" << ggml_nbytes(tensor) << "\n";
+                    //     const float * float_ptr = reinterpret_cast<const float *>(data.data());
+                    //     for (size_t j = 0; j < ggml_nbytes(tensor)/sizeof(float); ++j) {
+                            
+                    //         out << static_cast<float>(float_ptr[j]) << " ";
+                    //     }
+                    //     out << "\n";
+                    // out.close();
                     buf->iface.set_tensor(buf, tensor, data.data(), 0, data.size());
+                }else{
+                    if(strcmp(tensor->name,"result_output")==0){
+                        ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+                        buf->iface.set_tensor(buf, tensor, data.data(), 0, data.size());
+                    }
+                }
+            }else{
+                std::vector<rpc_tensor> tensors;
+                std::map<ggml_tensor*,rpc_tensor> visited;
+                int id = ggml_backend_rpc_get_device_id(rpc_ctx->endpoint.c_str());
+                for(uint32_t count=count_nodes_low;count<=count_nodes;count++){
+                    ggml_tensor * node = cgraph->nodes[count];
+                    if (!ggml_is_empty(node) && node->src[0] != nullptr &&
+                        ggml_backend_buft_is_rpc_split(node->src[0]->buffer->buft) &&
+                        (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID)) {
+                        ggml_tensor_extra_rpc * node_extra = (ggml_tensor_extra_rpc *)node->src[0]->extra;
+                        add_tensor_part(node,tensors,visited,node_extra->split_dim,id);
+                    }else{
+                        add_tensor_part(node,tensors,visited,-1,id);
+                    }
+                            // GGML_LOG_INFO("\noperation %d",node->op);
+                            // GGML_LOG_INFO("\ntensor %s ne0 :%d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d \n",
+                            //     node->name,visited[node].ne[0],visited[node].ne[1],visited[node].ne[2],visited[node].ne[3],visited[node].nb[0],visited[node].nb[1],visited[node].nb[2],visited[node].nb[3]);
+                            // for(int i=0;i<GGML_MAX_SRC;i++){
+                            //     ggml_tensor* src=node->src[i];
+                            //     if(src){
+                            //         GGML_LOG_INFO("src %d %s ne0 :%d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d \n",
+                            //             i,src->name,visited[src].ne[0],visited[src].ne[1],visited[src].ne[2],visited[src].ne[3],visited[src].nb[0],visited[src].nb[1],visited[src].nb[2],visited[src].nb[3]);
+                            //     }
+                            // }
+                }
+
+
+
+                auto  dev_ctx = (ggml_backend_rpc_device_context *) reg_ctx->devices[id]->context;
+                auto  sock    = get_socket(dev_ctx->endpoint);
+
+                std::vector<uint8_t> input;
+                uint32_t n_nodes = count_nodes - count_nodes_low + 1;
+                if (n_nodes == 0) {
+                    GGML_LOG_ERROR("[%s] no nodes to compute\n", __func__);
+                    continue;
+                }
+
+                uint32_t n_tensors  = tensors.size();
+                int      input_size = sizeof(uint32_t) + n_nodes * sizeof(uint64_t) + sizeof(uint32_t) +
+                                n_tensors * sizeof(rpc_tensor);
+                input.resize(input_size, 0);
+
+                memcpy(input.data(), &n_nodes, sizeof(n_nodes));
+                for (uint32_t i = 0; i < n_nodes; i++) {
+                    memcpy(input.data() + sizeof(n_nodes) + i * sizeof(uint64_t),
+                                &cgraph->nodes[count_nodes_low + i], sizeof(uint64_t));
+                }
+
+                uint32_t * in_ntensors = (uint32_t *) (input.data() + sizeof(n_nodes) + n_nodes * sizeof(uint64_t));
+                *in_ntensors           = n_tensors;
+
+                rpc_tensor * in_tensors =(rpc_tensor *) (input.data() + sizeof(n_nodes) + n_nodes * sizeof(uint64_t) + sizeof(uint32_t));
+                memcpy(in_tensors, tensors.data(), n_tensors * sizeof(rpc_tensor));
+
+                rpc_msg_graph_compute_rsp response;
+
+                bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size(), &response,
+                                                sizeof(response));
+                GGML_ASSERT(status);
+
+                if (response.result != GGML_STATUS_SUCCESS) {
+                    fprintf(stderr, "RPC graph compute failed with status %d\n", response.result);
+                    return (ggml_status) response.result;
+                }
+
+                if(!checkend) {
+
+                    ggml_tensor * src1=cgraph->nodes[count_nodes+1]->src[1];
+                    std::vector<uint8_t> data(ggml_nbytes(src1),0);
+                    ggml_backend_buffer_t buf=src1->view_src ? src1->view_src->buffer :src1->buffer;
+                    buf->iface.get_tensor(src1->buffer,src1,data.data(),0,data.size());
+                    for(int dev=0;dev<ggml_backend_rpc_get_device_count();dev++){
+                        if(dev!=id){
+                            buf->iface.set_tensor(buf, src1, data.data(), 0, data.size());
+                        }
+                    }
                 }
             }
         }
@@ -2967,11 +3020,6 @@ bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<
 
     response.resize(request.size, 0);
     ggml_backend_tensor_get(tensor, response.data(), request.offset, request.size);
-    // std::ofstream out("dump.bin", std::ios::app|std::ios::binary );
-    // const float * float_ptr = reinterpret_cast<const float *>(response.data());
-    // size_t float_count = request.size / sizeof(float);
-    // out.write(reinterpret_cast<const char*>(float_ptr), float_count * sizeof(float));
-    // out.close();
     ggml_free(ctx);
     return true;
 }
