@@ -1950,6 +1950,9 @@ static void add_tensor_part(ggml_tensor * tensor, std::vector<rpc_tensor> & tens
                         src_tensor.buffer= src_extra->buffer_ctx[id]->remote_ptr;
                         src_tensor.data=reinterpret_cast<uint64_t>(ggml_backend_rpc_buffer_context_get_base(
                                 reinterpret_cast<ggml_backend_rpc_buffer_context *>(src_extra->buffer_ctx[id])));
+                        if(src->view_src){
+                            src_tensor.data+=src->view_offs;
+                        }
                     }
                 }
                 // tensors.push_back(src_tensor);
@@ -1988,7 +1991,9 @@ static void add_tensor_part(ggml_tensor * tensor, std::vector<rpc_tensor> & tens
             rpc_t.buffer = tensor_extra->buffer_ctx[id]->remote_ptr;
             rpc_t.data   = reinterpret_cast<uint64_t>(ggml_backend_rpc_buffer_context_get_base(
                 reinterpret_cast<ggml_backend_rpc_buffer_context *>(tensor_extra->buffer_ctx[id])));
-    
+            if(tensor->view_src){
+                rpc_t.data+=tensor->view_offs;
+            }
         }
     }
     
@@ -2371,18 +2376,15 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         uint32_t count_nodes_low=0;
         for (int count_nodes=0; count_nodes < cgraph->n_nodes; count_nodes++) {
             ggml_tensor * node = cgraph->nodes[count_nodes];
-            if(node->op==GGML_OP_VIEW){
-                GGML_LOG_INFO("\ntensor %s ne0 :%ld ne1: %ld ne2: %ld ne3: %ld nb0: %ld nb1: %ld nb2: %ld nb3: %ld data: %p view_src: %s view_offset: %ld\n",
-                    node->name,node->ne[0],node->ne[1],node->ne[2],node->ne[3],node->nb[0],node->nb[1],node->nb[2],node->nb[3],
-                    node->data,node->view_src ? node->view_src->name : "null",node->view_offs);
-                for(int i=0;i<GGML_MAX_SRC;i++){
-                    ggml_tensor* src=node->src[i];
-                    if(src){
-                        GGML_LOG_INFO("src %d %s ne0 :%ld ne1: %ld ne2: %ld ne3: %ld nb0: %ld nb1: %ld nb2: %ld nb3: %ld \n",
-                                i,src->name,src->ne[0],src->ne[1],src->ne[2],src->ne[3],src->nb[0],src->nb[1],src->nb[2],src->nb[3]);
-                    }
-                }
-            }
+            // GGML_LOG_INFO("\ntensor %s ne0 :%ld ne1: %ld ne2: %ld ne3: %ld nb0: %ld nb1: %ld nb2: %ld nb3: %ld \n",
+            //         node->name,node->ne[0],node->ne[1],node->ne[2],node->ne[3],node->nb[0],node->nb[1],node->nb[2],node->nb[3]);
+            // for(int i=0;i<GGML_MAX_SRC;i++){
+            //     ggml_tensor* src=node->src[i];
+            //     if(src){
+            //         GGML_LOG_INFO("src %d %s ne0 :%ld ne1: %ld ne2: %ld ne3: %ld nb0: %ld nb1: %ld nb2: %ld nb3: %ld \n",
+            //                 i,src->name,src->ne[0],src->ne[1],src->ne[2],src->ne[3],src->nb[0],src->nb[1],src->nb[2],src->nb[3]);
+            //     }
+            // }
             if (!ggml_is_empty(node) && node->src[0] != nullptr &&
                 ggml_backend_buft_is_rpc_split(node->src[0]->buffer->buft) &&
                 (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID)) {
@@ -2391,10 +2393,8 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                     // this is where to break;
                     GGML_ASSERT(ggml_backend_buft_is_rpc(node->src[1]->buffer->buft));
                     GGML_ASSERT(ggml_backend_buft_is_rpc(node->buffer->buft));
-                    struct sync_split sync_split={{count_nodes_low,count_nodes-1},false};
-                    sync_splits.push_back(sync_split);     
-                    struct sync_split sync_split1={{count_nodes,count_nodes},false};
-                    sync_splits.push_back(sync_split1);
+                    struct sync_split sync_split={{count_nodes_low,count_nodes},false};
+                    sync_splits.push_back(sync_split);
                     count_nodes_low=count_nodes+1;  
                     // GGML_LOG_INFO("\n-----another split-----\n");           
                 // }else if(node_extra->split_dim==1){
@@ -2423,212 +2423,138 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
             // GGML_LOG_INFO("low = %d high = %d\n",count_nodes_low,count_nodes);
             bool checkend = sync_split.checkend;
             ggml_tensor *        tensor = cgraph->nodes[count_nodes];
-            if(ggml_backend_buft_is_rpc_split(tensor->src[0]->buffer->buft) &&
-                (tensor->op == GGML_OP_MUL_MAT || tensor->op == GGML_OP_MUL_MAT_ID)) {
-                std::vector<uint8_t> data(ggml_nbytes(tensor),0);
+            std::vector<uint8_t> data(ggml_nbytes(tensor),0);
+            // GGML_LOG_INFO("\n-------------print data-------------\n");
+            // const float * float_ptr = reinterpret_cast<const float *>(data.data());
+            // for(size_t i=0;i<data.size()/sizeof(float);i++){
+            //     GGML_LOG_INFO("%f ",float_ptr[i]);
+            // }
+            // GGML_LOG_INFO("\n-------------end of print data-------------\n");
+
+            //compute concurrently
+            std::mutex rpc_mutex;
+            std::mutex data_mutex;
+
+            int device_count = ggml_backend_rpc_get_device_count();
+            std::vector<std::thread> threads;
+
+            for (int id = 0; id < device_count; ++id) {
+                threads.emplace_back([&, id]() {
+                    //we need to compute the next part of the graph
+                    std::vector<rpc_tensor>              tensors;
+                    std::map<ggml_tensor*,rpc_tensor> visited;
+                    
+
+                    for(uint32_t count=count_nodes_low;count<=count_nodes;count++){
+                        ggml_tensor * node = cgraph->nodes[count];
+                        if (!ggml_is_empty(node) && node->src[0] != nullptr &&
+                        ggml_backend_buft_is_rpc_split(node->src[0]->buffer->buft) &&
+                        (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID)) {
+                            ggml_tensor_extra_rpc * node_extra = (ggml_tensor_extra_rpc *)node->src[0]->extra;
+                            add_tensor_part(node,tensors,visited,node_extra->split_dim,id);
+                        }else{
+                            add_tensor_part(node,tensors,visited,-1,id);
+                        }
+                        // GGML_LOG_INFO("\noperation %d",node->op);
+                        // GGML_LOG_INFO("\ntensor %s ne0 :%d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d \n",
+                        //     node->name,visited[node].ne[0],visited[node].ne[1],visited[node].ne[2],visited[node].ne[3],visited[node].nb[0],visited[node].nb[1],visited[node].nb[2],visited[node].nb[3]);
+                        // for(int i=0;i<GGML_MAX_SRC;i++){
+                        //     ggml_tensor* src=node->src[i];
+                        //     if(src){
+                        //         GGML_LOG_INFO("src %d %s ne0 :%d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d \n",
+                        //             i,src->name,visited[src].ne[0],visited[src].ne[1],visited[src].ne[2],visited[src].ne[3],visited[src].nb[0],visited[src].nb[1],visited[src].nb[2],visited[src].nb[3]);
+                        //     }
+                        // }
+                    }
+
+
+
+                    auto  dev_ctx = (ggml_backend_rpc_device_context *) reg_ctx->devices[id]->context;
+                    auto  sock    = get_socket(dev_ctx->endpoint);
+
+                    std::vector<uint8_t> input;
+                    uint32_t n_nodes = count_nodes - count_nodes_low + 1;
+                    if (n_nodes == 0) {
+                        return;
+                    }
+
+                    uint32_t n_tensors  = tensors.size();
+                    int      input_size = sizeof(uint32_t) + n_nodes * sizeof(uint64_t) + sizeof(uint32_t) +
+                                     n_tensors * sizeof(rpc_tensor);
+                    input.resize(input_size, 0);
+
+                    memcpy(input.data(), &n_nodes, sizeof(n_nodes));
+                    for (uint32_t i = 0; i < n_nodes; i++) {
+                        memcpy(input.data() + sizeof(n_nodes) + i * sizeof(uint64_t),
+                               &cgraph->nodes[count_nodes_low + i], sizeof(uint64_t));
+                    }
+
+                    uint32_t * in_ntensors = (uint32_t *) (input.data() + sizeof(n_nodes) + n_nodes * sizeof(uint64_t));
+                    *in_ntensors           = n_tensors;
+
+                    rpc_tensor * in_tensors =
+                        (rpc_tensor *) (input.data() + sizeof(n_nodes) + n_nodes * sizeof(uint64_t) + sizeof(uint32_t));
+                    memcpy(in_tensors, tensors.data(), n_tensors * sizeof(rpc_tensor));
+
+                    rpc_msg_graph_compute_rsp response;
+
+                    bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size(), &response,
+                                               sizeof(response));
+                    GGML_ASSERT(status);
+
+                    if (response.result != GGML_STATUS_SUCCESS) {
+                        std::lock_guard<std::mutex> lock(rpc_mutex);  // To avoid mixed output
+                        fprintf(stderr, "RPC graph compute failed with status %d\n", response.result);
+                        return;
+                    }
+
+                    if (!checkend) {
+                        // if (first_layer[id]) {
+                        //     output_nodes(n_nodes,count_nodes_low,cgraph,first_layer,id,sock,rpc_ctx,dev_ctx,tensor,curr_data);
+                        // }
+                        
+                        add_data_to_data(data,tensor,data_mutex,id);
+                    }else{
+                        if(strcmp(tensor->name,"result_output")==0){
+                            add_data_to_data(data,tensor,data_mutex,id);
+                        }
+                    }
+                });
+            }
+
+            // Join all threads
+            for (auto & thread : threads) {
+                if (thread.joinable()) {
+                    thread.join();
+                }
+            }
+            if (!checkend) {
+                // if(!std::all_of(first_layer.begin(), first_layer.end(), [](bool v) { return !v; })){
+                //     ouput_src0(tensor,data);
+                // }
+                // GGML_LOG_INFO("tensor: %s",tensor->name);
                 // GGML_LOG_INFO("\n-------------print data-------------\n");
                 // const float * float_ptr = reinterpret_cast<const float *>(data.data());
                 // for(size_t i=0;i<data.size()/sizeof(float);i++){
                 //     GGML_LOG_INFO("%f ",float_ptr[i]);
                 // }
                 // GGML_LOG_INFO("\n-------------end of print data-------------\n");
-
-                //compute concurrently
-                std::mutex rpc_mutex;
-                std::mutex data_mutex;
-
-                int device_count = ggml_backend_rpc_get_device_count();
-                std::vector<std::thread> threads;
-
-                for (int id = 0; id < device_count; ++id) {
-                    threads.emplace_back([&, id]() {
-                        //we need to compute the next part of the graph
-                        std::vector<rpc_tensor>              tensors;
-                        std::map<ggml_tensor*,rpc_tensor> visited;
+                ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+                // std::ofstream out("tensor_dump_row.txt", std::ios::app);
+                // out << "[" << __func__ << "]" << ", get data for tensor " << tensor->name
+                //         << ", size=" << ggml_nbytes(tensor) << "\n";
+                //     const float * float_ptr = reinterpret_cast<const float *>(data.data());
+                //     for (size_t j = 0; j < ggml_nbytes(tensor)/sizeof(float); ++j) {
                         
-
-                        for(uint32_t count=count_nodes_low;count<=count_nodes;count++){
-                            ggml_tensor * node = cgraph->nodes[count];
-                            if (!ggml_is_empty(node) && node->src[0] != nullptr &&
-                            ggml_backend_buft_is_rpc_split(node->src[0]->buffer->buft) &&
-                            (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID)) {
-                                ggml_tensor_extra_rpc * node_extra = (ggml_tensor_extra_rpc *)node->src[0]->extra;
-                                add_tensor_part(node,tensors,visited,node_extra->split_dim,id);
-                            }else{
-                                add_tensor_part(node,tensors,visited,-1,id);
-                            }
-                            // GGML_LOG_INFO("\noperation %d",node->op);
-                            // GGML_LOG_INFO("\ntensor %s ne0 :%d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d \n",
-                            //     node->name,visited[node].ne[0],visited[node].ne[1],visited[node].ne[2],visited[node].ne[3],visited[node].nb[0],visited[node].nb[1],visited[node].nb[2],visited[node].nb[3]);
-                            // for(int i=0;i<GGML_MAX_SRC;i++){
-                            //     ggml_tensor* src=node->src[i];
-                            //     if(src){
-                            //         GGML_LOG_INFO("src %d %s ne0 :%d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d \n",
-                            //             i,src->name,visited[src].ne[0],visited[src].ne[1],visited[src].ne[2],visited[src].ne[3],visited[src].nb[0],visited[src].nb[1],visited[src].nb[2],visited[src].nb[3]);
-                            //     }
-                            // }
-                        }
-
-
-
-                        auto  dev_ctx = (ggml_backend_rpc_device_context *) reg_ctx->devices[id]->context;
-                        auto  sock    = get_socket(dev_ctx->endpoint);
-
-                        std::vector<uint8_t> input;
-                        uint32_t n_nodes = count_nodes - count_nodes_low + 1;
-                        if (n_nodes == 0) {
-                            return;
-                        }
-
-                        uint32_t n_tensors  = tensors.size();
-                        int      input_size = sizeof(uint32_t) + n_nodes * sizeof(uint64_t) + sizeof(uint32_t) +
-                                        n_tensors * sizeof(rpc_tensor);
-                        input.resize(input_size, 0);
-
-                        memcpy(input.data(), &n_nodes, sizeof(n_nodes));
-                        for (uint32_t i = 0; i < n_nodes; i++) {
-                            memcpy(input.data() + sizeof(n_nodes) + i * sizeof(uint64_t),
-                                &cgraph->nodes[count_nodes_low + i], sizeof(uint64_t));
-                        }
-
-                        uint32_t * in_ntensors = (uint32_t *) (input.data() + sizeof(n_nodes) + n_nodes * sizeof(uint64_t));
-                        *in_ntensors           = n_tensors;
-
-                        rpc_tensor * in_tensors =
-                            (rpc_tensor *) (input.data() + sizeof(n_nodes) + n_nodes * sizeof(uint64_t) + sizeof(uint32_t));
-                        memcpy(in_tensors, tensors.data(), n_tensors * sizeof(rpc_tensor));
-
-                        rpc_msg_graph_compute_rsp response;
-
-                        bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size(), &response,
-                                                sizeof(response));
-                        GGML_ASSERT(status);
-
-                        if (response.result != GGML_STATUS_SUCCESS) {
-                            std::lock_guard<std::mutex> lock(rpc_mutex);  // To avoid mixed output
-                            fprintf(stderr, "RPC graph compute failed with status %d\n", response.result);
-                            return;
-                        }
-
-                        if (!checkend) {
-                            // if (first_layer[id]) {
-                            //     output_nodes(n_nodes,count_nodes_low,cgraph,first_layer,id,sock,rpc_ctx,dev_ctx,tensor,curr_data);
-                            // }
-                            
-                            add_data_to_data(data,tensor,data_mutex,id);
-                        }else{
-                            if(strcmp(tensor->name,"result_output")==0){
-                                add_data_to_data(data,tensor,data_mutex,id);
-                            }
-                        }
-                    });
-                }
-
-                // Join all threads
-                for (auto & thread : threads) {
-                    if (thread.joinable()) {
-                        thread.join();
-                    }
-                }
-                if (!checkend) {
-                    // if(!std::all_of(first_layer.begin(), first_layer.end(), [](bool v) { return !v; })){
-                    //     ouput_src0(tensor,data);
-                    // }
-                    ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
-                    // std::ofstream out("tensor_dump_row.txt", std::ios::app);
-                    // out << "[" << __func__ << "]" << ", get data for tensor " << tensor->name
-                    //         << ", size=" << ggml_nbytes(tensor) << "\n";
-                    //     const float * float_ptr = reinterpret_cast<const float *>(data.data());
-                    //     for (size_t j = 0; j < ggml_nbytes(tensor)/sizeof(float); ++j) {
-                            
-                    //         out << static_cast<float>(float_ptr[j]) << " ";
-                    //     }
-                    //     out << "\n";
-                    // out.close();
-                    buf->iface.set_tensor(buf, tensor, data.data(), 0, data.size());
-                }else{
-                    if(strcmp(tensor->name,"result_output")==0){
-                        ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
-                        buf->iface.set_tensor(buf, tensor, data.data(), 0, data.size());
-                    }
-                }
+                //         out << static_cast<float>(float_ptr[j]) << " ";
+                //     }
+                //     out << "\n";
+                // out.close();
+                buf->iface.set_tensor(buf, tensor, data.data(), 0, data.size());
             }else{
-                std::vector<rpc_tensor> tensors;
-                std::map<ggml_tensor*,rpc_tensor> visited;
-                int id = ggml_backend_rpc_get_device_id(rpc_ctx->endpoint.c_str());
-                for(uint32_t count=count_nodes_low;count<=count_nodes;count++){
-                    ggml_tensor * node = cgraph->nodes[count];
-                    if (!ggml_is_empty(node) && node->src[0] != nullptr &&
-                        ggml_backend_buft_is_rpc_split(node->src[0]->buffer->buft) &&
-                        (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID)) {
-                        ggml_tensor_extra_rpc * node_extra = (ggml_tensor_extra_rpc *)node->src[0]->extra;
-                        add_tensor_part(node,tensors,visited,node_extra->split_dim,id);
-                    }else{
-                        add_tensor_part(node,tensors,visited,-1,id);
-                    }
-                            // GGML_LOG_INFO("\noperation %d",node->op);
-                            // GGML_LOG_INFO("\ntensor %s ne0 :%d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d \n",
-                            //     node->name,visited[node].ne[0],visited[node].ne[1],visited[node].ne[2],visited[node].ne[3],visited[node].nb[0],visited[node].nb[1],visited[node].nb[2],visited[node].nb[3]);
-                            // for(int i=0;i<GGML_MAX_SRC;i++){
-                            //     ggml_tensor* src=node->src[i];
-                            //     if(src){
-                            //         GGML_LOG_INFO("src %d %s ne0 :%d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d \n",
-                            //             i,src->name,visited[src].ne[0],visited[src].ne[1],visited[src].ne[2],visited[src].ne[3],visited[src].nb[0],visited[src].nb[1],visited[src].nb[2],visited[src].nb[3]);
-                            //     }
-                            // }
-                }
-
-
-
-                auto  dev_ctx = (ggml_backend_rpc_device_context *) reg_ctx->devices[id]->context;
-                auto  sock    = get_socket(dev_ctx->endpoint);
-
-                std::vector<uint8_t> input;
-                uint32_t n_nodes = count_nodes - count_nodes_low + 1;
-                if (n_nodes == 0) {
-                    GGML_LOG_ERROR("[%s] no nodes to compute\n", __func__);
-                    continue;
-                }
-
-                uint32_t n_tensors  = tensors.size();
-                int      input_size = sizeof(uint32_t) + n_nodes * sizeof(uint64_t) + sizeof(uint32_t) +
-                                n_tensors * sizeof(rpc_tensor);
-                input.resize(input_size, 0);
-
-                memcpy(input.data(), &n_nodes, sizeof(n_nodes));
-                for (uint32_t i = 0; i < n_nodes; i++) {
-                    memcpy(input.data() + sizeof(n_nodes) + i * sizeof(uint64_t),
-                                &cgraph->nodes[count_nodes_low + i], sizeof(uint64_t));
-                }
-
-                uint32_t * in_ntensors = (uint32_t *) (input.data() + sizeof(n_nodes) + n_nodes * sizeof(uint64_t));
-                *in_ntensors           = n_tensors;
-
-                rpc_tensor * in_tensors =(rpc_tensor *) (input.data() + sizeof(n_nodes) + n_nodes * sizeof(uint64_t) + sizeof(uint32_t));
-                memcpy(in_tensors, tensors.data(), n_tensors * sizeof(rpc_tensor));
-
-                rpc_msg_graph_compute_rsp response;
-
-                bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size(), &response,
-                                                sizeof(response));
-                GGML_ASSERT(status);
-
-                if (response.result != GGML_STATUS_SUCCESS) {
-                    fprintf(stderr, "RPC graph compute failed with status %d\n", response.result);
-                    return (ggml_status) response.result;
-                }
-
-                if(!checkend) {
-
-                    ggml_tensor * src1=cgraph->nodes[count_nodes+1]->src[1];
-                    std::vector<uint8_t> data(ggml_nbytes(src1),0);
-                    ggml_backend_buffer_t buf=src1->view_src ? src1->view_src->buffer :src1->buffer;
-                    buf->iface.get_tensor(src1->buffer,src1,data.data(),0,data.size());
-                    for(int dev=0;dev<ggml_backend_rpc_get_device_count();dev++){
-                        if(dev!=id){
-                            buf->iface.set_tensor(buf, src1, data.data(), 0, data.size());
-                        }
-                    }
+                if(strcmp(tensor->name,"result_output")==0){
+                    ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+                    buf->iface.set_tensor(buf, tensor, data.data(), 0, data.size());
                 }
             }
         }
