@@ -8632,7 +8632,7 @@ static void ggml_compute_forward_get_rows_f32(
         const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
         const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
 
-        GGML_LOG_INFO("name: %s, get_rows_f32: i01 = %lld, ne01 = %lld", dst->name, i01, ne01);
+        // GGML_LOG_INFO("name: %s, get_rows_f32: i01 = %lld, ne01 = %lld", dst->name, i01, ne01);
 
         GGML_ASSERT(i01 >= 0 && i01 < ne01);
 
@@ -14008,7 +14008,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             }
             fprintf(out, "tensor data for %s after computation: \n",node->name);
             size_t size = ggml_nbytes(node);
-            fprintf(out, "size: %ld ne0: %ld ne1: %ld ne2: %ld ne3: %ld\n", size,node->ne[0],node->ne[1],node->ne[2],node->ne[3]);
+            fprintf(out, "view offset: %ld size: %ld ne0: %ld ne1: %ld ne2: %ld ne3: %ld\n", node->view_offs,size,node->ne[0],node->ne[1],node->ne[2],node->ne[3]);
             const uint32_t * float_ptr = (const uint32_t *) node->data;
             for (size_t j = 0; j < size / sizeof(uint32_t); ++j) {
                 if(j%1024==0){
