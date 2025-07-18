@@ -1799,6 +1799,12 @@ static int change_ne_and_nb(ggml_tensor* tensor,rpc_tensor & rpc_t, std::map<ggm
                     if(strncmp(tensor->name,"k",1)==0){
                         rpc_t.nb[1]=rpc_t.nb[3];
                     }
+                    if(strncmp(tensor->name,"v",1)==0){
+                        float split_part=(id==ggml_backend_rpc_get_device_count()-1)?(1-tensor_splits[id]):(tensor_splits[id+1]-tensor_splits[id]);
+                        rpc_t.nb[1]=rpc_t.nb[1]*split_part;
+                        rpc_t.nb[2]=rpc_t.nb[1]*rpc_t.ne[1];
+                        rpc_t.nb[3]=rpc_t.nb[2]*rpc_t.ne[2];
+                    }
                 
             }else{
                 rpc_tensor & src_tensor=visited[tensor->src[0]];
@@ -1829,8 +1835,15 @@ static int change_ne_and_nb(ggml_tensor* tensor,rpc_tensor & rpc_t, std::map<ggm
                 }else{
                     GGML_LOG_INFO("error view");
                 }
+                if(strncmp(tensor->name,"v",1)==0){
+                    float split_part=(id==ggml_backend_rpc_get_device_count()-1)?(1-tensor_splits[id]):(tensor_splits[id+1]-tensor_splits[id]);
+                    rpc_t.nb[1]=rpc_t.nb[1]*split_part;
+                    rpc_t.nb[2]=rpc_t.nb[1]*rpc_t.ne[1];
+                    rpc_t.nb[3]=rpc_t.nb[2]*rpc_t.ne[2];
+                }
                 return 0;
             }
+
         }break;
 
 
@@ -1919,6 +1932,7 @@ static int change_ne_and_nb(ggml_tensor* tensor,rpc_tensor & rpc_t, std::map<ggm
         }break;
 
     }
+    
     return -1;
 }
 
@@ -1952,11 +1966,22 @@ static void add_tensor_part(ggml_tensor * tensor, std::vector<rpc_tensor> & tens
                         src_tensor.buffer= src_extra->buffer_ctx[id]->remote_ptr;
                         src_tensor.data=reinterpret_cast<uint64_t>(ggml_backend_rpc_buffer_context_get_base(
                                 reinterpret_cast<ggml_backend_rpc_buffer_context *>(src_extra->buffer_ctx[id])));
-                        if(src->op==GGML_OP_VIEW){
-                            GGML_LOG_INFO("[%s] view_src is not null for tensor %s\n", __func__, src->name);
+                        if(src->op==GGML_OP_VIEW|| src->op==GGML_OP_CPY){
+                            uint64_t offset=src->view_offs;
+                            if(strncmp(src->name,"k",1)==0){
+                                float split_part=(id==ggml_backend_rpc_get_device_count()-1)?(1-tensor_splits[id]):(tensor_splits[id+1]-tensor_splits[id]);
+                                offset=src->view_offs*split_part;
+                            }
+                            src_tensor.data+=offset;
+                            src_tensor.view_offs=offset;
+                            // GGML_LOG_INFO("data after view_offs: %ld\n",src_tensor.data);
+                        }
+                    }else{
+                        if((src->op==GGML_OP_VIEW||src->op==GGML_OP_CPY)&&strncmp(src->name,"k",1)==0){
                             float split_part=(id==ggml_backend_rpc_get_device_count()-1)?(1-tensor_splits[id]):(tensor_splits[id+1]-tensor_splits[id]);    
-                            GGML_LOG_INFO("split_part: %f\n",split_part);
-                            src_tensor.data+=src->view_offs*split_part;
+                            uint64_t offset=src->view_offs*(1-split_part);
+                            src_tensor.data-=offset;
+                            src_tensor.view_offs=src->view_offs*split_part;
                         }
                     }
                 }
@@ -1997,12 +2022,24 @@ static void add_tensor_part(ggml_tensor * tensor, std::vector<rpc_tensor> & tens
             rpc_t.buffer = tensor_extra->buffer_ctx[id]->remote_ptr;
             rpc_t.data   = reinterpret_cast<uint64_t>(ggml_backend_rpc_buffer_context_get_base(
                 reinterpret_cast<ggml_backend_rpc_buffer_context *>(tensor_extra->buffer_ctx[id])));
-            if(tensor->op==GGML_OP_VIEW) {
-                GGML_LOG_INFO("[%s] view_src is not null for tensor %s\n", __func__, tensor->name);
-                float split_part=(id==ggml_backend_rpc_get_device_count()-1)?(1-tensor_splits[id]):(tensor_splits[id+1]-tensor_splits[id]);    
-                GGML_LOG_INFO("split_part: %f\n",split_part);
-                rpc_t.data += tensor->view_offs* split_part;
+            if(tensor->op==GGML_OP_VIEW|| tensor->op==GGML_OP_CPY){
+                uint64_t offset=tensor->view_offs;
+                if(strncmp(tensor->name,"k",1)==0) {
+                
+                    float split_part=(id==ggml_backend_rpc_get_device_count()-1)?(1-tensor_splits[id]):(tensor_splits[id+1]-tensor_splits[id]);    
+                    offset=tensor->view_offs*split_part;
+                }
+                rpc_t.data += offset;
+                rpc_t.view_offs = offset;
+                // GGML_LOG_INFO("data after view_offs: %ld\n",rpc_t.data);
             } 
+        }else{
+            if((tensor->op==GGML_OP_VIEW||tensor->op==GGML_OP_CPY)&&strncmp(tensor->name,"k",1)==0){
+                float split_part=(id==ggml_backend_rpc_get_device_count()-1)?(1-tensor_splits[id]):(tensor_splits[id+1]-tensor_splits[id]); 
+                uint64_t offset=tensor->view_offs*(1-split_part);   
+                rpc_t.data-=offset;
+                rpc_t.view_offs=tensor->view_offs*split_part;
+            }
         }
     }
     
@@ -2611,14 +2648,19 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                         }
                         // 
 
+                        // if( node->op == GGML_OP_VIEW ) {
+                        //     GGML_LOG_INFO("\ntensor %s ne0 :%d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d view_offs: %ld\n",
+                        //     node->name,visited[node].ne[0],visited[node].ne[1],visited[node].ne[2],visited[node].ne[3],visited[node].nb[0],visited[node].nb[1],visited[node].nb[2],visited[node].nb[3],visited[node].view_offs);
+                        
+                        // }
                         // GGML_LOG_INFO("\noperation %d",node->op);
-                        // GGML_LOG_INFO("\ntensor %s ne0 :%d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d \n",
-                        //     node->name,visited[node].ne[0],visited[node].ne[1],visited[node].ne[2],visited[node].ne[3],visited[node].nb[0],visited[node].nb[1],visited[node].nb[2],visited[node].nb[3]);
+                        // GGML_LOG_INFO("\ntensor %s ne0 :%d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d view_offs: %ld\n",
+                        //     node->name,visited[node].ne[0],visited[node].ne[1],visited[node].ne[2],visited[node].ne[3],visited[node].nb[0],visited[node].nb[1],visited[node].nb[2],visited[node].nb[3],visited[node].view_offs);
                         // for(int i=0;i<GGML_MAX_SRC;i++){
                         //     ggml_tensor* src=node->src[i];
                         //     if(src){
-                        //         GGML_LOG_INFO("src %d %s ne0 :%d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d \n",
-                        //             i,src->name,visited[src].ne[0],visited[src].ne[1],visited[src].ne[2],visited[src].ne[3],visited[src].nb[0],visited[src].nb[1],visited[src].nb[2],visited[src].nb[3]);
+                        //         GGML_LOG_INFO("src %d %s ne0 :%d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d view_offs: %ld\n",
+                        //             i,src->name,visited[src].ne[0],visited[src].ne[1],visited[src].ne[2],visited[src].ne[3],visited[src].nb[0],visited[src].nb[1],visited[src].nb[2],visited[src].nb[3],visited[src].view_offs);
                         //     }
                         // }
                     }
