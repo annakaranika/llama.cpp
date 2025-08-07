@@ -3008,10 +3008,10 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
         uint64_t tensor_size  = (uint64_t) ggml_nbytes(result);
         uint64_t buffer_start = (uint64_t) ggml_backend_buffer_get_base(result->buffer);
         uint64_t buffer_size  = (uint64_t) ggml_backend_buffer_get_size(result->buffer);
-        // GGML_LOG_INFO("[%s] tensor name: %s, buffer: %p, data: %" PRIx64 ", size: %" PRIu64 ", buffer_start: %" PRIx64
-        //               ", buffer_size: %" PRIu64 "\n",
-        //               __func__, tensor->name, (void *) result->buffer, tensor->data, tensor_size, buffer_start,
-        //               buffer_size);
+        GGML_LOG_INFO("[%s] tensor name: %s, buffer: %p, data: %" PRIx64 ", size: %" PRIu64 ", buffer_start: %" PRIx64
+                      ", buffer_size: %" PRIu64 "\n",
+                      __func__, tensor->name, (void *) result->buffer, tensor->data, tensor_size, buffer_start,
+                      buffer_size);
         GGML_ASSERT(tensor->data + tensor_size >= tensor->data);  // check for overflow
         GGML_ASSERT(tensor->data >= buffer_start);
         GGML_ASSERT(tensor->data + tensor_size <= buffer_start + buffer_size);

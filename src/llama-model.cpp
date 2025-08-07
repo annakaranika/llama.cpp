@@ -319,7 +319,7 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, enum llama_split_m
     buft_list_t buft_list;
     // add the device split buffer type if requested and available
     if (split_mode == LLAMA_SPLIT_MODE_ROW) {
-        LLAMA_LOG_INFO("%s :using split buffer type for device %s\n", __func__,ggml_backend_dev_name(dev));
+        LLAMA_LOG_INFO("%s: using split buffer type for device %s\n", __func__,ggml_backend_dev_name(dev));
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
         auto ggml_backend_split_buffer_type_fn = (ggml_backend_split_buffer_type_t)
             ggml_backend_reg_get_proc_address(reg, "ggml_backend_split_buffer_type");
@@ -345,7 +345,7 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, enum llama_split_m
 
     // add the device default buffer type
     buft_list.emplace_back(dev, ggml_backend_dev_buffer_type(dev));
-    LLAMA_LOG_INFO("%s :device %s default buffer type %s\n", __func__, ggml_backend_dev_name(dev), ggml_backend_buft_name(ggml_backend_dev_buffer_type(dev)));
+    LLAMA_LOG_INFO("%s: device %s default buffer type %s\n", __func__, ggml_backend_dev_name(dev), ggml_backend_buft_name(ggml_backend_dev_buffer_type(dev)));
     return buft_list;
 }
 
