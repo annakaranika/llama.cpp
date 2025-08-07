@@ -767,7 +767,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(struct ggml_context * ctx
 
     struct ggml_tensor * tensor = ggml_dup_tensor(ctx, cur);
     ggml_set_name(tensor, ggml_get_name(cur));
-    LLAMA_LOG_INFO("%s: creating tensor '%s' with shape [%lld, %lld, %lld, %lld]\n", __func__, ggml_get_name(tensor),
+    LLAMA_LOG_DEBUG("%s: creating tensor '%s' with shape [%lld, %lld, %lld, %lld]\n", __func__, ggml_get_name(tensor),
         (long long)tensor->ne[0], (long long)tensor->ne[1], (long long)tensor->ne[2], (long long)tensor->ne[3]);
 
     if (duplicated) {

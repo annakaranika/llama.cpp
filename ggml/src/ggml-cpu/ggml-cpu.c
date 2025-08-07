@@ -13956,8 +13956,8 @@ struct ggml_cplan ggml_graph_plan(
     return cplan;
 }
 
-static ggml_mutex_t file_mutex;
-static bool mutex_init=false;
+// static ggml_mutex_t file_mutex;
+// static bool mutex_init=false;
 
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     //GGML_LOG_INFO("ggml_graph_compute_thread: thread %d started\n", ((struct ggml_compute_state *)data)->ith);

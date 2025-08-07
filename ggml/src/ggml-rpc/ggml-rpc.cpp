@@ -1590,10 +1590,11 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_split_buffer_type(int main_de
     }
 
     tensor_splits=tensor_split_arr;
-    GGML_LOG_INFO("tensor splits: ");
+    GGML_LOG_DEBUG("tensor splits: ");
     for(int i=0;i<ggml_backend_rpc_get_device_count();i++){
-        GGML_LOG_INFO("%f ",tensor_splits[i]);
+        GGML_LOG_DEBUG("%f ",tensor_splits[i]);
     }
+    GGML_LOG_DEBUG("\n");
     auto it = split_buft_map.find({ main_device, tensor_split_arr });
     if (it != split_buft_map.end()) {
         return &it->second;

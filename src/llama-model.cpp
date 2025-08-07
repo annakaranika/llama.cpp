@@ -336,10 +336,10 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, enum llama_split_m
             auto * buft = ggml_backend_split_buffer_type_fn(dev_index, tensor_split);
             if (buft != nullptr) {
                 buft_list.emplace_back(dev, buft);
-                LLAMA_LOG_INFO("%s :device %s split buffer type %s\n", __func__, ggml_backend_dev_name(dev), ggml_backend_buft_name(buft));
+                LLAMA_LOG_INFO("%s: device %s split buffer type %s\n", __func__, ggml_backend_dev_name(dev), ggml_backend_buft_name(buft));
             }
         }else{
-            LLAMA_LOG_INFO("%s :device %s does not support split buffer type\n", __func__,ggml_backend_dev_name(dev));
+            LLAMA_LOG_INFO("%s: device %s does not support split buffer type\n", __func__,ggml_backend_dev_name(dev));
         }
     }
 
@@ -1420,7 +1420,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         ggml_backend_buffer_type_t first_moved_to_buft = nullptr;
 
         auto create_tensor = [&](const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) -> ggml_tensor * {
-            LLAMA_LOG_INFO("create_tensor: %s\n", tn.str().c_str());
+            LLAMA_LOG_DEBUG("create_tensor: %s\n", tn.str().c_str());
             ggml_tensor * t_meta = ml.get_tensor_meta(tn.str().c_str());
 
             if (!t_meta) {
@@ -1484,7 +1484,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             ggml_backend_buffer_type_t buft = select_weight_buft(hparams, t_meta, op, *buft_list);
             // if(op==GGML_OP_MUL_MAT||op==GGML_OP_MUL_MAT_ID){
             // LLAMA_LOG_INFO("%p\n", buft);
-            LLAMA_LOG_INFO("%s: tensor %s is using buffer type %s for op %s\n", __func__, tn.str().c_str(), ggml_backend_buft_name(buft), ggml_op_name(op));
+            // LLAMA_LOG_INFO("%s: tensor %s is using buffer type %s for op %s\n", __func__, tn.str().c_str(), ggml_backend_buft_name(buft), ggml_op_name(op));
             
             if (!buft) {
                 throw std::runtime_error(format("failed to find a compatible buffer type for tensor %s", tn.str().c_str()));
