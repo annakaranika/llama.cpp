@@ -40,12 +40,92 @@ except ImportError:
 
 
 class CommunicationModel(Enum):
+    """Communication model for distributed inference."""
+
     CENTRALIZED = "centralized"  # Client coordinates all communication
     PEER_TO_PEER = "peer_to_peer"  # Servers communicate directly
 
 
+class AttentionSplitStrategy(Enum):
+    """How to split attention heads across devices."""
+
+    KV_HEADS = "kv_heads"
+
+
+class FFNSplitStrategy(Enum):
+    """How to split FFN layers across devices."""
+
+    KV_HEADS = "kv_heads"
+    HIDDEN_DIM = "hidden_dim"
+    Q_HEADS = "q_heads"
+
+
+@dataclass
+class Device:
+    """
+    Represents a compute device in the distributed inference simulation.
+    Attributes:
+        name (str): Device identifier.
+        gflops (float): Peak FP32 GFLOPs (or "effective" compute units).
+        memory_gb (float): Available memory in GB.
+        net_bw_mbps (float): Throughput (Mbps) to the shared wireless fabric.
+        net_rtt_ms (float): Baseline RTT (ms) on the wireless fabric.
+        efficiency (float): Fraction of peak compute realized during inference.
+
+    """
+
+    name: str
+    gflops: float  # peak FP32 GFLOPs (or "effective" compute units)
+    memory_gb: float
+    net_bw_mbps: float  # throughput (Mbps) to the shared wireless fabric
+    net_rtt_ms: float  # baseline RTT (ms) on the wireless fabric
+    efficiency: float = 0.6  # how much of peak compute you realize during inference
+
+    def flops_per_sec(self) -> float:
+        """Effective FLOPs/s considering efficiency."""
+        return 1e9 * self.gflops * self.efficiency
+
+    def compute_time_s(self, flops: float) -> float:
+        """Compute time in seconds for given FLOPs."""
+        return flops / self.flops_per_sec()
+
+
 @dataclass
 class ModelSpec:
+    """
+    Model specification class for LLM inference simulation.
+
+    This class defines the architectural parameters and cost modeling coefficients
+    for a language model, specifically configured for TinyLlama-1.1B-Chat-v1.0.
+    It includes parameters for transformer architecture, communication patterns,
+    and performance estimation coefficients.
+
+    Attributes:
+        name (str): Model identifier, defaults to "TinyLlama-1.1B-Chat-v1.0"
+        num_layers (int): Total number of transformer layers including output layer
+        num_heads (int): Number of attention heads in multi-head attention
+        num_kv_heads (int): Number of key-value heads for grouped query attention
+        d_model (int): Model dimensionality/hidden size
+        d_k (int): Dimension per attention head
+        d_ff (int): Feed-forward network hidden dimension
+        communication_model (CommunicationModel): Communication pattern for distributed inference
+        vocab_size (int): Size of the model's vocabulary
+        attn_flops_coeff (float): Coefficient for attention linear operations FLOPs estimation
+        attn_quadratic_coeff (float): Coefficient for attention quadratic complexity FLOPs
+        ffn_flops_coeff (float): Coefficient for feed-forward network FLOPs estimation
+        act_bytes_per_token (int): Activation transfer size in bytes per token at layer boundaries
+        allreduce_bytes_per_token (int): Collective communication payload per token per layer
+        kv_bytes_per_token_per_layer (int): KV cache memory usage per token per layer
+
+    Methods:
+        layer_compute_flops_per_token(seq_len): Estimates FLOPs per token per layer
+            given sequence length, accounting for both linear and quadratic attention costs.
+
+    Note:
+        Coefficients are rough estimates and should be calibrated against actual measurements
+        for accurate performance modeling.
+    """
+
     name: str = "TinyLlama-1.1B-Chat-v1.0"
     num_layers: int = 23  # includes output layer
     num_heads: int = 32
@@ -72,36 +152,162 @@ class ModelSpec:
         2 * 4 * 2048
     )  # (K,V) * float32 * d_model (very rough)
 
-    def layer_compute_flops_per_token(self, seq_len: int) -> float:
+    def attn_compute_flops(
+        self,
+        seq_len: int,
+        dev_num_heads: Optional[int] = None,
+        dev_kv_heads: Optional[int] = None,
+    ) -> float:
+        """
+        Compute attention compute flops given sequence length and heads.
+        """
+        device_q_heads = dev_num_heads if dev_num_heads is not None else self.num_heads
+        device_kv_heads = (
+            dev_kv_heads if dev_kv_heads is not None else self.num_kv_heads
+        )
+
+        # Attention FLOPs based on head allocation
+        # Q projection scales with Q heads assigned to this device
+        q_proj_flops = self.attn_flops_coeff * self.d_model * device_q_heads * self.d_k
+
+        # K, V projections scale with KV heads assigned to this device
+        kv_proj_flops = (
+            2 * self.attn_flops_coeff * self.d_model * device_kv_heads * self.d_k
+        )
+
+        # Attention computation (QK^T, softmax, attention*V) scales with Q heads
+        q_fraction = device_q_heads / self.num_heads
+        attn_compute_flops = (
+            self.attn_quadratic_coeff * (seq_len**2) * self.d_model * q_fraction
+        )
+
+        # Output projection scales with Q heads (determines output size)
+        out_proj_flops = (
+            self.attn_flops_coeff * self.d_model * device_q_heads * self.d_k
+        )
+
+        total_attn_flops = (
+            q_proj_flops + kv_proj_flops + attn_compute_flops + out_proj_flops
+        )
+        return total_attn_flops
+
+    def ffn_compute_flops(self, ffn_fraction: float = 1.0) -> float:
+        """
+        Compute FFN compute flops given FFN fraction.
+        """
+        ffn_flops = self.ffn_flops_coeff * self.d_model * self.d_ff * ffn_fraction
+        return ffn_flops
+
+    def layer_compute_flops(
+        self,
+        seq_len: int,
+        dev_num_heads: Optional[int] = None,
+        dev_kv_heads: Optional[int] = None,
+        ffn_fraction: float = 1.0,
+    ) -> float:
         """
         Very rough per-layer compute FLOPs for generating one token given context length seq_len.
         """
-        attn_linear = self.attn_flops_coeff * self.d_model * self.num_heads
-        attn_quad = self.attn_quadratic_coeff * (seq_len**2) * self.d_model
-        ffn = self.ffn_flops_coeff * self.d_model * self.d_ff
-        return attn_linear + attn_quad + ffn
+        attn = self.attn_compute_flops(
+            seq_len,
+            dev_num_heads=dev_num_heads,
+            dev_kv_heads=dev_kv_heads,
+        )
+        ffn = self.ffn_compute_flops(ffn_fraction=ffn_fraction)
+        return attn + ffn
 
+    def layer_compute_cost_per_device(
+        self,
+        seq_len: int,
+        devices: List[Device],
+        device_q_counts: Optional[List[int]] = None,
+        device_kv_counts: Optional[List[int]] = None,
+        device_ffn_fractions: Optional[List[float]] = None,
+    ) -> List[float]:
+        """
+        Compute per-layer compute times across a list of devices
+        given their attention and FFN allocations.
+        Returns the total compute time (s) for the layer across all devices,
+        as well as compute time standard deviation and load balance efficiency.
+        """
 
-@dataclass
-class Device:
-    name: str
-    gflops: float  # peak FP32 GFLOPs (or "effective" compute units)
-    memory_gb: float
-    net_bw_mbps: float  # throughput (Mbps) to the shared wireless fabric
-    net_rtt_ms: float  # baseline RTT (ms) on the wireless fabric
-    efficiency: float = 0.6  # how much of peak compute you realize during inference
+        per_layer_compute_times = []
 
-    def flops_per_sec(self) -> float:
-        return 1e9 * self.gflops * self.efficiency
+        for i, device in enumerate(devices):
+            device_q_heads = device_q_counts[i] if device_q_counts else self.num_heads
+            device_kv_heads = (
+                device_kv_counts[i] if device_kv_counts else self.num_kv_heads
+            )
+            device_ffn_fraction = (
+                device_ffn_fractions[i] if device_ffn_fractions else 1.0
+            )
 
-    def compute_time_s(self, flops: float) -> float:
-        return flops / self.flops_per_sec()
+            attn_flops = self.attn_compute_flops(
+                seq_len,
+                dev_num_heads=device_q_heads,
+                dev_kv_heads=device_kv_heads,
+            )
+
+            ffn_flops = self.ffn_compute_flops(ffn_fraction=device_ffn_fraction)
+
+            total_flops = attn_flops + ffn_flops
+            compute_time = device.compute_time_s(total_flops)
+            per_layer_compute_times.append(compute_time)
+
+        # The bottleneck device determines the per-layer time (synchronous execution)
+        per_layer_time = max(per_layer_compute_times)
+        compute_time = per_layer_time * self.num_layers
+
+        return per_layer_compute_times
+
+    def memory_usage_per_device(
+        self,
+        seq_len: int,
+        devices: List[Device],
+        device_kv_counts: Optional[List[int]] = None,
+        device_ffn_fractions: Optional[List[float]] = None,
+    ) -> List[float]:
+        """
+        Estimate memory usage (GB) per device given KV head counts and FFN fractions.
+        """
+        memory_usages = []
+        for i in range(len(devices)):
+            # KV cache memory for assigned KV heads
+            kv_heads = device_kv_counts[i] if device_kv_counts else self.num_kv_heads
+            kv_cache_bytes = (
+                kv_heads * self.d_k * 2 * 4 * seq_len
+            )  # (K,V) * d_k * float32 * seq_len
+
+            # Model weights (rough estimate)
+            # Attention weights: Q + K + V + output projections
+            q_heads = device_kv_counts[i] if device_kv_counts else self.num_heads
+            attn_weights = (
+                q_heads * self.d_k * self.d_model * 4  # Q proj
+                + kv_heads * self.d_k * self.d_model * 2 * 4  # K,V proj
+            )
+
+            # FFN weights based on split strategy
+            ffn_fraction = device_ffn_fractions[i] if device_ffn_fractions else 1.0
+            ffn_weights = (
+                ffn_fraction * self.d_model * self.d_ff * 2 * 4
+            )  # up + down proj
+
+            total_memory = (
+                kv_cache_bytes + (attn_weights + ffn_weights) * self.num_layers
+            ) / (
+                1024**3
+            )  # GB
+            memory_usages.append(total_memory)
+        return memory_usages
 
 
 @dataclass
 class Network:
-    # Symmetric shared wireless fabric (simplified). If pairwise overrides provided,
-    # they take precedence when computing link costs.
+    """
+    Represents a network with symmetric shared wireless fabric.
+    If pairwise overrides are provided, they take precedence when computing link costs.
+    """
+
     default_bw_mbps: float = 300.0
     default_rtt_ms: float = 15.0
     pair_bw_mbps: Dict[Tuple[str, str], float] = field(default_factory=dict)
@@ -112,6 +318,9 @@ class Network:
     client_rtt_ms: float = 10.0  # Client-server RTT
 
     def link(self, a: str, b: str) -> Tuple[float, float]:
+        """
+        Get bandwidth (Mbps) and RTT (ms) between two devices.
+        """
         if a == b:
             return float("inf"), 0.0
         key = (a, b)
@@ -131,6 +340,9 @@ class Network:
         return bw, rtt
 
     def xfer_time_s(self, bytes_size: float, a: str, b: str) -> float:
+        """
+        Estimate transfer time between two devices considering bandwidth and RTT.
+        """
         bw_mbps, rtt_ms = self.link(a, b)
         if math.isinf(bw_mbps):
             return 0.0
@@ -265,6 +477,36 @@ class Network:
 
 
 # ------------------------------
+# Metrics and utilities
+# ------------------------------
+
+
+def std_compute_time(times: List[float]) -> float:
+    """
+    Compute standard deviation of compute times.
+    """
+    n = len(times)
+    if n == 0:
+        return 0.0
+    mean = sum(times) / n
+    variance = sum((t - mean) ** 2 for t in times) / n
+    return math.sqrt(variance)
+
+
+def load_balance_efficiency(times: List[float]) -> float:
+    """
+    Compute load balance efficiency as mean / max compute time.
+    """
+    if not times:
+        return 0.0
+    mean = sum(times) / len(times)
+    max_time = max(times)
+    if max_time == 0:
+        return 0.0
+    return mean / max_time
+
+
+# ------------------------------
 # Policy implementations
 # ------------------------------
 
@@ -273,7 +515,7 @@ def simulate_single_node(
     device: Device, model: ModelSpec, seq_len: int, gen_tokens: int
 ) -> Dict:
     """All layers on one device; simple latency estimate."""
-    per_layer_flops = model.layer_compute_flops_per_token(seq_len)
+    per_layer_flops = model.layer_compute_flops(seq_len)
     per_token_flops = model.num_layers * per_layer_flops
     t_token = device.compute_time_s(per_token_flops)
     total = t_token * gen_tokens
@@ -315,9 +557,7 @@ def simulate_pipeline(
     Estimate pipeline-parallel token latency with simple bubble model.
     Assumes each boundary sends activation for each token once.
     """
-    layer_costs = [
-        model.layer_compute_flops_per_token(seq_len) for _ in range(model.num_layers)
-    ]
+    layer_costs = [model.layer_compute_flops(seq_len) for _ in range(model.num_layers)]
     parts = _pipeline_partition_by_compute(devices, layer_costs)
 
     # Stage compute times per token
@@ -371,16 +611,6 @@ def simulate_pipeline(
     }
 
 
-class AttentionSplitStrategy(Enum):
-    KV_HEADS = "kv_heads"
-
-
-class FFNSplitStrategy(Enum):
-    KV_HEADS = "kv_heads"
-    HIDDEN_DIM = "hidden_dim"
-    Q_HEADS = "q_heads"
-
-
 def simulate_tensor_parallel(
     devices: List[Device],
     model: ModelSpec,
@@ -388,12 +618,12 @@ def simulate_tensor_parallel(
     seq_len: int,
     gen_tokens: int,
     parallel_degree: Optional[int] = None,
-    efficiency_loss: float = 0.85,
     attn_split_strategy: AttentionSplitStrategy = AttentionSplitStrategy.KV_HEADS,
     ffn_split_strategy: FFNSplitStrategy = FFNSplitStrategy.KV_HEADS,
 ) -> Dict:
     """
-    Tensor-parallel over a group of devices with flexible head-level splitting strategies for attention and FFN.
+    Tensor-parallel over a group of devices with flexible head-level splitting strategies
+    for attention and FFN.
     No KV head replication - limited by num_kv_heads.
 
     Supported combinations:
@@ -401,11 +631,8 @@ def simulate_tensor_parallel(
     2. attn: kv_heads, ffn: hidden_dim   -> Attention by KV heads, FFN by dimension
     3. attn: kv_heads, ffn: q_heads      -> Attention by KV heads, FFN by Q head groups.
     """
-    if parallel_degree is None:
-        k = len(devices)
-    else:
-        k = min(parallel_degree, len(devices))
-        devices = devices[:k]
+    k = len(devices) if parallel_degree is None else min(parallel_degree, len(devices))
+    devices = devices[:k] if parallel_degree is not None else devices
 
     # Attention is always split by KV heads (no replication)
     kv_heads_per_device = model.num_kv_heads // k
@@ -445,51 +672,14 @@ def simulate_tensor_parallel(
         raise ValueError(f"Unsupported FFN split strategy: {ffn_split_strategy}")
 
     # Calculate per-layer compute for each device
-    per_layer_compute_times = []
-
-    for i, device in enumerate(devices):
-        device_q_heads = device_q_counts[i]
-        device_kv_heads = device_kv_counts[i]
-        device_ffn_fraction = device_ffn_fractions[i]
-
-        # Attention FLOPs based on head allocation
-        # Q projection scales with Q heads assigned to this device
-        q_proj_flops = (
-            model.attn_flops_coeff * model.d_model * device_q_heads * model.d_k
-        )
-
-        # K, V projections scale with KV heads assigned to this device
-        kv_proj_flops = (
-            2 * model.attn_flops_coeff * model.d_model * device_kv_heads * model.d_k
-        )
-
-        # Attention computation (QK^T, softmax, attention*V) scales with Q heads
-        q_fraction = device_q_heads / model.num_heads
-        attn_compute_flops = (
-            model.attn_quadratic_coeff * (seq_len**2) * model.d_model * q_fraction
-        )
-
-        # Output projection scales with Q heads (determines output size)
-        out_proj_flops = (
-            model.attn_flops_coeff * model.d_model * device_q_heads * model.d_k
-        )
-
-        total_attn_flops = (
-            q_proj_flops + kv_proj_flops + attn_compute_flops + out_proj_flops
-        )
-
-        # FFN FLOPs based on split strategy
-        ffn_flops = (
-            model.ffn_flops_coeff * model.d_model * model.d_ff * device_ffn_fraction
-        )
-
-        total_flops = total_attn_flops + ffn_flops
-        compute_time = device.compute_time_s(total_flops) / efficiency_loss
-        per_layer_compute_times.append(compute_time)
-
-    # The bottleneck device determines the per-layer time (synchronous execution)
-    per_layer_time = max(per_layer_compute_times)
-    compute_time = per_layer_time * model.num_layers
+    per_layer_compute_times = model.layer_compute_cost_per_device(
+        seq_len,
+        devices,
+        device_q_counts,
+        device_kv_counts,
+        device_ffn_fractions,
+    )
+    compute_time = max(per_layer_compute_times) * model.num_layers
 
     # All-reduce cost per layer (assume 2 collectives per layer)
     red_bytes = model.allreduce_bytes_per_token
@@ -522,39 +712,13 @@ def simulate_tensor_parallel(
     total = per_token * gen_tokens
 
     # Calculate load balance and memory metrics
-    compute_time_std = (
-        sum((t - per_layer_time) ** 2 for t in per_layer_compute_times) / k
-    ) ** 0.5
-    load_balance_efficiency = min(per_layer_compute_times) / max(
-        per_layer_compute_times
-    )
+    compute_time_std = std_compute_time(per_layer_compute_times)
+    load_balance_efficiency_val = load_balance_efficiency(per_layer_compute_times)
 
     # Memory usage per device (KV cache + model weights)
-    device_memory_usage = []
-    for i in range(k):
-        # KV cache memory for assigned KV heads
-        kv_cache_bytes = (
-            device_kv_counts[i] * model.d_k * 2 * 4 * seq_len
-        )  # (K,V) * d_k * float32 * seq_len
-
-        # Model weights (rough estimate)
-        # Attention weights: Q + K + V + output projections
-        attn_weights = (
-            device_q_counts[i] * model.d_k * model.d_model * 4  # Q proj
-            + device_kv_counts[i] * model.d_k * model.d_model * 2 * 4  # K,V proj
-        )
-
-        # FFN weights based on split strategy
-        ffn_weights = (
-            device_ffn_fractions[i] * model.d_model * model.d_ff * 2 * 4
-        )  # up + down proj
-
-        total_memory = (
-            kv_cache_bytes + (attn_weights + ffn_weights) * model.num_layers
-        ) / (
-            1024**3
-        )  # GB
-        device_memory_usage.append(total_memory)
+    device_memory_usage = model.memory_usage_per_device(
+        seq_len, devices, device_kv_counts, device_ffn_fractions
+    )
 
     return {
         "policy": "tensor",
@@ -582,14 +746,14 @@ def simulate_tensor_parallel(
             "ffn_communication": ffn_comm_cost * model.num_layers,
         },
         "efficiency_metrics": {
-            "load_balance_efficiency": load_balance_efficiency,
+            "load_balance_efficiency": load_balance_efficiency_val,
             "compute_time_std": compute_time_std,
         },
         "total_latency_s": total,
         "notes": (
             f"Using {model.communication_model.value} communication with pairwise link modeling. "
             f"Attention split by {attn_split_strategy}, FFN split by {ffn_split_strategy}. "
-            f"Load balance efficiency: {load_balance_efficiency:.2f}. "
+            f"Load balance efficiency: {load_balance_efficiency_val:.2f}. "
             f"No KV head replication."
         ),
     }
@@ -597,15 +761,14 @@ def simulate_tensor_parallel(
 
 def metis_partition_layers(k: int, model: ModelSpec, seq_len: int) -> List[List[int]]:
     """
-    Build a chain graph of layers with node weights ~ compute and edge weights ~ activation size.
+    Build a chain graph of layers with node weights ~ compute and edge weights ~ communication.
     Return contiguous or non-contiguous partitions (METIS can split arbitrarily).
     If PyMetis is not available, fall back to a greedy balancer by compute.
     """
     if pymetis is None or CSRAdjacency is None:
         # Fallback: contiguous greedy like pipeline
         layer_costs = [
-            model.layer_compute_flops_per_token(seq_len)
-            for _ in range(model.num_layers)
+            model.layer_compute_flops(seq_len) for _ in range(model.num_layers)
         ]
         # Create k buckets with similar total compute
         parts = [[] for _ in range(k)]
@@ -635,10 +798,7 @@ def metis_partition_layers(k: int, model: ModelSpec, seq_len: int) -> List[List[
         xadj.append(len(adjncy))
 
     # Node weights (ints) ~ compute cost
-    nodewgt = [
-        max(1, int(1e-6 * model.layer_compute_flops_per_token(seq_len)))
-        for _ in range(n)
-    ]
+    nodewgt = [max(1, int(1e-6 * model.layer_compute_flops(seq_len))) for _ in range(n)]
 
     csr = CSRAdjacency(
         adj_starts=xadj,
@@ -669,9 +829,7 @@ def simulate_metis(
     devices_ordered = [devices[i] for i in order]
 
     # Reuse pipeline estimation but allow non-contiguous sets per stage by summing costs
-    layer_costs = [
-        model.layer_compute_flops_per_token(seq_len) for _ in range(model.num_layers)
-    ]
+    layer_costs = [model.layer_compute_flops(seq_len) for _ in range(model.num_layers)]
     stage_compute = []
     for idx, stage_layers in enumerate(parts_ordered):
         flops = sum(layer_costs[i] for i in stage_layers)
