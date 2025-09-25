@@ -22,8 +22,9 @@ Network model:
 
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import List, Dict, Tuple, Optional
+from enum import Enum
 import math
+from typing import List, Dict, Tuple, Optional
 
 try:
     import pymetis  # Optional
@@ -38,6 +39,11 @@ except ImportError:
 # ------------------------------
 
 
+class CommunicationModel(Enum):
+    CENTRALIZED = "centralized"  # Client coordinates all communication
+    PEER_TO_PEER = "peer_to_peer"  # Servers communicate directly
+
+
 @dataclass
 class ModelSpec:
     name: str = "TinyLlama-1.1B-Chat-v1.0"
@@ -47,6 +53,7 @@ class ModelSpec:
     d_model: int = 2048
     d_k: int = 64  # per-head
     d_ff: int = 5632
+    communication_model: CommunicationModel = CommunicationModel.CENTRALIZED
     vocab_size: int = 32000
 
     # Coefficients for cost modeling (FLOPs per token per layer)
@@ -100,6 +107,10 @@ class Network:
     pair_bw_mbps: Dict[Tuple[str, str], float] = field(default_factory=dict)
     pair_rtt_ms: Dict[Tuple[str, str], float] = field(default_factory=dict)
 
+    # Communication model parameters for centralized vs peer-to-peer
+    client_bandwidth_mbps: float = 1000.0  # Client-server bandwidth
+    client_rtt_ms: float = 10.0  # Client-server RTT
+
     def link(self, a: str, b: str) -> Tuple[float, float]:
         if a == b:
             return float("inf"), 0.0
@@ -124,6 +135,133 @@ class Network:
         if math.isinf(bw_mbps):
             return 0.0
         return (bytes_size * 8.0 / (bw_mbps * 1e6)) + rtt_ms / 1000.0
+
+    def ring_allreduce_time_with_pairwise_links(
+        self, bytes_size: float, device_names: List[str]
+    ) -> float:
+        """
+        Ring all-reduce time accounting for actual pairwise link characteristics.
+        In a ring, each device sends to its next neighbor in the ring.
+        Following this model:
+            time ≈ 2 * (N - 1) / N * (bytes / bw) + (N - 1) * RTT
+        """
+        n = len(device_names)
+        if n <= 1:
+            return 0.0
+
+        # Build ring: device[i] -> device[(i+1) % n]
+        total_time = 0.0
+
+        # Reduce-scatter phase: (n-1) steps, each step uses one ring link
+        for _ in range(n - 1):
+            # Find the bottleneck link for this step (all devices send simultaneously)
+            step_time = 0.0
+            for i in range(n):
+                sender = device_names[i]
+                receiver = device_names[(i + 1) % n]
+                bw_mbps, rtt_ms = self.link(sender, receiver)
+
+                # Each step sends 1/n of the data
+                chunk_size = bytes_size / n
+                link_time = (chunk_size * 8.0 / (bw_mbps * 1e6)) + (rtt_ms / 1000.0)
+                step_time = max(step_time, link_time)  # Bottleneck determines step time
+
+            total_time += step_time
+
+        # All-gather phase: (n-1) more steps
+        for _ in range(n - 1):
+            step_time = 0.0
+            for i in range(n):
+                sender = device_names[i]
+                receiver = device_names[(i + 1) % n]
+                bw_mbps, rtt_ms = self.link(sender, receiver)
+
+                # Each step sends 1/n of the data
+                chunk_size = bytes_size / n
+                link_time = (chunk_size * 8.0 / (bw_mbps * 1e6)) + (rtt_ms / 1000.0)
+                step_time = max(step_time, link_time)
+
+            total_time += step_time
+
+        return total_time
+
+    def compute_communication_cost(
+        self,
+        tensor_size_bytes: float,
+        devices: List[Device],
+        communication_model: CommunicationModel,
+    ) -> float:
+        """Compute communication cost based on the model type and actual pairwise links."""
+        device_names = [d.name for d in devices]
+        num_servers = len(devices)
+
+        if communication_model == CommunicationModel.CENTRALIZED:
+            # Actual RPC sequence: Graph Compute -> Get Tensor -> Add Data Compute Graph
+            total_cost = 0.0
+
+            # Phase 1: Client sends graph compute request to all servers (parallel)
+            max_graph_compute_time = 0.0
+            for _ in device_names:
+                # Graph compute request (serialized subgraph + tensor descriptors)
+                # Estimate ~1KB for small subgraph + tensor metadata per server
+                request_size = 1024  # bytes for serialized graph
+                request_time = (
+                    request_size * 8.0 / (self.client_bandwidth_mbps * 1e6)
+                ) + (self.client_rtt_ms / 1000.0)
+                # Response is just status (small)
+                response_time = self.client_rtt_ms / 1000.0
+                graph_compute_time = request_time + response_time
+                max_graph_compute_time = max(max_graph_compute_time, graph_compute_time)
+
+            total_cost += max_graph_compute_time
+
+            # Phase 2: Client requests partial tensor results from all servers (parallel)
+            max_get_tensor_time = 0.0
+            for _ in device_names:
+                chunk_size = (
+                    tensor_size_bytes / num_servers
+                )  # Each server computed a chunk
+                # Get tensor request (small tensor descriptor)
+                request_time = self.client_rtt_ms / 1000.0
+                # Response contains the actual tensor chunk data
+                response_time = (
+                    chunk_size * 8.0 / (self.client_bandwidth_mbps * 1e6)
+                ) + (self.client_rtt_ms / 1000.0)
+                get_tensor_time = request_time + response_time
+                max_get_tensor_time = max(max_get_tensor_time, get_tensor_time)
+
+            total_cost += max_get_tensor_time
+
+            # Phase 3: Client sends aggregated tensor back to all servers
+            # for local storage/reduction (parallel)
+            max_allreduce_time = 0.0
+            for _ in device_names:
+                # All reduce compute graph request
+                # (simple addition graph for local all-reduce + full aggregated tensor)
+                graph_size = 512  # bytes for simple add op graph
+                request_time = (
+                    (graph_size + tensor_size_bytes)
+                    * 8.0
+                    / (self.client_bandwidth_mbps * 1e6)
+                ) + (self.client_rtt_ms / 1000.0)
+                # Response is just computation status
+                response_time = self.client_rtt_ms / 1000.0
+                allreduce_time = request_time + response_time
+                max_allreduce_time = max(max_allreduce_time, allreduce_time)
+
+            total_cost += max_allreduce_time
+
+            # Add synchronization barrier overhead (thread joins, etc.)
+            sync_overhead = 0.001 * num_servers  # 1ms per server for coordination
+            total_cost += sync_overhead
+
+            return total_cost
+
+        # PEER_TO_PEER
+        # Ring all-reduce using actual pairwise links
+        return self.ring_allreduce_time_with_pairwise_links(
+            tensor_size_bytes, device_names
+        )
 
 
 # ------------------------------
@@ -233,29 +371,14 @@ def simulate_pipeline(
     }
 
 
-def ring_allreduce_time_s(
-    bytes_size: float, devices: List[Device], net: Network
-) -> float:
-    """
-    Time for a ring all-reduce over a homogeneous link assumption, approximated as:
-      time ≈ 2 * (N - 1) / N * (bytes / bw) + (N - 1) * RTT
-    We estimate bw as the min pairwise bw to be pessimistic.
-    """
-    n = len(devices)
-    if n <= 1:
-        return 0.0
-    # Conservative: use worst-case link between any two participants
-    min_bw = float("inf")
-    max_rtt = 0.0
-    names = [d.name for d in devices]
-    for i in range(n):
-        for j in range(i + 1, n):
-            bw, rtt = net.link(names[i], names[j])
-            min_bw = min(min_bw, bw)
-            max_rtt = max(max_rtt, rtt)
-    data_time = 2 * (n - 1) / n * (bytes_size * 8.0 / (min_bw * 1e6))
-    latency_time = (n - 1) * (max_rtt / 1000.0)
-    return data_time + latency_time
+class AttentionSplitStrategy(Enum):
+    KV_HEADS = "kv_heads"
+
+
+class FFNSplitStrategy(Enum):
+    KV_HEADS = "kv_heads"
+    HIDDEN_DIM = "hidden_dim"
+    Q_HEADS = "q_heads"
 
 
 def simulate_tensor_parallel(
@@ -266,10 +389,17 @@ def simulate_tensor_parallel(
     gen_tokens: int,
     parallel_degree: Optional[int] = None,
     efficiency_loss: float = 0.85,
+    attn_split_strategy: AttentionSplitStrategy = AttentionSplitStrategy.KV_HEADS,
+    ffn_split_strategy: FFNSplitStrategy = FFNSplitStrategy.KV_HEADS,
 ) -> Dict:
     """
-    Tensor-parallel over a group of devices. We divide compute across k devices and add
-    an all-reduce per layer per token (very rough) for attention+FFN outputs.
+    Tensor-parallel over a group of devices with flexible head-level splitting strategies for attention and FFN.
+    No KV head replication - limited by num_kv_heads.
+
+    Supported combinations:
+    1. attn: kv_heads, ffn: kv_heads     -> Both split by KV head groups
+    2. attn: kv_heads, ffn: hidden_dim   -> Attention by KV heads, FFN by dimension
+    3. attn: kv_heads, ffn: q_heads      -> Attention by KV heads, FFN by Q head groups.
     """
     if parallel_degree is None:
         k = len(devices)
@@ -277,33 +407,190 @@ def simulate_tensor_parallel(
         k = min(parallel_degree, len(devices))
         devices = devices[:k]
 
-    # Effective compute when splitting across k devices
-    per_layer_flops = model.layer_compute_flops_per_token(seq_len)
-    per_token_flops = model.num_layers * per_layer_flops
+    # Attention is always split by KV heads (no replication)
+    kv_heads_per_device = model.num_kv_heads // k
+    remaining_kv = model.num_kv_heads % k
 
-    # Split compute somewhat evenly; take slowest device as the bottleneck per-synchronization
-    device_times = []
-    for d in devices:
-        t = d.compute_time_s(per_token_flops / k) / efficiency_loss
-        device_times.append(t)
-    compute_time = max(device_times)  # sync happens each layer -> bottleneck per token
+    device_kv_counts = [kv_heads_per_device] * min(k, model.num_kv_heads)
+    for i in range(remaining_kv):
+        device_kv_counts[i] += 1
+
+    # Q heads follow KV heads (GQA pattern: each KV head serves multiple Q heads)
+    q_heads_per_kv = model.num_heads // model.num_kv_heads
+    device_q_counts = [kv * q_heads_per_kv for kv in device_kv_counts]
+
+    if attn_split_strategy == AttentionSplitStrategy.KV_HEADS:
+        # Attention splits follow KV head allocation
+        device_attn_fractions = [
+            kv_count / model.num_kv_heads for kv_count in device_kv_counts
+        ]
+    else:
+        raise ValueError(f"Unsupported attention split strategy: {attn_split_strategy}")
+
+    # FFN split strategy determines workload distribution
+    if ffn_split_strategy == FFNSplitStrategy.KV_HEADS:
+        # FFN splits follow KV head allocation
+        device_ffn_fractions = [
+            kv_count / model.num_kv_heads for kv_count in device_kv_counts
+        ]
+    elif ffn_split_strategy == FFNSplitStrategy.HIDDEN_DIM:
+        # FFN splits evenly across hidden dimension (traditional tensor parallel)
+        device_ffn_fractions = [1.0 / k] * k
+    elif ffn_split_strategy == FFNSplitStrategy.Q_HEADS:
+        # FFN splits follow Q head allocation
+        device_ffn_fractions = [
+            q_count / model.num_heads for q_count in device_q_counts
+        ]
+    else:
+        raise ValueError(f"Unsupported FFN split strategy: {ffn_split_strategy}")
+
+    # Calculate per-layer compute for each device
+    per_layer_compute_times = []
+
+    for i, device in enumerate(devices):
+        device_q_heads = device_q_counts[i]
+        device_kv_heads = device_kv_counts[i]
+        device_ffn_fraction = device_ffn_fractions[i]
+
+        # Attention FLOPs based on head allocation
+        # Q projection scales with Q heads assigned to this device
+        q_proj_flops = (
+            model.attn_flops_coeff * model.d_model * device_q_heads * model.d_k
+        )
+
+        # K, V projections scale with KV heads assigned to this device
+        kv_proj_flops = (
+            2 * model.attn_flops_coeff * model.d_model * device_kv_heads * model.d_k
+        )
+
+        # Attention computation (QK^T, softmax, attention*V) scales with Q heads
+        q_fraction = device_q_heads / model.num_heads
+        attn_compute_flops = (
+            model.attn_quadratic_coeff * (seq_len**2) * model.d_model * q_fraction
+        )
+
+        # Output projection scales with Q heads (determines output size)
+        out_proj_flops = (
+            model.attn_flops_coeff * model.d_model * device_q_heads * model.d_k
+        )
+
+        total_attn_flops = (
+            q_proj_flops + kv_proj_flops + attn_compute_flops + out_proj_flops
+        )
+
+        # FFN FLOPs based on split strategy
+        ffn_flops = (
+            model.ffn_flops_coeff * model.d_model * model.d_ff * device_ffn_fraction
+        )
+
+        total_flops = total_attn_flops + ffn_flops
+        compute_time = device.compute_time_s(total_flops) / efficiency_loss
+        per_layer_compute_times.append(compute_time)
+
+    # The bottleneck device determines the per-layer time (synchronous execution)
+    per_layer_time = max(per_layer_compute_times)
+    compute_time = per_layer_time * model.num_layers
 
     # All-reduce cost per layer (assume 2 collectives per layer)
     red_bytes = model.allreduce_bytes_per_token
-    per_layer_red = ring_allreduce_time_s(red_bytes, devices, net) * 2
-    comm_time = per_layer_red * model.num_layers
+
+    # Attention all-reduce: always needed after attention computation
+    attn_devices = [
+        device
+        for device, attn_frac in zip(devices, device_attn_fractions)
+        if attn_frac > 0
+    ]
+    attn_comm_cost = net.compute_communication_cost(
+        red_bytes, attn_devices, model.communication_model
+    )
+
+    # FFN all-reduce: needed after FFN computation
+    ffn_devices = [
+        device
+        for device, ffn_frac in zip(devices, device_ffn_fractions)
+        if ffn_frac > 0
+    ]
+    ffn_comm_cost = net.compute_communication_cost(
+        red_bytes, ffn_devices, model.communication_model
+    )
+
+    # Total communication per layer: attention + FFN collectives
+    per_layer_comm = attn_comm_cost + ffn_comm_cost
+    comm_time = per_layer_comm * model.num_layers
 
     per_token = compute_time + comm_time
     total = per_token * gen_tokens
+
+    # Calculate load balance and memory metrics
+    compute_time_std = (
+        sum((t - per_layer_time) ** 2 for t in per_layer_compute_times) / k
+    ) ** 0.5
+    load_balance_efficiency = min(per_layer_compute_times) / max(
+        per_layer_compute_times
+    )
+
+    # Memory usage per device (KV cache + model weights)
+    device_memory_usage = []
+    for i in range(k):
+        # KV cache memory for assigned KV heads
+        kv_cache_bytes = (
+            device_kv_counts[i] * model.d_k * 2 * 4 * seq_len
+        )  # (K,V) * d_k * float32 * seq_len
+
+        # Model weights (rough estimate)
+        # Attention weights: Q + K + V + output projections
+        attn_weights = (
+            device_q_counts[i] * model.d_k * model.d_model * 4  # Q proj
+            + device_kv_counts[i] * model.d_k * model.d_model * 2 * 4  # K,V proj
+        )
+
+        # FFN weights based on split strategy
+        ffn_weights = (
+            device_ffn_fractions[i] * model.d_model * model.d_ff * 2 * 4
+        )  # up + down proj
+
+        total_memory = (
+            kv_cache_bytes + (attn_weights + ffn_weights) * model.num_layers
+        ) / (
+            1024**3
+        )  # GB
+        device_memory_usage.append(total_memory)
+
     return {
         "policy": "tensor",
+        "communication_model": model.communication_model.value,
         "k": k,
+        "split_strategies": {
+            "attention": attn_split_strategy,
+            "ffn": ffn_split_strategy,
+        },
+        "device_allocation": {
+            devices[i].name: {
+                "q_heads": device_q_counts[i],
+                "kv_heads": device_kv_counts[i],
+                "ffn_fraction": device_ffn_fractions[i],
+                "memory_usage_gb": device_memory_usage[i],
+                "compute_time_per_layer": per_layer_compute_times[i],
+            }
+            for i in range(k)
+        },
         "per_token_s": per_token,
-        "component_times_s": {"compute": compute_time, "allreduce": comm_time},
+        "component_times_s": {
+            "compute": compute_time,
+            "communication": comm_time,
+            "attn_communication": attn_comm_cost * model.num_layers,
+            "ffn_communication": ffn_comm_cost * model.num_layers,
+        },
+        "efficiency_metrics": {
+            "load_balance_efficiency": load_balance_efficiency,
+            "compute_time_std": compute_time_std,
+        },
         "total_latency_s": total,
         "notes": (
-            "Ring all-reduce with conservative link estimates; "
-            "includes crude efficiency loss."
+            f"Using {model.communication_model.value} communication with pairwise link modeling. "
+            f"Attention split by {attn_split_strategy}, FFN split by {ffn_split_strategy}. "
+            f"Load balance efficiency: {load_balance_efficiency:.2f}. "
+            f"No KV head replication."
         ),
     }
 
@@ -430,6 +717,48 @@ def simulate_metis(
 # ------------------------------
 
 
+def compare_tensor_parallel_strategies(
+    devices: List[Device],
+    model: ModelSpec,
+    net: Network,
+    seq_len: int,
+    gen_tokens: int,
+    parallel_degree: Optional[int] = None,
+) -> Dict[str, Dict]:
+    """Compare the three tensor parallel splitting strategies."""
+
+    strategies = [
+        (
+            AttentionSplitStrategy.KV_HEADS,
+            FFNSplitStrategy.KV_HEADS,
+        ),  # Both split by KV head groups - most aligned
+        (
+            AttentionSplitStrategy.KV_HEADS,
+            FFNSplitStrategy.HIDDEN_DIM,
+        ),  # Attention by KV heads, FFN traditional split
+        (
+            AttentionSplitStrategy.KV_HEADS,
+            FFNSplitStrategy.Q_HEADS,
+        ),  # Attention by KV heads, FFN by Q head groups
+    ]
+
+    results = {}
+    for attn_strategy, ffn_strategy in strategies:
+        strategy_name = f"attn_{attn_strategy.name}_ffn_{ffn_strategy.name}"
+        results[strategy_name] = simulate_tensor_parallel(
+            devices,
+            model,
+            net,
+            seq_len,
+            gen_tokens,
+            parallel_degree=parallel_degree,
+            attn_split_strategy=attn_strategy,
+            ffn_split_strategy=ffn_strategy,
+        )
+
+    return results
+
+
 def run_experiments(
     devices: List[Device],
     model: Optional[ModelSpec] = None,
@@ -464,7 +793,7 @@ def run_experiments(
 
 if __name__ == "__main__":
     # Example: 4 heterogeneous Raspberry Pi-like devices
-    devs = [
+    SERVERS = [
         Device(
             "rpi-1",
             gflops=12.5,
@@ -507,7 +836,7 @@ if __name__ == "__main__":
     SEQ_LEN = 512
     GEN_TOKENS = 64
 
-    res = run_experiments(devs, MODEL, NET, SEQ_LEN, GEN_TOKENS)
+    res = run_experiments(SERVERS, MODEL, NET, SEQ_LEN, GEN_TOKENS)
     from pprint import pprint
 
     pprint(res)
