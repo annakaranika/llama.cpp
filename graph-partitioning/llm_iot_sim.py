@@ -68,22 +68,16 @@ class Device:
         name (str): Device identifier.
         gflops (float): Peak FP32 GFLOPs (or "effective" compute units).
         memory_gb (float): Available memory in GB.
-        net_bw_mbps (float): Throughput (Mbps) to the shared wireless fabric.
-        net_rtt_ms (float): Baseline RTT (ms) on the wireless fabric.
-        efficiency (float): Fraction of peak compute realized during inference.
 
     """
 
     name: str
-    gflops: float  # peak FP32 GFLOPs (or "effective" compute units)
+    gflops: float  # effective/achievable GFLOPs (or "effective" compute units)
     memory_gb: float
-    net_bw_mbps: float  # throughput (Mbps) to the shared wireless fabric
-    net_rtt_ms: float  # baseline RTT (ms) on the wireless fabric
-    efficiency: float = 0.6  # how much of peak compute you realize during inference
 
     def flops_per_sec(self) -> float:
-        """Effective FLOPs/s considering efficiency."""
-        return 1e9 * self.gflops * self.efficiency
+        """Effective FLOPs/s."""
+        return 1e9 * self.gflops
 
     def compute_time_s(self, flops: float) -> float:
         """Compute time in seconds for given FLOPs."""
@@ -308,6 +302,8 @@ class Network:
     If pairwise overrides are provided, they take precedence when computing link costs.
     """
 
+    client: Device = Device("client", gflops=15.0, memory_gb=4.0)
+    servers: List[Device] = field(default_factory=list)
     default_bw_mbps: float = 300.0
     default_rtt_ms: float = 15.0
     pair_bw_mbps: Dict[Tuple[str, str], float] = field(default_factory=dict)
@@ -348,6 +344,33 @@ class Network:
             return 0.0
         return (bytes_size * 8.0 / (bw_mbps * 1e6)) + rtt_ms / 1000.0
 
+    def avg_client_server_time(self, bytes_size: float) -> float:
+        """
+        Client-server transfer time model.
+        """
+        bw_rtt_pairs = [self.link("client", server.name) for server in self.servers]
+        if bw_rtt_pairs:
+            avg_bw = sum(bw for bw, _ in bw_rtt_pairs) / len(bw_rtt_pairs)
+            avg_rtt = sum(rtt for _, rtt in bw_rtt_pairs) / len(bw_rtt_pairs)
+        else:
+            avg_bw = self.client_bandwidth_mbps
+            avg_rtt = self.client_rtt_ms
+
+        return (bytes_size * 8.0 / (avg_bw * 1e6)) + (avg_rtt / 1000.0)
+
+    def centralized_allreduce_time(self, bytes_size: float, num_servers: int) -> float:
+        """
+        Centralized all-reduce time model.
+        Assumes client coordinates all communication.
+        """
+        if num_servers <= 1:
+            return 0.0
+        # Each server sends and receives the full data once
+        time = 2 * (bytes_size * 8.0 / (self.client_bandwidth_mbps * 1e6)) + (
+            2 * self.client_rtt_ms / 1000.0
+        )
+        return time
+
     def ring_allreduce_time_with_pairwise_links(
         self, bytes_size: float, device_names: List[str]
     ) -> float:
@@ -356,6 +379,9 @@ class Network:
         In a ring, each device sends to its next neighbor in the ring.
         Following this model:
             time ≈ 2 * (N - 1) / N * (bytes / bw) + (N - 1) * RTT
+
+        TODO: take into consideration the case that splits are not the same number
+        between attention and FFN blocks.
         """
         n = len(device_names)
         if n <= 1:
@@ -371,11 +397,10 @@ class Network:
             for i in range(n):
                 sender = device_names[i]
                 receiver = device_names[(i + 1) % n]
-                bw_mbps, rtt_ms = self.link(sender, receiver)
 
                 # Each step sends 1/n of the data
                 chunk_size = bytes_size / n
-                link_time = (chunk_size * 8.0 / (bw_mbps * 1e6)) + (rtt_ms / 1000.0)
+                link_time = self.xfer_time_s(chunk_size, sender, receiver)
                 step_time = max(step_time, link_time)  # Bottleneck determines step time
 
             total_time += step_time
@@ -386,25 +411,23 @@ class Network:
             for i in range(n):
                 sender = device_names[i]
                 receiver = device_names[(i + 1) % n]
-                bw_mbps, rtt_ms = self.link(sender, receiver)
 
                 # Each step sends 1/n of the data
                 chunk_size = bytes_size / n
-                link_time = (chunk_size * 8.0 / (bw_mbps * 1e6)) + (rtt_ms / 1000.0)
+                link_time = self.xfer_time_s(chunk_size, sender, receiver)
                 step_time = max(step_time, link_time)
 
             total_time += step_time
 
         return total_time
 
-    def compute_communication_cost(
+    def allreduce_communication_cost(
         self,
         tensor_size_bytes: float,
         devices: List[Device],
         communication_model: CommunicationModel,
     ) -> float:
         """Compute communication cost based on the model type and actual pairwise links."""
-        device_names = [d.name for d in devices]
         num_servers = len(devices)
 
         if communication_model == CommunicationModel.CENTRALIZED:
@@ -413,7 +436,7 @@ class Network:
 
             # Phase 1: Client sends graph compute request to all servers (parallel)
             max_graph_compute_time = 0.0
-            for _ in device_names:
+            for _ in devices:
                 # Graph compute request (serialized subgraph + tensor descriptors)
                 # Estimate ~1KB for small subgraph + tensor metadata per server
                 request_size = 1024  # bytes for serialized graph
@@ -429,7 +452,7 @@ class Network:
 
             # Phase 2: Client requests partial tensor results from all servers (parallel)
             max_get_tensor_time = 0.0
-            for _ in device_names:
+            for _ in devices:
                 chunk_size = (
                     tensor_size_bytes / num_servers
                 )  # Each server computed a chunk
@@ -447,7 +470,7 @@ class Network:
             # Phase 3: Client sends aggregated tensor back to all servers
             # for local storage/reduction (parallel)
             max_allreduce_time = 0.0
-            for _ in device_names:
+            for _ in devices:
                 # All reduce compute graph request
                 # (simple addition graph for local all-reduce + full aggregated tensor)
                 graph_size = 512  # bytes for simple add op graph
@@ -472,7 +495,7 @@ class Network:
         # PEER_TO_PEER
         # Ring all-reduce using actual pairwise links
         return self.ring_allreduce_time_with_pairwise_links(
-            tensor_size_bytes, device_names
+            tensor_size_bytes, device_names=[d.name for d in devices]
         )
 
 
@@ -481,7 +504,7 @@ class Network:
 # ------------------------------
 
 
-def std_compute_time(times: List[float]) -> float:
+def std_times(times: List[float]) -> float:
     """
     Compute standard deviation of compute times.
     """
@@ -493,7 +516,7 @@ def std_compute_time(times: List[float]) -> float:
     return math.sqrt(variance)
 
 
-def load_balance_efficiency(times: List[float]) -> float:
+def efficiency(times: List[float]) -> float:
     """
     Compute load balance efficiency as mean / max compute time.
     """
@@ -512,19 +535,22 @@ def load_balance_efficiency(times: List[float]) -> float:
 
 
 def simulate_single_node(
-    device: Device, model: ModelSpec, seq_len: int, gen_tokens: int
+    model: ModelSpec, net: Network, seq_len: int, gen_tokens: int
 ) -> Dict:
     """All layers on one device; simple latency estimate."""
+    devices = net.servers
+    if not devices:
+        raise ValueError("No devices available in the network.")
+    fastest = max(net.servers, key=lambda d: d.gflops)
     per_layer_flops = model.layer_compute_flops(seq_len)
     per_token_flops = model.num_layers * per_layer_flops
-    t_token = device.compute_time_s(per_token_flops)
+    t_token = fastest.compute_time_s(per_token_flops)
     total = t_token * gen_tokens
     return {
         "policy": "single_node",
-        "device": device.name,
+        "device": fastest.name,
         "per_token_s": t_token,
         "total_latency_s": total,
-        "utilization_est": device.efficiency,
         "notes": "No comms; ignores prompt prefill time.",
     }
 
@@ -551,12 +577,13 @@ def _pipeline_partition_by_compute(
 
 
 def simulate_pipeline(
-    devices: List[Device], model: ModelSpec, net: Network, seq_len: int, gen_tokens: int
+    model: ModelSpec, net: Network, seq_len: int, gen_tokens: int
 ) -> Dict:
     """
     Estimate pipeline-parallel token latency with simple bubble model.
     Assumes each boundary sends activation for each token once.
     """
+    devices = net.servers
     layer_costs = [model.layer_compute_flops(seq_len) for _ in range(model.num_layers)]
     parts = _pipeline_partition_by_compute(devices, layer_costs)
 
@@ -612,7 +639,6 @@ def simulate_pipeline(
 
 
 def simulate_tensor_parallel(
-    devices: List[Device],
     model: ModelSpec,
     net: Network,
     seq_len: int,
@@ -631,8 +657,12 @@ def simulate_tensor_parallel(
     2. attn: kv_heads, ffn: hidden_dim   -> Attention by KV heads, FFN by dimension
     3. attn: kv_heads, ffn: q_heads      -> Attention by KV heads, FFN by Q head groups.
     """
-    k = len(devices) if parallel_degree is None else min(parallel_degree, len(devices))
-    devices = devices[:k] if parallel_degree is not None else devices
+    k = (
+        len(net.servers)
+        if parallel_degree is None
+        else min(parallel_degree, len(net.servers))
+    )
+    devices = net.servers[:k] if parallel_degree is not None else net.servers
 
     # Attention is always split by KV heads (no replication)
     kv_heads_per_device = model.num_kv_heads // k
@@ -690,7 +720,7 @@ def simulate_tensor_parallel(
         for device, attn_frac in zip(devices, device_attn_fractions)
         if attn_frac > 0
     ]
-    attn_comm_cost = net.compute_communication_cost(
+    attn_comm_cost = net.allreduce_communication_cost(
         red_bytes, attn_devices, model.communication_model
     )
 
@@ -700,7 +730,7 @@ def simulate_tensor_parallel(
         for device, ffn_frac in zip(devices, device_ffn_fractions)
         if ffn_frac > 0
     ]
-    ffn_comm_cost = net.compute_communication_cost(
+    ffn_comm_cost = net.allreduce_communication_cost(
         red_bytes, ffn_devices, model.communication_model
     )
 
@@ -712,8 +742,8 @@ def simulate_tensor_parallel(
     total = per_token * gen_tokens
 
     # Calculate load balance and memory metrics
-    compute_time_std = std_compute_time(per_layer_compute_times)
-    load_balance_efficiency_val = load_balance_efficiency(per_layer_compute_times)
+    compute_time_std = std_times(per_layer_compute_times)
+    load_balance_efficiency_val = efficiency(per_layer_compute_times)
 
     # Memory usage per device (KV cache + model weights)
     device_memory_usage = model.memory_usage_per_device(
@@ -759,12 +789,180 @@ def simulate_tensor_parallel(
     }
 
 
-def metis_partition_layers(k: int, model: ModelSpec, seq_len: int) -> List[List[int]]:
+def build_computation_graph(
+    model: ModelSpec,
+    net: Network,
+    attn_split_strategy: AttentionSplitStrategy = AttentionSplitStrategy.KV_HEADS,
+    ffn_split_strategy: FFNSplitStrategy = FFNSplitStrategy.KV_HEADS,
+) -> Tuple[List[int], List[List[int]], List[int], List[int], List[int]]:
     """
-    Build a chain graph of layers with node weights ~ compute and edge weights ~ communication.
-    Return contiguous or non-contiguous partitions (METIS can split arbitrarily).
+    Build a computation graph with separate attention and FFN blocks per layer.
+
+    Graph structure per layer:
+    - Attention block: parallel nodes (one per possible split)
+    - FFN block: parallel nodes (one per possible split)
+    - Intra-block edges: communication cost between parallel attention/FFN nodes
+    - Inter-block edges: single edge from attention[0] -> ffn[0] (activation transfer)
+
+    Returns:
+        xadj: Adjacency list starts
+        adjncy: Adjacent nodes
+        eweights: Edge weights
+        node_types: Node type indicators (0=attn, 1=ffn)
+        node_splits: Which split each node represents
+    """
+    k = len(net.servers)
+    n_layers = model.num_layers
+
+    # Calculate split possibilities
+    max_attn_splits = (
+        model.num_kv_heads
+        if attn_split_strategy == AttentionSplitStrategy.KV_HEADS
+        else model.num_heads
+    )
+    max_ffn_splits = {
+        FFNSplitStrategy.KV_HEADS: model.num_kv_heads,
+        FFNSplitStrategy.Q_HEADS: model.num_heads,
+        FFNSplitStrategy.HIDDEN_DIM: k,  # Can split arbitrarily across hidden dim
+    }[ffn_split_strategy]
+
+    # Node layout: [
+    #   layer_0_attn_0, layer_0_attn_1, ..., layer_0_ffn_0, layer_0_ffn_1, ..., layer_1_attn_0, ...
+    # ]
+    nodes_per_layer = max_attn_splits + max_ffn_splits
+    total_nodes = n_layers * nodes_per_layer
+
+    xadj = [0]  # Start of adjacency for each node
+    adjncy = []  # Adjacent nodes
+    eweights = []  # Edge weights
+    node_types = []  # 0=attention, 1=ffn
+    node_splits = []  # Which split configuration this node represents
+
+    def get_node_id(layer: int, block_type: int, split_id: int) -> int:
+        """Get global node ID for layer/block_type/split_id"""
+        return layer * nodes_per_layer + block_type * max_attn_splits + split_id
+
+    # Build adjacency for each node
+    for node_id in range(total_nodes):
+        layer = node_id // nodes_per_layer
+        within_layer = node_id % nodes_per_layer
+
+        if within_layer < max_attn_splits:
+            # Attention node
+            block_type = 0
+            split_id = within_layer
+            max_block_splits = max_attn_splits
+        else:
+            # FFN node
+            block_type = 1
+            split_id = within_layer - max_attn_splits
+            max_block_splits = max_ffn_splits
+        node_splits.append(split_id + 1)  # 1-indexed split degree
+        node_types.append(block_type)
+
+        nbrs = []  # Neighbor nodes
+        wts = []  # Corresponding edge weights
+
+        # 1. Intra-block edges (parallel nodes in same block incur extra communication cost)
+        for other_split in range(max_block_splits):
+            if other_split != split_id:
+                other_node = get_node_id(layer, block_type, other_split)
+                nbrs.append(other_node)
+
+                # Communication cost between attention nodes (tensor parallel all-reduce)
+                comm_cost = net.allreduce_communication_cost(
+                    model.allreduce_bytes_per_token,
+                    net.servers[: split_id + 1],
+                    model.communication_model,
+                )
+                edge_weight = max(1, int(comm_cost * 1000))
+                wts.append(edge_weight)
+
+        if (  # 2. Inter-block edge (attention -> FFN within same layer)
+            block_type == 0 and split_id == 0
+        ):  # Only first attention node connects to first FFN node
+            next_block_node = get_node_id(layer, 1, 0)
+
+        elif (  # 3. Inter-layer edges (FFN -> next layer attention)
+            block_type == 1 and split_id == 0 and layer < n_layers - 1
+        ):  # Only first FFN node connects to next layer
+            next_block_node = get_node_id(layer + 1, 0, 0)
+        else:  # other block nodes
+            next_block_node = None
+
+        if next_block_node is not None:
+            nbrs.append(next_block_node)
+
+            comm_cost = net.allreduce_communication_cost(
+                model.act_bytes_per_token,
+                net.servers[: max(max_attn_splits, max_ffn_splits)],
+                model.communication_model,
+            )
+            edge_weight = max(1, int(comm_cost * 1000))
+            wts.append(edge_weight)
+
+        adjncy.extend(nbrs)
+        eweights.extend(wts)
+        xadj.append(len(adjncy))
+
+    return xadj, adjncy, eweights, node_types, node_splits
+
+
+def compute_node_weights(
+    model: ModelSpec,
+    devices: List[Device],
+    seq_len: int,
+    node_types: List[int],
+    node_splits: List[int],
+) -> List[int]:
+    """
+    Compute node weights based on actual computation cost for each block type and split degree.
+    """
+    node_weights = []
+
+    for block_type, split_degree in zip(node_types, node_splits):
+        if block_type == 0:  # Attention block
+            # Compute attention cost for this split degree
+            device_kv_heads = model.num_kv_heads // split_degree
+            device_q_heads = (model.num_heads // model.num_kv_heads) * device_kv_heads
+
+            attn_flops = model.attn_compute_flops(
+                seq_len, dev_num_heads=device_q_heads, dev_kv_heads=device_kv_heads
+            )
+
+            # Use average device performance
+            avg_device_perf = sum(d.gflops for d in devices) / len(devices)
+            compute_time = attn_flops / (avg_device_perf * 1e9)
+
+        else:  # FFN block
+            # Compute FFN cost for this split degree
+            ffn_fraction = 1.0 / split_degree
+            ffn_flops = model.ffn_compute_flops(ffn_fraction=ffn_fraction)
+
+            avg_device_perf = sum(d.gflops for d in devices) / len(devices)
+            compute_time = ffn_flops / (avg_device_perf * 1e9)
+
+        node_weight = max(1, int(compute_time * 1000))
+        node_weights.append(node_weight)
+
+    return node_weights
+
+
+def metis_partition_computation_blocks(
+    model: ModelSpec,
+    net: Network,
+    seq_len: int,
+    attn_split_strategy: AttentionSplitStrategy = AttentionSplitStrategy.KV_HEADS,
+    ffn_split_strategy: FFNSplitStrategy = FFNSplitStrategy.KV_HEADS,
+) -> Dict:
+    """
+    Build a chain graph of layers with node weights ~ compute and edge weights ~ communication cost
+    based on the model's communication strategy.
+    Return partitions optimized for the specified communication model.
     If PyMetis is not available, fall back to a greedy balancer by compute.
     """
+    k = len(net.servers)
+
     if pymetis is None or CSRAdjacency is None:
         # Fallback: contiguous greedy like pipeline
         layer_costs = [
@@ -777,97 +975,123 @@ def metis_partition_layers(k: int, model: ModelSpec, seq_len: int) -> List[List[
             idx = sums.index(min(sums))
             parts[idx].append(i)
             sums[idx] += c
-        return parts
+        return {"partitions": parts}
 
-    # METIS expects adjacency list; create a simple chain graph 0-1-2-...-(L-1)
-    n = model.num_layers
-    xadj = [0]
-    adjncy = []
-    eweights = []
-    for i in range(n):
-        nbrs = []
-        wts = []
-        if i - 1 >= 0:
-            nbrs.append(i - 1)
-            wts.append(1)  # edge weight placeholder
-        if i + 1 < n:
-            nbrs.append(i + 1)
-            wts.append(1)
-        adjncy.extend(nbrs)
-        eweights.extend(wts)
-        xadj.append(len(adjncy))
-
-    # Node weights (ints) ~ compute cost
-    nodewgt = [max(1, int(1e-6 * model.layer_compute_flops(seq_len))) for _ in range(n)]
-
-    csr = CSRAdjacency(
-        adj_starts=xadj,
-        adjacent=adjncy,
+    # Build computation graph
+    xadj, adjncy, eweights, node_types, node_splits = build_computation_graph(
+        model, net, attn_split_strategy, ffn_split_strategy
     )
+
+    # Compute node weights
+    node_weights = compute_node_weights(
+        model, net.servers, seq_len, node_types, node_splits
+    )
+
+    # Run METIS partitioning
+    csr = CSRAdjacency(adj_starts=xadj, adjacent=adjncy)
     _, assignment = pymetis.part_graph(
-        k, adjacency=csr, vweights=nodewgt, eweights=eweights
+        k, adjacency=csr, vweights=node_weights, eweights=eweights
     )
-    parts: List[List[int]] = [[] for _ in range(k)]
-    for i, p in enumerate(assignment):
-        parts[p].append(i)
-    return parts
+
+    # Analyze the partitioning results
+    partitions = [[] for _ in range(k)]
+    for node_id, partition_id in enumerate(assignment):
+        layer = node_id // (len(node_types) // model.num_layers)
+        block_type = node_types[node_id]
+        split_degree = node_splits[node_id]
+
+        partitions[partition_id].append(
+            {
+                "node_id": node_id,
+                "layer": layer,
+                "block_type": "attention" if block_type == 0 else "ffn",
+                "split_degree": split_degree,
+                "compute_weight": node_weights[node_id],
+            }
+        )
+
+    return {
+        "partitions": partitions,
+        "total_nodes": len(node_types),
+        "graph_structure": {
+            "attention_blocks": sum(1 for t in node_types if t == 0),
+            "ffn_blocks": sum(1 for t in node_types if t == 1),
+        },
+        "assignment": assignment,
+    }
 
 
 def simulate_metis(
-    devices: List[Device], model: ModelSpec, net: Network, seq_len: int, gen_tokens: int
+    model: ModelSpec,
+    net: Network,
+    seq_len: int,
+    gen_tokens: int,
+    attn_split_strategy: AttentionSplitStrategy = AttentionSplitStrategy.KV_HEADS,
+    ffn_split_strategy: FFNSplitStrategy = FFNSplitStrategy.KV_HEADS,
 ) -> Dict:
     """
-    Partition layers with METIS (or greedy) and schedule as a generalized pipeline.
-    We assume a linear order of parts by average layer index to approximate a pipeline path.
+    Enhanced METIS simulation with attention/FFN block structure.
     """
-    k = len(devices)
-    parts = metis_partition_layers(k, model, seq_len)
+    k = len(net.servers)
+    partition_result = metis_partition_computation_blocks(
+        model, net, seq_len, attn_split_strategy, ffn_split_strategy
+    )
 
-    # Order parts by average layer index to form a pipeline order
-    order = sorted(range(k), key=lambda p: sum(parts[p]) / max(1, len(parts[p])))
-    parts_ordered = [parts[i] for i in order]
-    devices_ordered = [devices[i] for i in order]
+    # Extract optimal split strategies from METIS results
+    optimal_strategies = {}
+    for partition_id, nodes in enumerate(partition_result["partitions"]):
+        attention_nodes = [n for n in nodes if n["block_type"] == "attention"]
+        ffn_nodes = [n for n in nodes if n["block_type"] == "ffn"]
 
-    # Reuse pipeline estimation but allow non-contiguous sets per stage by summing costs
-    layer_costs = [model.layer_compute_flops(seq_len) for _ in range(model.num_layers)]
-    stage_compute = []
-    for idx, stage_layers in enumerate(parts_ordered):
-        flops = sum(layer_costs[i] for i in stage_layers)
-        stage_compute.append(devices_ordered[idx].compute_time_s(flops))
+        # Find most common split degrees (METIS might prefer specific splits)
+        if attention_nodes:
+            attn_split = max(attention_nodes, key=lambda x: x["compute_weight"])[
+                "split_degree"
+            ]
+        else:
+            attn_split = 1
 
-    # Assume one activation send between consecutive stages per token
-    act = model.act_bytes_per_token
-    stage_xfer = [0.0]
-    for i in range(1, k):
-        a = devices_ordered[i - 1].name
-        b = devices_ordered[i].name
-        stage_xfer.append(net.xfer_time_s(act, a, b))
+        if ffn_nodes:
+            ffn_split = max(ffn_nodes, key=lambda x: x["compute_weight"])[
+                "split_degree"
+            ]
+        else:
+            ffn_split = 1
 
-    stage_times = [stage_compute[0]] + [
-        stage_compute[i] + stage_xfer[i] for i in range(1, k)
-    ]
-    stage_time = max(stage_times)
-    bubbles = sum(stage_times) - stage_time
-    total = bubbles + stage_time * gen_tokens
+        optimal_strategies[f"device_{partition_id}"] = {
+            "attention_split": attn_split,
+            "ffn_split": ffn_split,
+        }
 
-    return {
-        "policy": "metis",
-        "stages": [
-            {
-                "device": devices_ordered[i].name,
-                "layers": parts_ordered[i],
-                "compute_s": stage_compute[i],
-                "inbound_xfer_s": stage_xfer[i],
-            }
-            for i in range(k)
-        ],
-        "per_token_s_steady": stage_time,
-        "total_latency_s": total,
-        "notes": (
-            "Order by average layer index to form a pipeline; "
-            "METIS fallback is greedy if PyMetis unavailable."
-        ),
-    }
+    # Use the optimal strategy for tensor parallel simulation
+    best_strategy_key = min(
+        optimal_strategies.keys(),
+        key=lambda x: optimal_strategies[x]["attention_split"]
+        + optimal_strategies[x]["ffn_split"],
+    )
+    best_strategy = optimal_strategies[best_strategy_key]
+
+    # Run tensor parallel with the METIS-suggested strategy
+    result = simulate_tensor_parallel(
+        model,
+        net,
+        seq_len,
+        gen_tokens,
+        parallel_degree=min(k, best_strategy["attention_split"]),
+        attn_split_strategy=attn_split_strategy,
+        ffn_split_strategy=ffn_split_strategy,
+    )
+
+    result.update(
+        {
+            "policy": "metis",
+            "metis_partition_info": partition_result,
+            "optimal_strategies": optimal_strategies,
+            "selected_strategy": best_strategy,
+        }
+    )
+
+    return result
 
 
 # ------------------------------
@@ -876,7 +1100,6 @@ def simulate_metis(
 
 
 def compare_tensor_parallel_strategies(
-    devices: List[Device],
     model: ModelSpec,
     net: Network,
     seq_len: int,
@@ -904,7 +1127,6 @@ def compare_tensor_parallel_strategies(
     for attn_strategy, ffn_strategy in strategies:
         strategy_name = f"attn_{attn_strategy.name}_ffn_{ffn_strategy.name}"
         results[strategy_name] = simulate_tensor_parallel(
-            devices,
             model,
             net,
             seq_len,
@@ -918,7 +1140,6 @@ def compare_tensor_parallel_strategies(
 
 
 def run_experiments(
-    devices: List[Device],
     model: Optional[ModelSpec] = None,
     net: Optional[Network] = None,
     seq_len: int = 512,
@@ -933,68 +1154,38 @@ def run_experiments(
 
     results = {}
     # Single node (fastest device)
-    fastest = max(devices, key=lambda d: d.gflops * d.efficiency)
-    results["single_node"] = simulate_single_node(fastest, model, seq_len, gen_tokens)
+    results["single_node"] = simulate_single_node(model, net, seq_len, gen_tokens)
 
     # Pipeline (use all devices)
-    results["pipeline"] = simulate_pipeline(devices, model, net, seq_len, gen_tokens)
+    results["pipeline"] = simulate_pipeline(model, net, seq_len, gen_tokens)
 
     # Tensor (use all devices)
-    results["tensor"] = simulate_tensor_parallel(
-        devices, model, net, seq_len, gen_tokens
-    )
+    results["tensor"] = simulate_tensor_parallel(model, net, seq_len, gen_tokens)
 
     # METIS
-    results["metis"] = simulate_metis(devices, model, net, seq_len, gen_tokens)
+    results["metis"] = simulate_metis(model, net, seq_len, gen_tokens)
     return results
 
 
 if __name__ == "__main__":
     # Example: 4 heterogeneous Raspberry Pi-like devices
+    CLIENT = Device("client", gflops=170.0, memory_gb=16.0)
     SERVERS = [
-        Device(
-            "rpi-1",
-            gflops=12.5,
-            memory_gb=4.0,
-            net_bw_mbps=300,
-            net_rtt_ms=12,
-            efficiency=0.55,
-        ),
-        Device(
-            "rpi-2",
-            gflops=10.0,
-            memory_gb=2.0,
-            net_bw_mbps=250,
-            net_rtt_ms=15,
-            efficiency=0.5,
-        ),
-        Device(
-            "rpi-3",
-            gflops=7.5,
-            memory_gb=2.0,
-            net_bw_mbps=200,
-            net_rtt_ms=18,
-            efficiency=0.5,
-        ),
-        Device(
-            "rpi-4",
-            gflops=5.0,
-            memory_gb=1.0,
-            net_bw_mbps=150,
-            net_rtt_ms=20,
-            efficiency=0.45,
-        ),
+        Device("rpi-1", gflops=12.5, memory_gb=4.0),
+        Device("rpi-2", gflops=10.0, memory_gb=2.0),
+        Device("rpi-3", gflops=7.5, memory_gb=2.0),
+        Device("rpi-4", gflops=5.0, memory_gb=1.0),
     ]
 
     # Shared wireless fabric
-    NET = Network(default_bw_mbps=200.0, default_rtt_ms=18.0)
+    NET = Network(CLIENT, SERVERS, default_bw_mbps=200.0, default_rtt_ms=18.0)
 
     # Model + workload
     MODEL = ModelSpec()
     SEQ_LEN = 512
     GEN_TOKENS = 64
 
-    res = run_experiments(SERVERS, MODEL, NET, SEQ_LEN, GEN_TOKENS)
+    res = run_experiments(MODEL, NET, SEQ_LEN, GEN_TOKENS)
     from pprint import pprint
 
     pprint(res)
