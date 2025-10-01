@@ -28,11 +28,9 @@ device performance parameters in LLM inference systems.
 """
 
 import time
-import warnings
+
 import argparse
 import numpy as np
-
-warnings.filterwarnings("ignore")
 
 
 def measure_matmul_gflops(sizes=None, warmup=3, runs=5):
@@ -59,8 +57,9 @@ def measure_matmul_gflops(sizes=None, warmup=3, runs=5):
         times = []
         for _ in range(runs):
             start = time.perf_counter()
-            C = A @ B  # pylint: disable=invalid-name,unused-variable
-            checksum = np.sum(C)  # Prevent optimization away
+            C = A @ B  # pylint: disable=invalid-name
+            # Prevent optimization away
+            checksum = np.sum(C)  # pylint: disable=unused-variable
             end = time.perf_counter()
             times.append(end - start)
 

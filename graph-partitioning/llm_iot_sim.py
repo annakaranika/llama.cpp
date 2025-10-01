@@ -23,7 +23,9 @@ Network model:
 from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
+import logging
 import math
+from pprint import pformat
 from typing import List, Dict, Tuple, Optional
 
 try:
@@ -32,6 +34,61 @@ try:
 except ImportError:
     pymetis = None
     CSRAdjacency = None
+
+# ------------------------------
+# Logging setup
+# ------------------------------
+
+
+def setup_logger(
+    name: str = "llm_iot_sim",
+    level: int = logging.INFO,
+    log_file: Optional[str] = None,
+    console: bool = True,
+) -> logging.Logger:
+    """
+    Setup logger for LLM IoT simulation.
+
+    Args:
+        name: Logger name
+        level: Logging level (DEBUG, INFO, WARNING, ERROR)
+        log_file: Optional file to write logs to
+        console: Whether to also log to console
+
+    Returns:
+        Configured logger instance
+    """
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+
+    # Clear any existing handlers to avoid duplicates
+    logger.handlers.clear()
+
+    # Create formatter
+    formatter = logging.Formatter(
+        fmt="%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    # Console handler
+    if console:
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(level)
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
+
+    # File handler
+    if log_file:
+        file_handler = logging.FileHandler(log_file, mode="a")
+        file_handler.setLevel(level)
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+
+    return logger
+
+
+# Create module-level logger
+LOGGER = setup_logger()
 
 
 # ------------------------------
@@ -302,7 +359,7 @@ class Network:
     If pairwise overrides are provided, they take precedence when computing link costs.
     """
 
-    client: Device = Device("client", gflops=15.0, memory_gb=4.0)
+    client: Optional[Device] = None
     servers: List[Device] = field(default_factory=list)
     default_bw_mbps: float = 300.0
     default_rtt_ms: float = 15.0
@@ -312,6 +369,10 @@ class Network:
     # Communication model parameters for centralized vs peer-to-peer
     client_bandwidth_mbps: float = 1000.0  # Client-server bandwidth
     client_rtt_ms: float = 10.0  # Client-server RTT
+
+    def __post_init__(self):
+        if self.client is None:
+            self.client = Device("client", gflops=15.0, memory_gb=4.0)
 
     def link(self, a: str, b: str) -> Tuple[float, float]:
         """
@@ -755,7 +816,7 @@ def simulate_tensor_parallel(
         "communication_model": model.communication_model.value,
         "k": k,
         "split_strategies": {
-            "attention": attn_split_strategy,
+            "attn": attn_split_strategy,
             "ffn": ffn_split_strategy,
         },
         "device_allocation": {
@@ -792,9 +853,10 @@ def simulate_tensor_parallel(
 def build_computation_graph(
     model: ModelSpec,
     net: Network,
+    seq_len: int,
     attn_split_strategy: AttentionSplitStrategy = AttentionSplitStrategy.KV_HEADS,
     ffn_split_strategy: FFNSplitStrategy = FFNSplitStrategy.KV_HEADS,
-) -> Tuple[List[int], List[List[int]], List[int], List[int], List[int]]:
+) -> Tuple[List[int], List[int], List[int], List[int], List[int], List[int]]:
     """
     Build a computation graph with separate attention and FFN blocks per layer.
 
@@ -805,12 +867,21 @@ def build_computation_graph(
     - Inter-block edges: single edge from attention[0] -> ffn[0] (activation transfer)
 
     Returns:
-        xadj: Adjacency list starts
-        adjncy: Adjacent nodes
-        eweights: Edge weights
-        node_types: Node type indicators (0=attn, 1=ffn)
-        node_splits: Which split each node represents
+    - xadj: Adjacency list starts
+    - adjncy: Adjacent nodes
+    - eweights: Edge weights
+    - node_types: Node type indicators (0=attn, 1=ffn)
+    - node_splits: Which split each node represents
+    - node_weights: Node weights based on computation flops
     """
+
+    LOGGER.info("Building computation graph for %s", model.name)
+    LOGGER.info(
+        "Strategies: attention=%s, ffn=%s",
+        attn_split_strategy.name,
+        ffn_split_strategy.name,
+    )
+
     k = len(net.servers)
     n_layers = model.num_layers
 
@@ -818,7 +889,7 @@ def build_computation_graph(
     max_attn_splits = (
         model.num_kv_heads
         if attn_split_strategy == AttentionSplitStrategy.KV_HEADS
-        else model.num_heads
+        else 1
     )
     max_ffn_splits = {
         FFNSplitStrategy.KV_HEADS: model.num_kv_heads,
@@ -826,17 +897,26 @@ def build_computation_graph(
         FFNSplitStrategy.HIDDEN_DIM: k,  # Can split arbitrarily across hidden dim
     }[ffn_split_strategy]
 
+    LOGGER.debug("Max splits: attention=%s, ffn=%s", max_attn_splits, max_ffn_splits)
+
     # Node layout: [
     #   layer_0_attn_0, layer_0_attn_1, ..., layer_0_ffn_0, layer_0_ffn_1, ..., layer_1_attn_0, ...
     # ]
     nodes_per_layer = max_attn_splits + max_ffn_splits
     total_nodes = n_layers * nodes_per_layer
 
+    LOGGER.info(
+        "Graph structure: %s total nodes, %s nodes per layer",
+        total_nodes,
+        nodes_per_layer,
+    )
+
     xadj = [0]  # Start of adjacency for each node
     adjncy = []  # Adjacent nodes
     eweights = []  # Edge weights
     node_types = []  # 0=attention, 1=ffn
-    node_splits = []  # Which split configuration this node represents
+    split_ids = []  # Split ID for each node (1-indexed within block type)
+    node_weights = []  # Node weights based on computation cost
 
     def get_node_id(layer: int, block_type: int, split_id: int) -> int:
         """Get global node ID for layer/block_type/split_id"""
@@ -852,49 +932,101 @@ def build_computation_graph(
             block_type = 0
             split_id = within_layer
             max_block_splits = max_attn_splits
+
+            # Compute attention cost for this split degree
+            device_kv_heads = model.num_kv_heads // max_attn_splits
+            device_q_heads = (model.num_heads // model.num_kv_heads) * device_kv_heads
+
+            compute_flops = model.attn_compute_flops(
+                seq_len, dev_num_heads=device_q_heads, dev_kv_heads=device_kv_heads
+            )
+
         else:
             # FFN node
             block_type = 1
             split_id = within_layer - max_attn_splits
             max_block_splits = max_ffn_splits
-        node_splits.append(split_id + 1)  # 1-indexed split degree
+
+            # Compute FFN cost for this split degree
+            ffn_fraction = 1.0 / max_ffn_splits
+            compute_flops = model.ffn_compute_flops(ffn_fraction=ffn_fraction)
+
+        node_weight = max(1, int(compute_flops))
+
+        split_ids.append(split_id)
         node_types.append(block_type)
+        node_weights.append(node_weight)
 
         nbrs = []  # Neighbor nodes
         wts = []  # Corresponding edge weights
 
         # 1. Intra-block edges (parallel nodes in same block incur extra communication cost)
-        for other_split in range(max_block_splits):
-            if other_split != split_id:
-                other_node = get_node_id(layer, block_type, other_split)
-                nbrs.append(other_node)
+        if split_id == 0:
+            for other_split_id in range(max_block_splits):
+                if other_split_id != split_id:
+                    other_node = get_node_id(layer, block_type, other_split_id)
+                    nbrs.append(other_node)
 
-                # Communication cost between attention nodes (tensor parallel all-reduce)
-                comm_cost = net.allreduce_communication_cost(
-                    model.allreduce_bytes_per_token,
-                    net.servers[: split_id + 1],
-                    model.communication_model,
-                )
-                edge_weight = max(1, int(comm_cost * 1000))
-                wts.append(edge_weight)
+                    # Communication cost between nodes (tensor parallel all-reduce)
+                    comm_cost = net.allreduce_communication_cost(
+                        model.allreduce_bytes_per_token,
+                        net.servers,
+                        model.communication_model,
+                    )
+                    edge_weight = max(1, int(comm_cost * 1000))
+                    wts.append(edge_weight)
+        else:
+            # Connect back to first split node
+            other_node = get_node_id(layer, block_type, 0)
+            nbrs.append(other_node)
+
+            comm_cost = net.allreduce_communication_cost(
+                model.allreduce_bytes_per_token,
+                net.servers,
+                model.communication_model,
+            )
+            edge_weight = max(1, int(comm_cost * 1000))
+            wts.append(edge_weight)
 
         if (  # 2. Inter-block edge (attention -> FFN within same layer)
             block_type == 0 and split_id == 0
         ):  # Only first attention node connects to first FFN node
             next_block_node = get_node_id(layer, 1, 0)
+            if layer > 0:
+                # Also connect from previous layer's FFN to this layer's attention
+                prev_block_node = get_node_id(layer - 1, 1, 0)
+            else:
+                prev_block_node = None
 
         elif (  # 3. Inter-layer edges (FFN -> next layer attention)
-            block_type == 1 and split_id == 0 and layer < n_layers - 1
+            block_type == 1 and split_id == 0
         ):  # Only first FFN node connects to next layer
-            next_block_node = get_node_id(layer + 1, 0, 0)
+            if layer < n_layers - 1:
+                next_block_node = get_node_id(layer + 1, 0, 0)
+            else:
+                next_block_node = None
+            prev_block_node = get_node_id(layer, 0, 0)  # From this layer's attention
+
         else:  # other block nodes
             next_block_node = None
+            prev_block_node = None
 
         if next_block_node is not None:
             nbrs.append(next_block_node)
 
             comm_cost = net.allreduce_communication_cost(
-                model.act_bytes_per_token,
+                model.allreduce_bytes_per_token,
+                net.servers[: max(max_attn_splits, max_ffn_splits)],
+                model.communication_model,
+            )
+            edge_weight = max(1, int(comm_cost * 1000))
+            wts.append(edge_weight)
+
+        if prev_block_node is not None:
+            nbrs.append(prev_block_node)
+
+            comm_cost = net.allreduce_communication_cost(
+                model.allreduce_bytes_per_token,
                 net.servers[: max(max_attn_splits, max_ffn_splits)],
                 model.communication_model,
             )
@@ -905,47 +1037,66 @@ def build_computation_graph(
         eweights.extend(wts)
         xadj.append(len(adjncy))
 
-    return xadj, adjncy, eweights, node_types, node_splits
+    def get_node_name(node_id: int) -> str:
+        """Get human-readable node name"""
+        layer = node_id // nodes_per_layer
+        within_layer = node_id % nodes_per_layer
+        if within_layer < max_attn_splits:
+            block_type = "attn"
+            split_id = within_layer
+        else:
+            block_type = "ffn"
+            split_id = within_layer - max_attn_splits
+        return f"layer_{layer}_{block_type}_{split_id}"
+
+    # Print first few nodes to show structure
+    LOGGER.debug("Building node adjacencies...")
+    for i in range(min(20, total_nodes)):
+        layer = i // nodes_per_layer
+        within_layer = i % nodes_per_layer
+        block_type = "attn" if within_layer < max_attn_splits else "ffn"
+        split_id = (
+            within_layer
+            if within_layer < max_attn_splits
+            else within_layer - max_attn_splits
+        )
+
+        neighbors = zip(
+            [get_node_name(node_id) for node_id in adjncy[xadj[i] : xadj[i + 1]]],
+            eweights[xadj[i] : xadj[i + 1]],
+        )
+
+        LOGGER.debug(
+            "Node %s: %s -> compute: %s, neighbors: %s",
+            i,
+            get_node_name(i),
+            node_weights[i],
+            list(neighbors),
+        )
+
+    if total_nodes > 20:
+        LOGGER.debug("... and %s more nodes", total_nodes - 20)
+
+    LOGGER.info(
+        "Graph construction complete: %s edges, %s nodes",
+        len(adjncy),
+        len(node_weights),
+    )
+
+    return xadj, adjncy, eweights, node_types, split_ids, node_weights
 
 
-def compute_node_weights(
-    model: ModelSpec,
-    devices: List[Device],
-    seq_len: int,
-    node_types: List[int],
-    node_splits: List[int],
-) -> List[int]:
+def device_constraints_for_metis(servers: List[Device]) -> List[float]:
     """
-    Compute node weights based on actual computation cost for each block type and split degree.
+    Compute device constraints for METIS.
+    Higher weight = device can handle more computation.
     """
-    node_weights = []
+    capacities = [s.gflops for s in servers]
+    # Set target partition weights based on device capacities
+    total_capacity = sum(capacities)
+    weights = [w / total_capacity for w in capacities]
 
-    for block_type, split_degree in zip(node_types, node_splits):
-        if block_type == 0:  # Attention block
-            # Compute attention cost for this split degree
-            device_kv_heads = model.num_kv_heads // split_degree
-            device_q_heads = (model.num_heads // model.num_kv_heads) * device_kv_heads
-
-            attn_flops = model.attn_compute_flops(
-                seq_len, dev_num_heads=device_q_heads, dev_kv_heads=device_kv_heads
-            )
-
-            # Use average device performance
-            avg_device_perf = sum(d.gflops for d in devices) / len(devices)
-            compute_time = attn_flops / (avg_device_perf * 1e9)
-
-        else:  # FFN block
-            # Compute FFN cost for this split degree
-            ffn_fraction = 1.0 / split_degree
-            ffn_flops = model.ffn_compute_flops(ffn_fraction=ffn_fraction)
-
-            avg_device_perf = sum(d.gflops for d in devices) / len(devices)
-            compute_time = ffn_flops / (avg_device_perf * 1e9)
-
-        node_weight = max(1, int(compute_time * 1000))
-        node_weights.append(node_weight)
-
-    return node_weights
+    return weights
 
 
 def metis_partition_computation_blocks(
@@ -961,7 +1112,11 @@ def metis_partition_computation_blocks(
     Return partitions optimized for the specified communication model.
     If PyMetis is not available, fall back to a greedy balancer by compute.
     """
+
+    LOGGER.info("Starting METIS partitioning")
+
     k = len(net.servers)
+    LOGGER.info("Partitioning into %s parts for %s devices", k, len(net.servers))
 
     if pymetis is None or CSRAdjacency is None:
         # Fallback: contiguous greedy like pipeline
@@ -978,34 +1133,50 @@ def metis_partition_computation_blocks(
         return {"partitions": parts}
 
     # Build computation graph
-    xadj, adjncy, eweights, node_types, node_splits = build_computation_graph(
-        model, net, attn_split_strategy, ffn_split_strategy
+    LOGGER.debug("Building computation graph...")
+    xadj, adjncy, edge_weights, node_types, split_ids, node_weights = (
+        build_computation_graph(
+            model, net, seq_len, attn_split_strategy, ffn_split_strategy
+        )
     )
 
-    # Compute node weights
-    node_weights = compute_node_weights(
-        model, net.servers, seq_len, node_types, node_splits
+    # Compute device capacity weights
+    target_partition_weights = device_constraints_for_metis(net.servers)
+    LOGGER.info(
+        "Device capacity weights: %s",
+        [
+            f"{net.servers[i].name}={w:.3f}"
+            for i, w in enumerate(target_partition_weights)
+        ],
     )
 
     # Run METIS partitioning
+    LOGGER.info("Running METIS graph partitioning...")
+
     csr = CSRAdjacency(adj_starts=xadj, adjacent=adjncy)
     _, assignment = pymetis.part_graph(
-        k, adjacency=csr, vweights=node_weights, eweights=eweights
+        k,
+        adjacency=csr,
+        vweights=node_weights,
+        eweights=edge_weights,
+        tpwgts=target_partition_weights,
     )
+    LOGGER.info("METIS partitioning completed successfully")
 
     # Analyze the partitioning results
     partitions = [[] for _ in range(k)]
     for node_id, partition_id in enumerate(assignment):
         layer = node_id // (len(node_types) // model.num_layers)
         block_type = node_types[node_id]
-        split_degree = node_splits[node_id]
+        split_id = split_ids[node_id]
 
         partitions[partition_id].append(
             {
                 "node_id": node_id,
+                "node_name": f"layer_{layer}_{'attn' if block_type == 0 else 'ffn'}_{split_id}",
                 "layer": layer,
-                "block_type": "attention" if block_type == 0 else "ffn",
-                "split_degree": split_degree,
+                "block_type": "attn" if block_type == 0 else "ffn",
+                "split_id": split_id,
                 "compute_weight": node_weights[node_id],
             }
         )
@@ -1032,66 +1203,292 @@ def simulate_metis(
     """
     Enhanced METIS simulation with attention/FFN block structure.
     """
-    k = len(net.servers)
     partition_result = metis_partition_computation_blocks(
         model, net, seq_len, attn_split_strategy, ffn_split_strategy
     )
 
-    # Extract optimal split strategies from METIS results
-    optimal_strategies = {}
-    for partition_id, nodes in enumerate(partition_result["partitions"]):
-        attention_nodes = [n for n in nodes if n["block_type"] == "attention"]
-        ffn_nodes = [n for n in nodes if n["block_type"] == "ffn"]
+    devices = net.servers
+    partitions = partition_result["partitions"]
 
-        # Find most common split degrees (METIS might prefer specific splits)
-        if attention_nodes:
-            attn_split = max(attention_nodes, key=lambda x: x["compute_weight"])[
-                "split_degree"
-            ]
-        else:
-            attn_split = 1
+    LOGGER.debug("Computing device workloads from partition assignments...")
 
-        if ffn_nodes:
-            ffn_split = max(ffn_nodes, key=lambda x: x["compute_weight"])[
-                "split_degree"
-            ]
-        else:
-            ffn_split = 1
+    # Compute per-device workload from actual partition assignments
+    device_compute_times = []
+    device_workloads = []
 
-        optimal_strategies[f"device_{partition_id}"] = {
-            "attention_split": attn_split,
-            "ffn_split": ffn_split,
-        }
+    for device_idx, partition_nodes in enumerate(partitions):
+        if not partition_nodes:
+            device_compute_times.append(0.0)
+            device_workloads.append(
+                {
+                    "total_flops": 0,
+                    "attention_blocks": 0,
+                    "ffn_blocks": 0,
+                    "layers_involved": set(),
+                }
+            )
+            continue
 
-    # Use the optimal strategy for tensor parallel simulation
-    best_strategy_key = min(
-        optimal_strategies.keys(),
-        key=lambda x: optimal_strategies[x]["attention_split"]
-        + optimal_strategies[x]["ffn_split"],
+        device = devices[device_idx]
+        total_flops = 0
+        attention_blocks = 0
+        ffn_blocks = 0
+        layers_involved = set()
+
+        # Sum up computation from assigned nodes
+        for node in partition_nodes:
+            total_flops += node["compute_weight"]
+            layers_involved.add(node["layer"])
+
+            if node["block_type"] == "attn":
+                attention_blocks += 1
+            else:
+                ffn_blocks += 1
+
+        # Convert METIS weights back to actual FLOPs (reverse the scaling)
+        actual_flops = total_flops  # Already in the right units from graph construction
+        compute_time = device.compute_time_s(actual_flops)
+
+        device_compute_times.append(compute_time)
+        device_workloads.append(
+            {
+                "total_flops": actual_flops,
+                "attention_blocks": attention_blocks,
+                "ffn_blocks": ffn_blocks,
+                "layers_involved": layers_involved,
+                "nodes_assigned": len(partition_nodes),
+            }
+        )
+
+    # Compute communication costs from graph structure
+    LOGGER.debug("Analyzing communication costs...")
+    communication_costs = analyze_metis_communication_costs(
+        partition_result, model, net, seq_len
     )
-    best_strategy = optimal_strategies[best_strategy_key]
 
-    # Run tensor parallel with the METIS-suggested strategy
-    result = simulate_tensor_parallel(
-        model,
-        net,
-        seq_len,
-        gen_tokens,
-        parallel_degree=min(k, best_strategy["attention_split"]),
-        attn_split_strategy=attn_split_strategy,
-        ffn_split_strategy=ffn_split_strategy,
+    LOGGER.info(
+        "Communication analysis: %s cross-partition edges",
+        communication_costs["cross_partition_edges"],
     )
 
-    result.update(
-        {
-            "policy": "metis",
-            "metis_partition_info": partition_result,
-            "optimal_strategies": optimal_strategies,
-            "selected_strategy": best_strategy,
-        }
+    # Per-layer timing: max across devices (synchronous execution)
+    per_layer_compute_time = max(device_compute_times) if device_compute_times else 0.0
+    total_compute_time = per_layer_compute_time * model.num_layers
+
+    # Communication happens per layer as well
+    per_layer_comm_time = communication_costs["per_layer_total"]
+    total_comm_time = per_layer_comm_time * model.num_layers
+
+    # Total per-token time
+    per_token_time = total_compute_time + total_comm_time
+    total_latency = per_token_time * gen_tokens
+
+    # Load balance analysis
+    compute_time_std = std_times(device_compute_times)
+    load_balance_efficiency_val = efficiency(device_compute_times)
+
+    # Memory analysis - estimate based on assigned blocks
+    memory_usage = estimate_metis_memory_usage(partitions, model, seq_len)
+
+    return {
+        "policy": "metis",
+        # "partition_info": partition_result,
+        "device_workloads": {
+            devices[i].name: {
+                **device_workloads[i],
+                "compute_time_s": device_compute_times[i],
+                "memory_usage_gb": memory_usage[i],
+            }
+            for i in range(len(devices))
+        },
+        "timing_analysis": {
+            "per_layer_compute_s": per_layer_compute_time,
+            "per_layer_communication_s": per_layer_comm_time,
+            "total_compute_s": total_compute_time,
+            "total_communication_s": total_comm_time,
+            "per_token_s": per_token_time,
+        },
+        "communication_breakdown": communication_costs,
+        "efficiency_metrics": {
+            "load_balance_efficiency": load_balance_efficiency_val,
+            "compute_time_std": compute_time_std,
+            "devices_utilized": sum(
+                1 for w in device_workloads if w["total_flops"] > 0
+            ),
+        },
+        "total_latency_s": total_latency,
+        "notes": (
+            f"METIS partitioning with {len(partitions)} devices. "
+            f"Load balance efficiency: {load_balance_efficiency_val:.3f}. "
+            f"Communication pattern derived from graph structure."
+        ),
+    }
+
+
+def analyze_metis_communication_costs(
+    partition_result: Dict,
+    model: ModelSpec,
+    net: Network,
+    seq_len: int,
+) -> Dict:
+    """
+    Analyze communication costs from METIS partition by examining
+    cross-partition edges in the computation graph.
+    """
+    partitions = partition_result["partitions"]
+
+    # Build partition assignment mapping: node_id -> device_id
+    node_to_device = {}
+    node_names = {}
+    for device_idx, partition_nodes in enumerate(partitions):
+        for node in partition_nodes:
+            node_to_device[node["node_id"]] = device_idx
+            node_names[node["node_id"]] = node["node_name"]
+
+    # Rebuild the graph to analyze cross-partition communication
+    xadj, adjncy, edge_weights, node_types, _, node_weights = build_computation_graph(
+        model, net, seq_len
     )
 
-    return result
+    # Identify cross-partition edges (communication requirements)
+    intra_partition_edges = []
+    cross_partition_edges = []
+
+    for node_id in range(len(node_weights)):
+        if node_id not in node_to_device:
+            continue
+
+        source_device = node_to_device[node_id]
+
+        # Check all neighbors of this node
+        start_idx = xadj[node_id]
+        end_idx = xadj[node_id + 1]
+
+        for adj_idx in range(start_idx, end_idx):
+            neighbor_id = adjncy[adj_idx]
+            edge_weight = edge_weights[adj_idx]
+
+            if neighbor_id not in node_to_device:
+                continue
+
+            neighbor_device = node_to_device[neighbor_id]
+
+            edge_info = {
+                "source_node": node_names[node_id],
+                "target_node": node_names[neighbor_id],
+                "source_device": source_device,
+                "target_device": neighbor_device,
+                "weight": edge_weight,
+                "source_type": "attn" if node_types[node_id] == 0 else "ffn",
+                "target_type": "attn" if node_types[neighbor_id] == 0 else "ffn",
+            }
+
+            if source_device == neighbor_device:
+                intra_partition_edges.append(edge_info)
+            else:
+                cross_partition_edges.append(edge_info)
+
+    # Compute communication costs
+    total_cross_partition_cost = 0.0
+    device_pair_costs = {}
+
+    for edge in cross_partition_edges:
+        # Convert METIS edge weight back to actual communication cost
+        # (reverse the scaling from build_computation_graph)
+        actual_comm_cost = edge["weight"] / 1000.0  # We scaled by 1000
+        total_cross_partition_cost += actual_comm_cost
+
+        # Track costs between device pairs
+        device_pair = (edge["source_device"], edge["target_device"])
+        if device_pair not in device_pair_costs:
+            device_pair_costs[device_pair] = 0.0
+        device_pair_costs[device_pair] += actual_comm_cost
+
+    return {
+        "cross_partition_edges": len(cross_partition_edges),
+        "intra_partition_edges": len(intra_partition_edges),
+        "per_layer_total": total_cross_partition_cost,
+        "device_pair_costs": device_pair_costs,
+        "communication_pattern": {
+            "attention_to_ffn": len(
+                [
+                    e
+                    for e in cross_partition_edges
+                    if e["source_type"] == "attn" and e["target_type"] == "ffn"
+                ]
+            ),
+            "ffn_to_attention": len(
+                [
+                    e
+                    for e in cross_partition_edges
+                    if e["source_type"] == "ffn" and e["target_type"] == "attn"
+                ]
+            ),
+            "attention_to_attention": len(
+                [
+                    e
+                    for e in cross_partition_edges
+                    if e["source_type"] == "attn" and e["target_type"] == "attn"
+                ]
+            ),
+            "ffn_to_ffn": len(
+                [
+                    e
+                    for e in cross_partition_edges
+                    if e["source_type"] == "ffn" and e["target_type"] == "ffn"
+                ]
+            ),
+        },
+        "edge_details": cross_partition_edges[:10],  # First 10 for debugging
+    }
+
+
+def estimate_metis_memory_usage(
+    partitions: List[List[Dict]], model: ModelSpec, seq_len: int
+) -> List[float]:
+    """
+    Estimate memory usage per device based on METIS partition assignments.
+    """
+    memory_usage = []
+
+    for partition_nodes in partitions:
+        if not partition_nodes:
+            memory_usage.append(0.0)
+            continue
+
+        # Count attention and FFN blocks assigned to this device
+        attention_blocks = sum(
+            1 for node in partition_nodes if node["block_type"] == "attn"
+        )
+        ffn_blocks = sum(1 for node in partition_nodes if node["block_type"] == "ffn")
+
+        # Estimate model weights memory
+        # Rough approximation: each attention/FFN block needs model parameters
+        layers_involved = len(set(node["layer"] for node in partition_nodes))
+
+        # Model parameters (very rough estimate)
+        params_per_attn_block = (
+            model.d_model * model.d_k * model.num_heads * 4
+        )  # Q,K,V,O projections
+        params_per_ffn_block = model.d_model * model.d_ff * 2  # up + down projections
+
+        total_params = (
+            attention_blocks * params_per_attn_block + ffn_blocks * params_per_ffn_block
+        )
+        param_memory_gb = total_params * 4 / (1024**3)  # FP32
+
+        # KV cache memory (scales with layers involved and sequence length)
+        kv_cache_gb = (
+            layers_involved * seq_len * model.num_kv_heads * model.d_k * 2 * 4
+        ) / (1024**3)
+
+        # Activation memory (rough estimate)
+        activation_gb = layers_involved * seq_len * model.d_model * 4 / (1024**3)
+
+        total_memory = param_memory_gb + kv_cache_gb + activation_gb
+        memory_usage.append(total_memory)
+
+    return memory_usage
 
 
 # ------------------------------
@@ -1144,13 +1541,26 @@ def run_experiments(
     net: Optional[Network] = None,
     seq_len: int = 512,
     gen_tokens: int = 64,
+    log_level: int = logging.INFO,
+    log_file: Optional[str] = None,
 ) -> Dict[str, Dict]:
     """
     Run all policies on the given device set.
     Returns a dict of results keyed by policy.
     """
+    # Setup logger for this experiment run
+    exp_logger = setup_logger(level=log_level, log_file=log_file)
+
+    exp_logger.info("=" * 60)
+    exp_logger.info("Starting LLM IoT simulation experiments")
+    exp_logger.info("=" * 60)
+
     model = model or ModelSpec()
     net = net or Network()
+
+    exp_logger.info("Model: %s (%s layers)", model.name, model.num_layers)
+    exp_logger.info("Devices: %s", [d.name + f"({d.gflops}GF)" for d in net.servers])
+    exp_logger.info("Workload: %s context + %s generation tokens", seq_len, gen_tokens)
 
     results = {}
     # Single node (fastest device)
@@ -1164,17 +1574,20 @@ def run_experiments(
 
     # METIS
     results["metis"] = simulate_metis(model, net, seq_len, gen_tokens)
+
+    LOGGER.info("Experiment results:\n%s", pformat(results, width=100, depth=3))
+
     return results
 
 
 if __name__ == "__main__":
     # Example: 4 heterogeneous Raspberry Pi-like devices
-    CLIENT = Device("client", gflops=170.0, memory_gb=16.0)
+    CLIENT = Device("client", gflops=100.0, memory_gb=16.0)
     SERVERS = [
         Device("rpi-1", gflops=12.5, memory_gb=4.0),
         Device("rpi-2", gflops=10.0, memory_gb=2.0),
-        Device("rpi-3", gflops=7.5, memory_gb=2.0),
-        Device("rpi-4", gflops=5.0, memory_gb=1.0),
+        Device("rpi-3", gflops=5.5, memory_gb=2.0),
+        Device("rpi-4", gflops=0.4, memory_gb=1.0),
     ]
 
     # Shared wireless fabric
@@ -1185,7 +1598,11 @@ if __name__ == "__main__":
     SEQ_LEN = 512
     GEN_TOKENS = 64
 
-    res = run_experiments(MODEL, NET, SEQ_LEN, GEN_TOKENS)
-    from pprint import pprint
+    import datetime
 
-    pprint(res)
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    LOG_FILE = f"llm_iot_sim_{timestamp}.log"
+    # res = simulate_metis(
+    #     MODEL, NET, SEQ_LEN, GEN_TOKENS  # , ffn_split_strategy=FFNSplitStrategy.Q_HEADS
+    # )
+    res = run_experiments(MODEL, NET, SEQ_LEN, GEN_TOKENS, log_file=LOG_FILE)
