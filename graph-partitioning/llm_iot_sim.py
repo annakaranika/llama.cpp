@@ -103,6 +103,14 @@ class CommunicationModel(Enum):
     PEER_TO_PEER = "peer_to_peer"  # Servers communicate directly
 
 
+class PeerToPeerPolicy(Enum):
+    """Peer-to-peer communication pattern."""
+
+    ALL_TO_ALL = "all_to_all"  # All-to-all all-reduce
+    RING = "ring"  # Ring all-reduce
+    HIERARCHICAL = "hierarchical"  # Hierarchical all-reduce
+
+
 class AttentionSplitStrategy(Enum):
     """How to split attention heads across devices."""
 
@@ -161,12 +169,11 @@ class ModelSpec:
         d_ff (int): Feed-forward network hidden dimension
         communication_model (CommunicationModel): Communication pattern for distributed inference
         vocab_size (int): Size of the model's vocabulary
-        attn_flops_coeff (float): Coefficient for attention linear operations FLOPs estimation
-        attn_quadratic_coeff (float): Coefficient for attention quadratic complexity FLOPs
-        ffn_flops_coeff (float): Coefficient for feed-forward network FLOPs estimation
-        act_bytes_per_token (int): Activation transfer size in bytes per token at layer boundaries
-        allreduce_bytes_per_token (int): Collective communication payload per token per layer
+        activation_bytes (int): Activation transfer size in bytes per token at layer boundaries
+        attn_allreduce_bytes (int): Collective communication payload per token per layer for attention
         kv_bytes_per_token_per_layer (int): KV cache memory usage per token per layer
+        ffn_allreduce_bytes (int): Collective communication payload per token per layer for FFN
+        output_allreduce_bytes (int): Collective communication payload per token for output logits
 
     Methods:
         layer_compute_flops_per_token(seq_len): Estimates FLOPs per token per layer
@@ -181,27 +188,22 @@ class ModelSpec:
     num_layers: int = 23  # includes output layer
     num_heads: int = 32
     num_kv_heads: int = 4
-    d_model: int = 2048
+    d_model: int = 2048  # vector size
     d_k: int = 64  # per-head
-    d_ff: int = 5632
+    d_ff: int = 5632  # hidden size
     communication_model: CommunicationModel = CommunicationModel.CENTRALIZED
     vocab_size: int = 32000
 
-    # Coefficients for cost modeling (FLOPs per token per layer)
-    # Very rough, tweak to calibrate against your measurements:
-    attn_flops_coeff: float = 6.0  # scales ~ O(seq_len * d_model * num_heads)
-    attn_quadratic_coeff: float = 1e-3  # scales ~ O(seq_len^2 * d_model) for qk matmul
-    ffn_flops_coeff: float = 12.0  # scales ~ O(d_model * d_ff)
     # Activation transfer size per boundary (in bytes) per token:
-    act_bytes_per_token: int = 4 * 2048  # float32 * d_model by default
+    activation_bytes: int = 4 * d_model  # float32 * d_model by default
 
     # Collective (tensor-parallel) all-reduce payload per layer & token (approx activations)
-    allreduce_bytes_per_token: int = 4 * 2048
+    attn_allreduce_bytes: int = 4 * d_model  # Attention output sync
+    ffn_allreduce_bytes: int = 4 * d_model  # FFN output sync
+    output_allreduce_bytes: int = 4 * vocab_size  # Final logits sync
 
-    # KV cache bytes per token per layer (read/written). Used for seq_len dependence in gen.
-    kv_bytes_per_token_per_layer: int = (
-        2 * 4 * 2048
-    )  # (K,V) * float32 * d_model (very rough)
+    # KV cache bytes per head. Used for seq_len dependence in generation
+    kv_bytes_per_head: int = 2 * 4 * d_k  # (K,V) * float32 * d_k
 
     def attn_compute_flops(
         self,
@@ -211,6 +213,45 @@ class ModelSpec:
     ) -> float:
         """
         Compute attention compute flops given sequence length and heads.
+
+        Attention Architecture Flow:
+        Input:  [batch, seq_len, d_model]                       # 2048 dim
+        ↓
+        Q projection:  d_model → num_heads    * d_k             # 2048 → 32 * 64 = 2048
+        K projection:  d_model → num_kv_heads * d_k             # 2048 →  4 * 64 = 256
+        V projection:  d_model → num_kv_heads * d_k             # 2048 →  4 * 64 = 256
+        ↓
+        Reshape: Q=[batch, seq_len, num_heads, d_k]             # [B, 512, 32, 64]
+                 K=[batch, seq_len, num_kv_heads, d_k]          # [B, 512,  4, 64]
+                 V=[batch, seq_len, num_kv_heads, d_k]          # [B, 512,  4, 64]
+        ↓
+        Expand K,V: K=[batch, seq_len, num_heads, d_k]          # [B, 512, 32, 64] (GQA: repeat each KV head 8x)  # pylint: disable=line-too-long
+                    V=[batch, seq_len, num_heads, d_k]          # [B, 512, 32, 64]
+        ↓
+        Attention scores: Q @ K^T                               # [32, 512, 64] @ [32, 64, 512] = [32, 512, 512]  # pylint: disable=line-too-long
+        ↓                                                       # seq_len² scaling! Memory + compute intensive  # pylint: disable=line-too-long
+        Scale: scores / √d_k                                    # [32, 512, 512] / 8.0
+        ↓
+        Softmax: softmax(scores)                                # [32, 512, 512] row-wise softmax
+        ↓
+        Weighted sum: softmax_scores @ V                        # [32, 512, 512] @ [32, 512, 64] = [32, 512, 64]  # pylint: disable=line-too-long
+        ↓
+        Concatenate heads: [batch, seq_len, num_heads * d_k]    # [B, 512, 32*64] = [B, 512, 2048]
+        ↓
+        Output projection: (num_heads * d_k) → d_model          # 2048 → 2048
+        ↓
+        Output: [batch, seq_len, d_model]                       # 2048 dim (same as input)
+
+        Key computational costs:
+        - Linear projections: O(seq_len * d_model²)             # Q,K,V,O projections
+        - Attention matrix: O(seq_len² * d_model)               # QK^T + softmax + attn@V
+        - Memory: O(seq_len² * num_heads) for scores            # Attention matrix storage
+
+        GQA (Grouped Query Attention) optimization:
+        - num_kv_heads < num_heads (4 vs 32 in TinyLlama)
+        - Each KV head serves multiple Q heads (8 Q heads per KV head)
+        - Reduces KV cache memory: 4x instead of 32x storage
+        - Same attention quality with less memory bandwidth
         """
         device_q_heads = dev_num_heads if dev_num_heads is not None else self.num_heads
         device_kv_heads = (
@@ -218,36 +259,53 @@ class ModelSpec:
         )
 
         # Attention FLOPs based on head allocation
+
         # Q projection scales with Q heads assigned to this device
-        q_proj_flops = self.attn_flops_coeff * self.d_model * device_q_heads * self.d_k
+        # Q projection: [seq_len, d_model] @ [d_model, device_q_heads * d_k]
+        q_proj_flops = seq_len * self.d_model * (device_q_heads * self.d_k)
 
         # K, V projections scale with KV heads assigned to this device
-        kv_proj_flops = (
-            2 * self.attn_flops_coeff * self.d_model * device_kv_heads * self.d_k
-        )
+        # K,V projections: [seq_len, d_model] @ [d_model, device_kv_heads * d_k]
+        kv_proj_flops = 2 * seq_len * self.d_model * (device_kv_heads * self.d_k)
 
         # Attention computation (QK^T, softmax, attention*V) scales with Q heads
+        # QK^T multiplication: [seq_len, device_q_heads * d_k] @ [device_kv_heads * d_k, seq_len]
+        # Softmax: Applied over seq_len dimension
+        # Attentio@V: [seq_len, seq_len] @ [seq_len, device_kv_heads * d_k]
         q_fraction = device_q_heads / self.num_heads
-        attn_compute_flops = (
-            self.attn_quadratic_coeff * (seq_len**2) * self.d_model * q_fraction
-        )
+        attn_compute_flops = (seq_len**2) * self.d_model * q_fraction
 
         # Output projection scales with Q heads (determines output size)
-        out_proj_flops = (
-            self.attn_flops_coeff * self.d_model * device_q_heads * self.d_k
-        )
+        # Out projection: [seq_len, device_q_heads * d_k] @ [device_q_heads * d_k, d_model]
+        out_proj_flops = seq_len * self.d_model * (device_q_heads * self.d_k)
 
         total_attn_flops = (
             q_proj_flops + kv_proj_flops + attn_compute_flops + out_proj_flops
         )
         return total_attn_flops
 
-    def ffn_compute_flops(self, ffn_fraction: float = 1.0) -> float:
+    def ffn_compute_flops(self, seq_len: int, ffn_fraction: float = 1.0) -> float:
         """
         Compute FFN compute flops given FFN fraction.
+        FFN has two linear layers: d_model → d_ff → d_model (up + down proj)
+
+        Input:  [batch, seq_len, d_model]     # 2048 dim
+        ↓
+        Up projection:   d_model → d_ff       # 2048 → 5632
+        ↓
+        Activation (GeLU, SwiGLU, etc.)       # elementwise, usually negligible
+        ↓
+        Down projection: d_ff → d_model       # 5632 → 2048
+        ↓
+        Output: [batch, seq_len, d_model]     # 2048 dim (same as input)
         """
-        ffn_flops = self.ffn_flops_coeff * self.d_model * self.d_ff * ffn_fraction
-        return ffn_flops
+        # Up projection: [seq_len, d_model] @ [d_model, d_ff] → seq_len * d_model * d_ff
+        up_proj_flops = seq_len * self.d_model * self.d_ff * ffn_fraction
+
+        # Down projection: [seq_len, d_ff] @ [d_ff, d_model] → seq_len * d_ff * d_model (same as up)
+        down_proj_flops = seq_len * self.d_ff * self.d_model * ffn_fraction
+
+        return up_proj_flops + down_proj_flops
 
     def layer_compute_flops(
         self,
@@ -264,7 +322,7 @@ class ModelSpec:
             dev_num_heads=dev_num_heads,
             dev_kv_heads=dev_kv_heads,
         )
-        ffn = self.ffn_compute_flops(ffn_fraction=ffn_fraction)
+        ffn = self.ffn_compute_flops(seq_len, ffn_fraction=ffn_fraction)
         return attn + ffn
 
     def layer_compute_cost_per_device(
@@ -299,7 +357,9 @@ class ModelSpec:
                 dev_kv_heads=device_kv_heads,
             )
 
-            ffn_flops = self.ffn_compute_flops(ffn_fraction=device_ffn_fraction)
+            ffn_flops = self.ffn_compute_flops(
+                seq_len, ffn_fraction=device_ffn_fraction
+            )
 
             total_flops = attn_flops + ffn_flops
             compute_time = device.compute_time_s(total_flops)
@@ -325,11 +385,9 @@ class ModelSpec:
         for i in range(len(devices)):
             # KV cache memory for assigned KV heads
             kv_heads = device_kv_counts[i] if device_kv_counts else self.num_kv_heads
-            kv_cache_bytes = (
-                kv_heads * self.d_k * 2 * 4 * seq_len
-            )  # (K,V) * d_k * float32 * seq_len
+            kv_cache_bytes = kv_heads * self.kv_bytes_per_head * seq_len
 
-            # Model weights (rough estimate)
+            # Model weights
             # Attention weights: Q + K + V + output projections
             q_heads = device_kv_counts[i] if device_kv_counts else self.num_heads
             attn_weights = (
@@ -482,70 +540,88 @@ class Network:
 
         return total_time
 
-    def allreduce_communication_cost(
+    def allreduce_communication_cost(  # pylint: disable=too-many-locals
         self,
         tensor_size_bytes: float,
-        devices: List[Device],
+        servers: List[Device],
         communication_model: CommunicationModel,
     ) -> float:
         """Compute communication cost based on the model type and actual pairwise links."""
-        num_servers = len(devices)
+        num_servers = len(servers)
 
         if communication_model == CommunicationModel.CENTRALIZED:
-            # Actual RPC sequence: Graph Compute -> Get Tensor -> Add Data Compute Graph
+            # Actual RPC sequence:
+            #   Graph Compute
+            #   -> num_servers x {Set Partial Tensor -> Add Data Compute Graph -> Get Partial Tensor}
+            #   -> Set Final Aggregated Tensor
+            add_graph_size = 512  # bytes for simple add op graph
+            block_graph_size = 1024  # bytes for small compute graph
             total_cost = 0.0
 
             # Phase 1: Client sends graph compute request to all servers (parallel)
             max_graph_compute_time = 0.0
-            for _ in devices:
+            for _ in servers:
                 # Graph compute request (serialized subgraph + tensor descriptors)
                 # Estimate ~1KB for small subgraph + tensor metadata per server
-                request_size = 1024  # bytes for serialized graph
                 request_time = (
-                    request_size * 8.0 / (self.client_bandwidth_mbps * 1e6)
-                ) + (self.client_rtt_ms / 1000.0)
+                    block_graph_size * 8.0 / (self.client_bandwidth_mbps * 1e6)
+                ) + (self.client_rtt_ms / 2 / 1000.0)
                 # Response is just status (small)
-                response_time = self.client_rtt_ms / 1000.0
+                response_time = self.client_rtt_ms / 2 / 1000.0
                 graph_compute_time = request_time + response_time
                 max_graph_compute_time = max(max_graph_compute_time, graph_compute_time)
 
             total_cost += max_graph_compute_time
 
-            # Phase 2: Client requests partial tensor results from all servers (parallel)
-            max_get_tensor_time = 0.0
-            for _ in devices:
-                chunk_size = (
-                    tensor_size_bytes / num_servers
-                )  # Each server computed a chunk
+            # Phase 2: Client performs partial tensor summation with all servers (sequential)
+            sum_set_add_get_time = 0.0
+            for _ in servers:
+                # Set tensor request (tensor data)
+                partial_set_request_time = (
+                    tensor_size_bytes * 8.0 / (self.client_bandwidth_mbps * 1e6)
+                ) + (self.client_rtt_ms / 2 / 1000.0)
+                # Response is just status (small)
+                partial_set_response_time = self.client_rtt_ms / 2 / 1000.0
+                # Add tensor request (small tensor descriptor + add op graph)
+                add_request_time = (
+                    add_graph_size * 8.0 / (self.client_bandwidth_mbps * 1e6)
+                ) + (self.client_rtt_ms / 2 / 1000.0)
+                # Response is just status (small)
+                add_response_time = self.client_rtt_ms / 2 / 1000.0
                 # Get tensor request (small tensor descriptor)
-                request_time = self.client_rtt_ms / 1000.0
-                # Response contains the actual tensor chunk data
-                response_time = (
-                    chunk_size * 8.0 / (self.client_bandwidth_mbps * 1e6)
-                ) + (self.client_rtt_ms / 1000.0)
-                get_tensor_time = request_time + response_time
-                max_get_tensor_time = max(max_get_tensor_time, get_tensor_time)
+                partial_get_request_time = self.client_rtt_ms / 2 / 1000.0
+                # Response contains the actual tensor data
+                partial_get_response_time = (
+                    tensor_size_bytes * 8.0 / (self.client_bandwidth_mbps * 1e6)
+                ) + (self.client_rtt_ms / 2 / 1000.0)
+                per_server_time = (
+                    partial_set_request_time
+                    + partial_set_response_time
+                    + add_request_time
+                    + add_response_time
+                    + partial_get_request_time
+                    + partial_get_response_time
+                )
+                sum_set_add_get_time += per_server_time
 
-            total_cost += max_get_tensor_time
+            total_cost += sum_set_add_get_time
 
             # Phase 3: Client sends aggregated tensor back to all servers
             # for local storage/reduction (parallel)
-            max_allreduce_time = 0.0
-            for _ in devices:
+            max_final_set_time = 0.0
+            for _ in servers:
                 # All reduce compute graph request
                 # (simple addition graph for local all-reduce + full aggregated tensor)
-                graph_size = 512  # bytes for simple add op graph
+                # bytes for simple add op graph
                 request_time = (
-                    (graph_size + tensor_size_bytes)
-                    * 8.0
-                    / (self.client_bandwidth_mbps * 1e6)
-                ) + (self.client_rtt_ms / 1000.0)
+                    tensor_size_bytes * 8.0 / (self.client_bandwidth_mbps * 1e6)
+                ) + (self.client_rtt_ms / 2 / 1000.0)
                 # Response is just computation status
-                response_time = self.client_rtt_ms / 1000.0
-                allreduce_time = request_time + response_time
-                max_allreduce_time = max(max_allreduce_time, allreduce_time)
+                response_time = self.client_rtt_ms / 2 / 1000.0
+                final_set_time = request_time + response_time
+                max_final_set_time = max(max_final_set_time, final_set_time)
 
-            total_cost += max_allreduce_time
+            total_cost += max_final_set_time
 
             # Add synchronization barrier overhead (thread joins, etc.)
             sync_overhead = 0.001 * num_servers  # 1ms per server for coordination
@@ -556,7 +632,7 @@ class Network:
         # PEER_TO_PEER
         # Ring all-reduce using actual pairwise links
         return self.ring_allreduce_time_with_pairwise_links(
-            tensor_size_bytes, device_names=[d.name for d in devices]
+            tensor_size_bytes, device_names=[d.name for d in servers]
         )
 
 
@@ -663,7 +739,9 @@ def simulate_pipeline(
             stage_pairs.append(None)
 
     # Activation transfer times between stages per token
-    act = model.act_bytes_per_token
+    act = (
+        model.ffn_allreduce_bytes
+    )  # activation size per token at stage boundary (assumed after ffn)
     stage_xfer = []
     for pair in stage_pairs:
         if pair is None:
@@ -773,16 +851,15 @@ def simulate_tensor_parallel(
     compute_time = max(per_layer_compute_times) * model.num_layers
 
     # All-reduce cost per layer (assume 2 collectives per layer)
-    red_bytes = model.allreduce_bytes_per_token
 
-    # Attention all-reduce: always needed after attention computation
+    # Attention all-reduce: needed after attention computation
     attn_devices = [
         device
         for device, attn_frac in zip(devices, device_attn_fractions)
         if attn_frac > 0
     ]
     attn_comm_cost = net.allreduce_communication_cost(
-        red_bytes, attn_devices, model.communication_model
+        model.attn_allreduce_bytes, attn_devices, model.communication_model
     )
 
     # FFN all-reduce: needed after FFN computation
@@ -792,7 +869,7 @@ def simulate_tensor_parallel(
         if ffn_frac > 0
     ]
     ffn_comm_cost = net.allreduce_communication_cost(
-        red_bytes, ffn_devices, model.communication_model
+        model.ffn_allreduce_bytes, ffn_devices, model.communication_model
     )
 
     # Total communication per layer: attention + FFN collectives
@@ -932,6 +1009,7 @@ def build_computation_graph(
             block_type = 0
             split_id = within_layer
             max_block_splits = max_attn_splits
+            allreduce_bytes = model.attn_allreduce_bytes
 
             # Compute attention cost for this split degree
             device_kv_heads = model.num_kv_heads // max_attn_splits
@@ -946,10 +1024,11 @@ def build_computation_graph(
             block_type = 1
             split_id = within_layer - max_attn_splits
             max_block_splits = max_ffn_splits
+            allreduce_bytes = model.ffn_allreduce_bytes
 
             # Compute FFN cost for this split degree
             ffn_fraction = 1.0 / max_ffn_splits
-            compute_flops = model.ffn_compute_flops(ffn_fraction=ffn_fraction)
+            compute_flops = model.ffn_compute_flops(seq_len, ffn_fraction=ffn_fraction)
 
         node_weight = max(1, int(compute_flops))
 
@@ -969,7 +1048,7 @@ def build_computation_graph(
 
                     # Communication cost between nodes (tensor parallel all-reduce)
                     comm_cost = net.allreduce_communication_cost(
-                        model.allreduce_bytes_per_token,
+                        allreduce_bytes,
                         net.servers,
                         model.communication_model,
                     )
@@ -981,7 +1060,7 @@ def build_computation_graph(
             nbrs.append(other_node)
 
             comm_cost = net.allreduce_communication_cost(
-                model.allreduce_bytes_per_token,
+                allreduce_bytes,
                 net.servers,
                 model.communication_model,
             )
@@ -992,30 +1071,39 @@ def build_computation_graph(
             block_type == 0 and split_id == 0
         ):  # Only first attention node connects to first FFN node
             next_block_node = get_node_id(layer, 1, 0)
+            next_allreduce_bytes = model.attn_allreduce_bytes
             if layer > 0:
                 # Also connect from previous layer's FFN to this layer's attention
                 prev_block_node = get_node_id(layer - 1, 1, 0)
+                prev_allreduce_bytes = model.ffn_allreduce_bytes
             else:
                 prev_block_node = None
+                prev_allreduce_bytes = None
 
         elif (  # 3. Inter-layer edges (FFN -> next layer attention)
             block_type == 1 and split_id == 0
         ):  # Only first FFN node connects to next layer
             if layer < n_layers - 1:
                 next_block_node = get_node_id(layer + 1, 0, 0)
+                next_allreduce_bytes = model.ffn_allreduce_bytes
             else:
                 next_block_node = None
+                next_allreduce_bytes = None
             prev_block_node = get_node_id(layer, 0, 0)  # From this layer's attention
+            prev_allreduce_bytes = model.attn_allreduce_bytes
 
         else:  # other block nodes
             next_block_node = None
             prev_block_node = None
+            next_allreduce_bytes = None
+            prev_allreduce_bytes = None
 
         if next_block_node is not None:
+            assert next_allreduce_bytes is not None
             nbrs.append(next_block_node)
 
             comm_cost = net.allreduce_communication_cost(
-                model.allreduce_bytes_per_token,
+                next_allreduce_bytes,
                 net.servers[: max(max_attn_splits, max_ffn_splits)],
                 model.communication_model,
             )
@@ -1023,10 +1111,11 @@ def build_computation_graph(
             wts.append(edge_weight)
 
         if prev_block_node is not None:
+            assert prev_allreduce_bytes is not None
             nbrs.append(prev_block_node)
 
             comm_cost = net.allreduce_communication_cost(
-                model.allreduce_bytes_per_token,
+                prev_allreduce_bytes,
                 net.servers[: max(max_attn_splits, max_ffn_splits)],
                 model.communication_model,
             )
