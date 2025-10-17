@@ -515,6 +515,13 @@ static void add_rpc_devices(std::string servers) {
             throw std::invalid_argument("failed to register RPC device");
         }
     }
+    typedef void (*ggml_backend_rpc_create_peer_connection_t)();
+    ggml_backend_rpc_create_peer_connection_t ggml_backend_rpc_create_peer_connection_fn = 
+        (ggml_backend_rpc_create_peer_connection_t) ggml_backend_reg_get_proc_address(rpc_reg,"ggml_backend_rpc_create_peer_connection");
+    if (!ggml_backend_rpc_create_peer_connection_fn) {
+        throw std::invalid_argument("failed to find RPC create peer connection function");
+    }
+    ggml_backend_rpc_create_peer_connection_fn();
 }
 
 bool common_params_parse(int argc, char ** argv, common_params & params, llama_example ex, void(*print_usage)(int, char **)) {
