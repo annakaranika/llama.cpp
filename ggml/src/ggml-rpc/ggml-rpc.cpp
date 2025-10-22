@@ -2689,12 +2689,27 @@ void ggml_backend_rpc_get_device_memory(const char * endpoint, size_t * free, si
 // RPC server-side implementation
 class all_reduce_block{
     public:
-        all_reduce_block(ggml_tensor* tensor, int op, int device_count, struct rpc_server* server);
+        all_reduce_block(){}
+        all_reduce_block(ggml_tensor* tensor, int op, int device_count,ggml_backend_t backend);
         ~all_reduce_block();
+        bool block_init(ggml_tensor* tensor, int op, int device_count,ggml_backend_t backend);
         bool add(std::vector<uint8_t> & input);
+        bool add_to_buffer(std::vector<uint8_t> & input){
+            all_reduce_buffer.push_back(input);
+            return true;
+        }
+        void block_uinit(){
+            initialized=false;
+        }
+        bool is_init(){
+            return initialized;
+        }
         void wait_for_completion();
+        std::vector<std::vector<uint8_t>> & get_all_reduce_buffer(){
+            return all_reduce_buffer;
+        }
     private:
-        rpc_server* server;
+        bool initialized = false;
         ggml_cgraph * graph;
         ggml_tensor* tensor;
         ggml_tensor* add_tensor;
@@ -2706,6 +2721,8 @@ class all_reduce_block{
         std::condition_variable cv;
         bool is_completed = false;
         int   arrived = 0;
+        std::vector<std::vector<uint8_t>> all_reduce_buffer;
+        ggml_backend_t                            backend;
 
 };
 
@@ -2714,7 +2731,7 @@ void all_reduce_block::wait_for_completion(){
     cv.wait(lock, [this] { return is_completed; });
 }
 
-all_reduce_block::all_reduce_block(ggml_tensor* tensor, int op, int device_count, struct rpc_server* server):server(server),op(op),num_of_servers(device_count){
+all_reduce_block::all_reduce_block(ggml_tensor* tensor, int op, int device_count,ggml_backend_t backend):op(op),num_of_servers(device_count),backend(backend){
     this->tensor = tensor;
     size_t buf_size = ggml_tensor_overhead()*(1+3)+ggml_graph_overhead_custom(3,false);
     struct ggml_init_params params = {
@@ -2742,13 +2759,56 @@ all_reduce_block::all_reduce_block(ggml_tensor* tensor, int op, int device_count
     this->graph = graph; 
 
     arrived++;
-    auto all_reduce_buffer=server->get_all_reduce_buffer();
-    auto it = all_reduce_buffer.find(tensor->name);
-    if(it!=all_reduce_buffer.end()){
-        for(auto & b : it->second){
+    // if(!all_reduce_buffer.empty()){
+    //     for(auto & b : all_reduce_buffer){
+    //         add(b);
+    //     }
+    // }
+
+    initialized=true;
+}
+
+bool all_reduce_block::block_init(ggml_tensor* tensor, int op, int device_count,ggml_backend_t backend){
+    if(initialized){
+        return true;
+    }
+    this->op = op;
+    this->num_of_servers = device_count;
+    this->backend = backend;
+    this->tensor = tensor;
+    size_t buf_size = ggml_tensor_overhead()*(1+3)+ggml_graph_overhead_custom(3,false);
+    struct ggml_init_params params = {
+        /*.mem_size   =*/buf_size,
+        /*.mem_buffer =*/NULL,
+        /*.no_alloc   =*/true,
+    };
+    struct ggml_context * ctx = ggml_init(params);
+    struct ggml_cgraph * graph = ggml_new_graph_custom(ctx, 3, false);
+    graph->n_nodes=0;
+    add_tensor = ggml_new_tensor_4d(ctx, tensor->type, tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]);
+    strncpy(add_tensor->name, "add_tensor", 11);
+    ggml_backend_buffer_type_t buft = tensor->buffer->buft;
+    add_tensor->buffer = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(tensor));
+    add_tensor->data = add_tensor->buffer->iface.get_base(add_tensor->buffer);
+    add_tensor->buffer->iface.init_tensor(add_tensor->buffer, add_tensor);
+    data = nullptr;
+    ggml_tensor * tensor_out = ggml_add(ctx, tensor, add_tensor);
+    tensor_out->buffer = tensor->buffer;
+    tensor_out->data   = tensor->data;
+    strncpy(tensor_out->name, "tensor_out", 11);
+
+    ggml_build_forward_expand(graph, tensor_out);
+
+    this->graph = graph; 
+
+    arrived++;
+    if(!all_reduce_buffer.empty()){
+        for(auto & b : all_reduce_buffer){
             add(b);
         }
     }
+
+    initialized=true;
 }
 
 all_reduce_block::~all_reduce_block(){
@@ -2758,9 +2818,9 @@ all_reduce_block::~all_reduce_block(){
 
 bool all_reduce_block::add(std::vector<uint8_t> & input){
     std::lock_guard<std::mutex> lock(add_mutex);
-
+    GGML_LOG_INFO("add size: %d",sizeof(input));
     ggml_backend_tensor_set(add_tensor,input.data(),0,sizeof(input));
-    ggml_backend_graph_compute(server->get_backend(),graph);
+    ggml_backend_graph_compute(backend,graph);
     arrived++;
     if (arrived>=num_of_servers){
         is_completed=true;
@@ -2793,9 +2853,6 @@ class rpc_server {
                                 rpc_msg_create_peer_connection_rsp & response);
     void add_socket_listen(const std::shared_ptr<socket_t> & sock);
     bool all_reduce(std::vector<uint8_t> & input);
-    std::unordered_map<std::string,std::vector<std::vector<uint8_t>>> & get_all_reduce_buffer(){
-        return all_reduce_buffer;
-    }
     ggml_backend_t & get_backend(){
         return backend;
     }
@@ -2812,8 +2869,8 @@ class rpc_server {
     std::mutex                                               sockets_mutex;
     uint8_t device_id;
     uint8_t device_count;
-    std::unordered_map<std::string,struct all_reduce_block> all_reduce_blocks;
-    std::unordered_map<std::string,std::vector<std::vector<uint8_t>>> all_reduce_buffer;
+    // std::unordered_map<std::string,struct all_reduce_block> all_reduce_blocks;
+    struct all_reduce_block block;
     std::mutex                                               block_mutex;
 
 };
@@ -3271,12 +3328,22 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, rpc_msg_graph
     }
 
     //now broadcast result to all connected clients
-    if (signal == 0 || signal ==1)  {
+    if (signal == 0 )  {
         ggml_tensor * tensor_to_all_reduce = graph->nodes[n_nodes - 1];
         std::string tensor_name = tensor_to_all_reduce->name;
-        struct all_reduce_block block(tensor_to_all_reduce,signal,device_count,this);
         block_mutex.lock();
-        all_reduce_blocks.emplace(tensor_name,std::move(block));
+        // auto it = all_reduce_blocks.find(tensor_name);
+        // if (it != all_reduce_blocks.end()){
+        //     GGML_LOG_INFO("all_reduce block for tensor %s already exists",tensor_name.c_str());
+        //     it->second.block_init(tensor_to_all_reduce,signal,device_count,backend);
+        // }else{
+        //     GGML_LOG_INFO("creating all_reduce block for tensor %s",tensor_name.c_str());
+        //     struct all_reduce_block block(tensor_to_all_reduce,signal,device_count,backend);
+        //     all_reduce_blocks.emplace(std::piecewise_construct,
+        //                                 std::forward_as_tuple(std::string(tensor_name)),
+        //                                 std::forward_as_tuple(std::move(block)));
+        // }
+        block.block_init(tensor_to_all_reduce,signal,device_count,backend);
         block_mutex.unlock();
 
         //notify all other servers to do all_reduce
@@ -3287,14 +3354,17 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, rpc_msg_graph
             if (auto sock = sock_weak.second.lock()){
                 bool status = send_rpc_cmd(sock, RPC_CMD_ALL_REDUCE, add_data.data(), add_data.size(), nullptr, 0);
                 if (!status){
-                    GGML_LOG_INFO("failed to send all_reduce command to %s",sock_weak.first);
+                    GGML_LOG_INFO("failed to send all_reduce command to %s",sock_weak.first.c_str());
                 }
             }
         }
 
         //wait for another thread to notify that all_reduce is done
-        all_reduce_blocks[tensor_name].wait_for_completion();
-        all_reduce_blocks.erase(tensor_name);
+        // all_reduce_blocks[tensor_name].wait_for_completion();
+        // all_reduce_blocks.erase(tensor_name);
+        block.wait_for_completion();
+        block.block_uinit();
+
     }
     
     ggml_free(ctx);
@@ -3338,7 +3408,7 @@ bool rpc_server::create_peer_connection(const rpc_msg_create_peer_connection_req
             std::string host;
             int port;
             if(!parse_endpoint(endpoint,host,port)){
-                GGML_LOG_INFO("unable to parse endpoint %s",endpoint);
+                GGML_LOG_INFO("unable to parse endpoint %s",endpoint.c_str());
             }
             auto sock = socket_connect(host.c_str(),port);
             if (sock == nullptr){
@@ -3347,25 +3417,37 @@ bool rpc_server::create_peer_connection(const rpc_msg_create_peer_connection_req
             sockets_connectto[endpoint] = sock;
         }
     }
-    
+    response.result = GGML_STATUS_SUCCESS;
+    return true;
 }
 
 bool rpc_server::all_reduce(std::vector<uint8_t> & input){
 
-    char tensor_name[GGML_MAX_NAME];
-    memcpy(tensor_name,input.data(),sizeof(tensor_name));
-    std::vector<uint8_t> tensor_data(input.size()-sizeof(tensor_name));
-    memcpy(tensor_data.data(),input.data()+sizeof(tensor_name),tensor_data.size());
+    char tensor_name_[GGML_MAX_NAME];
+    memcpy(tensor_name_,input.data(),sizeof(tensor_name_));
+    std::vector<uint8_t> tensor_data(input.size()-sizeof(tensor_name_));
+    memcpy(tensor_data.data(),input.data()+sizeof(tensor_name_),tensor_data.size());
+    std::string tensor_name=tensor_name_;
     block_mutex.lock();
-    auto it = all_reduce_blocks.find(tensor_name);
-    if (it == all_reduce_blocks.end()){
-        GGML_LOG_INFO("no all_reduce block found for tensor %s, going to buffer it",tensor_name);
-        all_reduce_buffer[tensor_name].push_back(std::move(tensor_data));
+    // auto it = all_reduce_blocks.find(tensor_name);
+    // if (it == all_reduce_blocks.end()){
+    //     GGML_LOG_INFO("no all_reduce block found for tensor %s, going to buffer it",tensor_name);
+    //     struct all_reduce_block block;
+    //     block.add_to_buffer(tensor_data);
+    //     all_reduce_blocks.emplace(std::piecewise_construct,
+    //                                     std::forward_as_tuple(std::string(tensor_name)),
+    //                                     std::forward_as_tuple(std::move(block)));
+    // }else{
+    //     it->second.add(tensor_data);
+    // }
+    if(block.is_init()){
+        block.add(tensor_data);
     }else{
-        it->second.add(tensor_data);
+        block.add_to_buffer(tensor_data);
     }
 
     block_mutex.unlock();
+    return true;
 }
 
 rpc_server::~rpc_server() {
@@ -3868,6 +3950,7 @@ static bool ggml_backend_rpc_create_peer_connection() {
             GGML_ASSERT(status);
         });
     }
+    return true;
 }
 
 static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const char * name) {
