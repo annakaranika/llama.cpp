@@ -116,6 +116,7 @@ examples/server/webui/dist
 __pycache__/
 */poetry.lock
 poetry.toml
+**/*.egg-info/
 
 # Nix
 /result
@@ -144,3 +145,5 @@ poetry.toml
 # Local scripts
 /run-vim.sh
 /run-chat.sh
+
+sim_output/
