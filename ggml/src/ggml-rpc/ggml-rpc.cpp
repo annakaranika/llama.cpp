@@ -3420,6 +3420,7 @@ void rpc_server::add_socket_listen(const std::shared_ptr<socket_t> & sock) {
     std::lock_guard<std::mutex> lock(sockets_mutex);
     //add socket to the list
     sockets_listento.push_back(sock);
+    GGML_LOG_INFO("listen to socket %d\n",sock->fd);
 }
 
 bool rpc_server::create_peer_connection(const rpc_msg_create_peer_connection_req & request,
@@ -3457,7 +3458,7 @@ bool rpc_server::create_peer_connection(const rpc_msg_create_peer_connection_req
                 GGML_LOG_INFO("nullptr socket");
             }
             sockets_connectto[endpoint] = sock;
-            GGML_LOG_INFO("create connection for device %s",endpoint.c_str());
+            GGML_LOG_INFO("create connection for device %s\n",endpoint.c_str());
         }
     }
     response.result = GGML_STATUS_SUCCESS;
@@ -3814,10 +3815,10 @@ void ggml_backend_rpc_start_server(ggml_backend_t backend, const char * endpoint
             size_t free_mem, total_mem;
             get_backend_memory(&free_mem, &total_mem);
             printf("Accepted client connection, free_mem=%zu, total_mem=%zu\n", free_mem, total_mem);
-            printf("client socket: %d",client_socket->fd);
+            printf("client socket: %d\n",client_socket->fd);
             fflush(stdout);
             rpc_serve_client(server, client_socket->fd, free_mem, total_mem);
-            printf("Client connection closed\n");
+            printf("Client connection closed\n\n");
             fflush(stdout);
         }).detach();
     }
