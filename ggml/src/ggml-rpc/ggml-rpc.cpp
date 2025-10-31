@@ -2164,7 +2164,7 @@ static void serialize_graph(const ggml_cgraph * cgraph, std::vector<uint8_t> & o
     std::unordered_set<ggml_tensor *> visited;
     // GGML_LOG_INFO("begin serialize graph, n_nodes = %d\n",n_nodes);
     for (uint32_t i = 0; i < n_nodes; i++) {
-        ggml_tensor * node = cgraph->nodes[i];
+        // ggml_tensor * node = cgraph->nodes[i];
         // GGML_LOG_INFO("\ni = %d\n", i);
         // GGML_LOG_INFO("\ntensor %s ne0 :%ld ne1: %ld ne2: %ld ne3: %ld nb0: %ld nb1: %ld nb2: %ld nb3: %ld ",
         //             node->name,node->ne[0],node->ne[1],node->ne[2],node->ne[3],node->nb[0],node->nb[1],node->nb[2],node->nb[3]);
@@ -2840,7 +2840,7 @@ all_reduce_block::~all_reduce_block() {
 bool all_reduce_block::add(std::vector<uint8_t> & input) {
     GGML_LOG_INFO("all_reduce_block add called\n");
     std::lock_guard<std::mutex> lock(add_mutex);
-    GGML_LOG_INFO("add size: %d", sizeof(input));
+    GGML_LOG_INFO("add size: %lu", sizeof(input));
 
     //do the addition
     ggml_backend_tensor_set(add_tensor, input.data(), 0, sizeof(input));
@@ -2890,13 +2890,13 @@ class rpc_server {
     ggml_backend_t                            backend;
     std::unordered_set<ggml_backend_buffer_t> buffers;
     bool                                      server_split = false;
-    std::unordered_map<std::string, std::weak_ptr<socket_t>>   sockets_connectto;  //sockets that the server connects to
-    std::vector<std::weak_ptr<socket_t>>                       sockets_listento;   //sockets that the server listen to
-    std::mutex                                                 sockets_mutex;  //mutex for adding sockets to the list
-    uint8_t                                                    device_id;      //device id for current server
-    uint8_t                                                    device_count;   //total num of servers
-    std::unordered_map<std::string, struct all_reduce_block *> all_reduce_blocks;  //blocks for all reduce
-    std::mutex                                                 block_mutex;        //mutex for adding or checking blocks
+    std::unordered_map<std::string, std::weak_ptr<socket_t>> sockets_connectto;  //sockets that the server connects to
+    std::vector<std::weak_ptr<socket_t>>                     sockets_listento;   //sockets that the server listen to
+    std::mutex                                               sockets_mutex;      //mutex for adding sockets to the list
+    uint8_t                                                  device_id;          //device id for current server
+    uint8_t                                                  device_count;       //total num of servers
+    std::unordered_map<std::string, all_reduce_block *>      all_reduce_blocks;  //blocks for all reduce
+    std::mutex                                               block_mutex;        //mutex for adding or checking blocks
 };
 
 bool rpc_server::get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response) {
@@ -3283,7 +3283,7 @@ ggml_tensor * rpc_server::create_node(uint64_t id, struct ggml_context * ctx,
 
         return result;
     } catch (const std::exception & e) {
-        GGML_LOG_ERROR("[%s] tensor %lu with not found in tensor_ptrs: %s\n", __func__, id, e.what());
+        GGML_LOG_ERROR("[%s] tensor %llu with not found in tensor_ptrs: %s\n", __func__, id, e.what());
         return nullptr;
     }
 }
@@ -3374,8 +3374,7 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, rpc_msg_graph
             GGML_LOG_INFO("creating all_reduce block for tensor %s", tensor_name.c_str());
             try {
                 //if not, create the block and add it to the map
-                struct all_reduce_block * block =
-                    new all_reduce_block(tensor_to_all_reduce, signal, device_count, backend);
+                all_reduce_block * block = new all_reduce_block(tensor_to_all_reduce, signal, device_count, backend);
                 all_reduce_blocks[tensor_name] = block;
             } catch (const std::exception & e) {
                 GGML_LOG_INFO("[%s] error: %s\n", __func__, e.what());
