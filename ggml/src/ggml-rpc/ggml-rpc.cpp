@@ -121,6 +121,7 @@ enum rpc_cmd {
     RPC_CMD_SET_SPLIT,
     RPC_CMD_CREATE_PEER_CONNECTION,
     RPC_CMD_ALL_REDUCE,
+    RPC_CMD_DO_COMPUTATION,
     RPC_CMD_COUNT,
 };
 
@@ -213,6 +214,10 @@ struct rpc_msg_create_peer_connection_req {
 
 struct rpc_msg_create_peer_connection_rsp {
     uint8_t result;
+};
+
+struct rpc_msg_do_computation_req{
+    uint8_t graph_number;
 };
 
 #pragma pack(pop)
@@ -2034,7 +2039,7 @@ static void add_tensor_part(ggml_tensor * tensor, std::vector<rpc_tensor> & tens
     if (tensor == nullptr || visited.count(tensor)) {
         return;
     }
-    int src0_idx;
+    int src0_idx=-1;
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         ggml_tensor * src = tensor->src[i];
         rpc_tensor    src_tensor;
@@ -2384,6 +2389,7 @@ static void add_data_to_data(std::vector<uint8_t> & data, ggml_tensor * tensor, 
 
         ggml_backend_buffer_free(temp->buffer);
         ggml_backend_buffer_free(add_out->buffer);
+        ggml_free(ctx);
     }
 }
 
@@ -2409,211 +2415,260 @@ static void add_data_to_data(std::vector<uint8_t> & data, ggml_tensor * tensor, 
  * - The function asserts on RPC failures and unexpected tensor states.
  */
 static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    // GGML_LOG_INFO("graph compute for cgraph %x\n", (uint64_t) cgraph);
+    static std::unordered_map<uint64_t,uint8_t> graph_splits; //{graph: number}
+    static uint8_t global_graph_number = 0;
     ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *) backend->context;
+    struct sync_split {
+        std::pair<uint32_t, uint32_t> nodes_split;
+        bool                          checkend;
+    };
+    static struct sync_split change_split;
     // GGML_LOG_INFO("[%s] computing graph with %d nodes\n", __func__, cgraph->n_nodes);
     if (split) {
-        struct sync_split {
-            std::pair<uint32_t, uint32_t> nodes_split;
-            bool                          checkend;
-        };
+        //check wether the graph is stored at the server
+        // if(graph_splits.find((uint64_t)cgraph)==graph_splits.end())
+        {
 
-        // Find next synchronization point
-        std::vector<struct sync_split> sync_splits;
-        uint32_t                       count_nodes_low = 0;
-        for (int count_nodes = 0; count_nodes < cgraph->n_nodes; count_nodes++) {
-            ggml_tensor * node = cgraph->nodes[count_nodes];
-            // if(node->op==GGML_OP_VIEW){
-            //     GGML_LOG_INFO("\ntensor %s ne0 :%ld ne1: %ld ne2: %ld ne3: %ld nb0: %ld nb1: %ld nb2: %ld nb3: %ld \n",
-            //         node->name,node->ne[0],node->ne[1],node->ne[2],node->ne[3],node->nb[0],node->nb[1],node->nb[2],node->nb[3]);
-            //     GGML_LOG_INFO("view_offs %ld\n",node->view_offs);
-
-            // }
-            // GGML_LOG_INFO("\ntensor %s ne0 :%ld ne1: %ld ne2: %ld ne3: %ld nb0: %ld nb1: %ld nb2: %ld nb3: %ld \n",
-            //         node->name,node->ne[0],node->ne[1],node->ne[2],node->ne[3],node->nb[0],node->nb[1],node->nb[2],node->nb[3]);
-            // for(int i=0;i<GGML_MAX_SRC;i++){
-            //     ggml_tensor* src=node->src[i];
-            //     if(src){
-            //         GGML_LOG_INFO("src %d %s ne0 :%ld ne1: %ld ne2: %ld ne3: %ld nb0: %ld nb1: %ld nb2: %ld nb3: %ld \n",
-            //                 i,src->name,src->ne[0],src->ne[1],src->ne[2],src->ne[3],src->nb[0],src->nb[1],src->nb[2],src->nb[3]);
-            //     }
-            // }
-            if (!ggml_is_empty(node) && node->src[0] != nullptr &&
-                ggml_backend_buft_is_rpc_split(node->src[0]->buffer->buft) &&
-                (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID)) {
-                ggml_tensor_extra_rpc * node_extra = (ggml_tensor_extra_rpc *) node->src[0]->extra;
-                if (node_extra->split_dim == 0) {
-                    // this is where to break;
-                    GGML_ASSERT(ggml_backend_buft_is_rpc(node->src[1]->buffer->buft));
-                    GGML_ASSERT(ggml_backend_buft_is_rpc(node->buffer->buft));
-                    struct sync_split sync_split = {
-                        { count_nodes_low, count_nodes },
-                        false
-                    };
-                    sync_splits.push_back(sync_split);
-                    count_nodes_low = count_nodes + 1;
-                    // GGML_LOG_INFO("\n-----another split-----\n");
-                } else if (node_extra->split_dim == 1) {
-                    GGML_ASSERT(ggml_backend_buft_is_rpc(node->src[1]->buffer->buft));
-                    GGML_ASSERT(ggml_backend_buft_is_rpc(node->buffer->buft));
-                    if (strcmp(node->name, "result_output") == 0) {
+            // Find next synchronization point
+            std::vector<struct sync_split> sync_splits;
+            uint32_t                       count_nodes_low = 0;
+            for (int count_nodes = 0; count_nodes < cgraph->n_nodes; count_nodes++) {
+                ggml_tensor * node = cgraph->nodes[count_nodes];
+                // if(node->op==GGML_OP_VIEW){
+                //     GGML_LOG_INFO("\ntensor %s ne0 :%ld ne1: %ld ne2: %ld ne3: %ld nb0: %ld nb1: %ld nb2: %ld nb3: %ld \n",
+                //         node->name,node->ne[0],node->ne[1],node->ne[2],node->ne[3],node->nb[0],node->nb[1],node->nb[2],node->nb[3]);
+                //     GGML_LOG_INFO("view_offs %ld\n",node->view_offs);
+                // }
+                // GGML_LOG_INFO("\ntensor %s ne0 :%ld ne1: %ld ne2: %ld ne3: %ld nb0: %ld nb1: %ld nb2: %ld nb3: %ld \n",
+                //         node->name,node->ne[0],node->ne[1],node->ne[2],node->ne[3],node->nb[0],node->nb[1],node->nb[2],node->nb[3]);
+                // for(int i=0;i<GGML_MAX_SRC;i++){
+                //     ggml_tensor* src=node->src[i];
+                //     if(src){
+                //         GGML_LOG_INFO("src %d %s ne0 :%ld ne1: %ld ne2: %ld ne3: %ld nb0: %ld nb1: %ld nb2: %ld nb3: %ld \n",
+                //                 i,src->name,src->ne[0],src->ne[1],src->ne[2],src->ne[3],src->nb[0],src->nb[1],src->nb[2],src->nb[3]);
+                //     }
+                // }
+                if (!ggml_is_empty(node) && node->src[0] != nullptr &&
+                    ggml_backend_buft_is_rpc_split(node->src[0]->buffer->buft) &&
+                    (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID)) {
+                    ggml_tensor_extra_rpc * node_extra = (ggml_tensor_extra_rpc *) node->src[0]->extra;
+                    if (node_extra->split_dim == 0) {
+                        // this is where to break;
+                        GGML_ASSERT(ggml_backend_buft_is_rpc(node->src[1]->buffer->buft));
+                        GGML_ASSERT(ggml_backend_buft_is_rpc(node->buffer->buft));
+                        struct sync_split sync_split = {
+                            { count_nodes_low, count_nodes },
+                            false
+                        };
+                        sync_splits.push_back(sync_split);
+                        count_nodes_low = count_nodes + 1;
+                        // GGML_LOG_INFO("\n-----another split-----\n");
+                    } else if (node_extra->split_dim == 1) {
+                        GGML_ASSERT(ggml_backend_buft_is_rpc(node->src[1]->buffer->buft));
+                        GGML_ASSERT(ggml_backend_buft_is_rpc(node->buffer->buft));
+                        if (strcmp(node->name, "result_output") == 0) {
+                            struct sync_split sync_split = {
+                                { count_nodes_low, count_nodes },
+                                true
+                            };
+                            sync_splits.push_back(sync_split);
+                        }
+                    }
+                } else {
+                    if (count_nodes == cgraph->n_nodes - 1) {
                         struct sync_split sync_split = {
                             { count_nodes_low, count_nodes },
                             true
                         };
                         sync_splits.push_back(sync_split);
+                        // GGML_LOG_INFO("\n-----end of subgraph-----\n");
                     }
-                }
-            } else {
-                if (count_nodes == cgraph->n_nodes - 1) {
-                    struct sync_split sync_split = {
-                        { count_nodes_low, count_nodes },
-                        true
-                    };
-                    sync_splits.push_back(sync_split);
-                    // GGML_LOG_INFO("\n-----end of subgraph-----\n");
                 }
             }
-        }
+            change_split=sync_splits[sync_splits.size()-2];
+            // Compute the computation graph for the current split and synchronize results
+            for (size_t count_split = 0; count_split < sync_splits.size(); count_split++) {
+                // GGML_LOG_INFO("\n------------split-------------\n");
+                struct sync_split sync_split      = sync_splits[count_split];
+                uint32_t          count_nodes_low = sync_split.nodes_split.first;
+                uint32_t          count_nodes     = sync_split.nodes_split.second;
+                // GGML_LOG_INFO("low = %d high = %d\n",count_nodes_low,count_nodes);
+                // bool              checkend        = sync_split.checkend;
 
-        // Compute the computation graph for the current split and synchronize results
-        for (size_t count_split = 0; count_split < sync_splits.size(); count_split++) {
-            // GGML_LOG_INFO("\n------------split-------------\n");
-            struct sync_split sync_split      = sync_splits[count_split];
-            uint32_t          count_nodes_low = sync_split.nodes_split.first;
-            uint32_t          count_nodes     = sync_split.nodes_split.second;
-            // GGML_LOG_INFO("low = %d high = %d\n",count_nodes_low,count_nodes);
-            bool              checkend        = sync_split.checkend;
+                ggml_tensor *        tensor = cgraph->nodes[count_nodes];
 
-            ggml_tensor *        tensor = cgraph->nodes[count_nodes];
-            std::vector<uint8_t> data(ggml_nbytes(tensor), 0);
+                //compute concurrently
+                std::mutex rpc_mutex;
+                std::mutex data_mutex;
 
-            //compute concurrently
-            std::mutex rpc_mutex;
-            std::mutex data_mutex;
+                int                      device_count = ggml_backend_rpc_get_device_count();
+                std::vector<std::thread> threads;
 
-            int                      device_count = ggml_backend_rpc_get_device_count();
-            std::vector<std::thread> threads;
+                for (int id = 0; id < device_count; ++id) {
+                    threads.emplace_back([&, id]() {
+                        //we need to compute the next part of the graph
+                        std::vector<rpc_tensor>             tensors;
+                        std::map<ggml_tensor *, rpc_tensor> visited;
 
-            for (int id = 0; id < device_count; ++id) {
-                threads.emplace_back([&, id]() {
-                    //we need to compute the next part of the graph
-                    std::vector<rpc_tensor>             tensors;
-                    std::map<ggml_tensor *, rpc_tensor> visited;
-
-                    for (uint32_t count = count_nodes_low; count <= count_nodes; count++) {
-                        ggml_tensor * node = cgraph->nodes[count];
-                        if (!ggml_is_empty(node) && node->src[0] != nullptr &&
-                            ggml_backend_buft_is_rpc_split(node->src[0]->buffer->buft) &&
-                            (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID)) {
-                            // This node is eligible for RPC splitting
-                            ggml_tensor_extra_rpc * node_extra = (ggml_tensor_extra_rpc *) node->src[0]->extra;
-                            add_tensor_part(node, tensors, visited, node_extra->split_dim, id);
-                        } else {
-                            // This node is not eligible for RPC splitting
-                            add_tensor_part(node, tensors, visited, -1, id);
+                        for (uint32_t count = count_nodes_low; count <= count_nodes; count++) {
+                            ggml_tensor * node = cgraph->nodes[count];
+                            if (!ggml_is_empty(node) && node->src[0] != nullptr &&
+                                ggml_backend_buft_is_rpc_split(node->src[0]->buffer->buft) &&
+                                (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID)) {
+                                // This node is eligible for RPC splitting
+                                ggml_tensor_extra_rpc * node_extra = (ggml_tensor_extra_rpc *) node->src[0]->extra;
+                                add_tensor_part(node, tensors, visited, node_extra->split_dim, id);
+                            } else {
+                                // This node is not eligible for RPC splitting
+                                add_tensor_part(node, tensors, visited, -1, id);
+                            }
+                        
                         }
-                        //
 
-                        // if( node->op == GGML_OP_VIEW ) {
-                        //     GGML_LOG_INFO("\ntensor %s ne0 :%d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d view_offs: %ld\n",
-                        //     node->name,visited[node].ne[0],visited[node].ne[1],visited[node].ne[2],visited[node].ne[3],visited[node].nb[0],visited[node].nb[1],visited[node].nb[2],visited[node].nb[3],visited[node].view_offs);
+                        auto dev_ctx = (ggml_backend_rpc_device_context *) reg_ctx->devices[id]->context;
+                        auto sock    = get_socket(dev_ctx->endpoint);
 
-                        // }
-                        // GGML_LOG_INFO("\noperation %d",node->op);
-                        // GGML_LOG_INFO("\ntensor %s ne0 :%d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d view_offs: %ld\n",
-                        //     node->name,visited[node].ne[0],visited[node].ne[1],visited[node].ne[2],visited[node].ne[3],visited[node].nb[0],visited[node].nb[1],visited[node].nb[2],visited[node].nb[3],visited[node].view_offs);
-                        // for(int i=0;i<GGML_MAX_SRC;i++){
-                        //     ggml_tensor* src=node->src[i];
-                        //     if(src){
-                        //         GGML_LOG_INFO("src %d %s ne0 :%d ne1: %d ne2: %d ne3: %d nb0: %d nb1: %d nb2: %d nb3: %d view_offs: %ld\n",
-                        //             i,src->name,visited[src].ne[0],visited[src].ne[1],visited[src].ne[2],visited[src].ne[3],visited[src].nb[0],visited[src].nb[1],visited[src].nb[2],visited[src].nb[3],visited[src].view_offs);
-                        //     }
-                        // }
+                        std::vector<uint8_t> input;
+                        uint32_t             n_nodes = count_nodes - count_nodes_low + 1;
+                        if (n_nodes == 0) {
+                            return;
+                        }
+
+                        //input format: signal(1 byte) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t)) |
+                        //              n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) | graph_number (1 byte)
+                        uint32_t n_tensors  = tensors.size();
+                        int      input_size = sizeof(uint8_t) + sizeof(uint32_t) + n_nodes * sizeof(uint64_t) +
+                                        sizeof(uint32_t) + n_tensors * sizeof(rpc_tensor) + sizeof(uint8_t);
+                        input.resize(input_size, 0);
+
+                        //add a signal value to indicate the type of all-reduce at the beginning of the input
+                        //0: addition
+                        //1: concatenation (only for result_output, so maybe just at the client)
+                        //2: no operation (nothing to do at the client and servers)
+                        ggml_tensor_extra_rpc * tensor_extra = (ggml_tensor_extra_rpc *) tensor->src[0]->extra;
+                        uint8_t                 signal       = tensor_extra->split_dim == -1 ? 2 : tensor_extra->split_dim;
+                        memcpy(input.data(), &signal, sizeof(uint8_t));
+
+                        // Serialize input graph for RPC command
+                        // Append number of nodes
+                        memcpy(input.data() + sizeof(uint8_t), &n_nodes, sizeof(n_nodes));
+                        for (uint32_t i = 0; i < n_nodes; i++) {
+                            // Copy each node pointer (as uint64_t) into the input buffer for serialization
+                            memcpy(input.data() + sizeof(uint8_t) + sizeof(n_nodes) + i * sizeof(uint64_t),
+                                &cgraph->nodes[count_nodes_low + i], sizeof(uint64_t));
+                        }
+
+                        // Append number of tensors
+                        uint32_t * in_ntensors =
+                            (uint32_t *) (input.data() + sizeof(uint8_t) + sizeof(n_nodes) + n_nodes * sizeof(uint64_t));
+                        *in_ntensors = n_tensors;
+
+                        // Copy tensor metadata
+                        rpc_tensor * in_tensors = (rpc_tensor *) (input.data() + sizeof(uint8_t) + sizeof(n_nodes) +
+                                                                n_nodes * sizeof(uint64_t) + sizeof(uint32_t));
+                        memcpy(in_tensors, tensors.data(), n_tensors * sizeof(rpc_tensor));
+
+                        // denote which graph number this is, and info for graph that servers need to know
+                        uint8_t * in_graph_number = (uint8_t *)(input.data() + sizeof(uint8_t) + sizeof(n_nodes) +
+                                                                n_nodes * sizeof(uint64_t) + sizeof(uint32_t) +
+                                                                n_tensors * sizeof(rpc_tensor));
+                        *in_graph_number = global_graph_number;
+
+                        rpc_msg_graph_compute_rsp response;
+                        
+                        //here the graph_compute commend actually not do the compute, but store the graph
+                        //we will have another commend that will tell the servers to compute
+                        bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size(), &response,
+                                                sizeof(response));
+                        GGML_ASSERT(status);
+
+                        if (response.result != GGML_STATUS_SUCCESS) {
+                            std::lock_guard<std::mutex> lock(rpc_mutex);  // To avoid mixed output
+                            fprintf(stderr, "RPC graph compute failed with status %d\n", response.result);
+                            return;
+                        }
+
+                        
+
+                    });
+                }
+
+                // Join all threads
+                for (auto & thread : threads) {
+                    if (thread.joinable()) {
+                        thread.join();
                     }
+                }
+            }
 
-                    auto dev_ctx = (ggml_backend_rpc_device_context *) reg_ctx->devices[id]->context;
-                    auto sock    = get_socket(dev_ctx->endpoint);
+            graph_splits[reinterpret_cast<uint64_t>(cgraph)] = global_graph_number;
+            global_graph_number++;
+        }
+        // else{
+        //     GGML_LOG_INFO("graph %ld has been computed before with graph number %d, skip computation\n",
+        //                   (uint64_t)cgraph, graph_splits[reinterpret_cast<uint64_t>(cgraph)]);
+        // }
 
-                    std::vector<uint8_t> input;
-                    uint32_t             n_nodes = count_nodes - count_nodes_low + 1;
-                    if (n_nodes == 0) {
-                        return;
-                    }
 
-                    uint32_t n_tensors  = tensors.size();
-                    int      input_size = sizeof(uint8_t) + sizeof(uint32_t) + n_nodes * sizeof(uint64_t) +
-                                     sizeof(uint32_t) + n_tensors * sizeof(rpc_tensor);
-                    input.resize(input_size, 0);
+        //send a commend to servers to ask them do the computation job here
+        int                      device_count = ggml_backend_rpc_get_device_count();
+        std::vector<std::thread> threads;
 
-                    //add a signal value to indicate the type of all-reduce at the beginning of the input
-                    //0: addition
-                    //1: concatenation (only for result_output, so maybe just at the client)
-                    //2: no operation (nothing to do at the client and servers)
-                    ggml_tensor_extra_rpc * tensor_extra = (ggml_tensor_extra_rpc *) tensor->src[0]->extra;
-                    uint8_t                 signal       = tensor_extra->split_dim == -1 ? 2 : tensor_extra->split_dim;
-                    memcpy(input.data(), &signal, sizeof(uint8_t));
+        ggml_tensor * tensor=cgraph->nodes[cgraph->n_nodes - 1];
+        std::vector<uint8_t> data(ggml_nbytes(tensor),0);
+        std::mutex data_mutex;
+        for (int id = 0; id < device_count; ++id) {
+            threads.emplace_back([&, id]() {
+                auto dev_ctx = (ggml_backend_rpc_device_context *) reg_ctx->devices[id]->context;
+                auto sock    = get_socket(dev_ctx->endpoint);
 
-                    // Serialize input for RPC command
-                    // Append number of nodes
-                    memcpy(input.data() + sizeof(uint8_t), &n_nodes, sizeof(n_nodes));
-                    for (uint32_t i = 0; i < n_nodes; i++) {
-                        // Copy each node pointer (as uint64_t) into the input buffer for serialization
-                        memcpy(input.data() + sizeof(uint8_t) + sizeof(n_nodes) + i * sizeof(uint64_t),
-                               &cgraph->nodes[count_nodes_low + i], sizeof(uint64_t));
-                    }
+                rpc_msg_do_computation_req compute_info;
+                compute_info.graph_number = graph_splits[reinterpret_cast<uint64_t>(cgraph)];
+                bool status=send_rpc_cmd(sock,RPC_CMD_DO_COMPUTATION,&compute_info,sizeof(compute_info),nullptr,0);
+                GGML_ASSERT(status);
 
-                    // Append number of tensors
-                    uint32_t * in_ntensors =
-                        (uint32_t *) (input.data() + sizeof(uint8_t) + sizeof(n_nodes) + n_nodes * sizeof(uint64_t));
-                    *in_ntensors = n_tensors;
-
-                    // Copy tensor metadata
-                    rpc_tensor * in_tensors = (rpc_tensor *) (input.data() + sizeof(uint8_t) + sizeof(n_nodes) +
-                                                              n_nodes * sizeof(uint64_t) + sizeof(uint32_t));
-                    memcpy(in_tensors, tensors.data(), n_tensors * sizeof(rpc_tensor));
-
-                    rpc_msg_graph_compute_rsp response;
-                    bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size(), &response,
-                                               sizeof(response));
-                    GGML_ASSERT(status);
-
-                    if (response.result != GGML_STATUS_SUCCESS) {
-                        std::lock_guard<std::mutex> lock(rpc_mutex);  // To avoid mixed output
-                        fprintf(stderr, "RPC graph compute failed with status %d\n", response.result);
-                        return;
-                    }
-
-                    // Aggregate results back to the main tensor on each device
-                    // if this is not an intermediate node
-                    if (checkend && strcmp(tensor->name, "result_output") == 0) {
+                if (strcmp(tensor->name, "result_output") == 0) {
                         // GGML_LOG_INFO("getting result data from device %d\n", id);
                         add_data_to_data(data, tensor, data_mutex, id);
-                    }
-                });
-            }
-
-            // Join all threads
-            for (auto & thread : threads) {
-                if (thread.joinable()) {
-                    thread.join();
                 }
+            });
+        }
+            // Join all threads
+        for (auto & thread : threads) {
+            if (thread.joinable()) {
+                thread.join();
             }
-            // Write back data to RPC backend tensor on the client
-            if (checkend && strcmp(tensor->name, "result_output") == 0) {
-                ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
-                buf->iface.set_tensor(buf, tensor, data.data(), 0, data.size());
-            }
+        }
+        // Write back data to RPC backend tensor on the client
+
+        if (strcmp(tensor->name, "result_output") == 0) {
+            ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+            buf->iface.set_tensor(buf, tensor, data.data(), 0, data.size());
         }
         return GGML_STATUS_SUCCESS;
     } else {
-        std::vector<uint8_t> input;
-        serialize_graph(cgraph, input);
-        rpc_msg_graph_compute_rsp response;
-        auto                      sock = get_socket(rpc_ctx->endpoint);
-        bool                      status =
-            send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size(), &response, sizeof(response));
-        GGML_ASSERT(status);
-        return (enum ggml_status) response.result;
+        if(graph_splits.find((uint64_t)cgraph)==graph_splits.end()){
+            std::vector<uint8_t> input;
+            serialize_graph(cgraph, input);
+            rpc_msg_graph_compute_rsp response;
+            auto                      sock = get_socket(rpc_ctx->endpoint);
+            bool                      status =
+                send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size(), &response, sizeof(response));
+            GGML_ASSERT(status);
+            graph_splits[reinterpret_cast<uint64_t>(cgraph)] = global_graph_number;
+            global_graph_number++;
+            return (enum ggml_status) response.result;
+        }else{
+            GGML_LOG_INFO("graph %ld has been computed before with graph number %d, skip computation\n",
+                          (uint64_t)cgraph, graph_splits[reinterpret_cast<uint64_t>(cgraph)]);
+            rpc_msg_do_computation_req compute_info;
+            compute_info.graph_number = graph_splits[reinterpret_cast<uint64_t>(cgraph)];
+            auto                      sock = get_socket(rpc_ctx->endpoint);
+            bool status=send_rpc_cmd(sock,RPC_CMD_DO_COMPUTATION,&compute_info,sizeof(compute_info),nullptr,0);
+            GGML_ASSERT(status);
+            return GGML_STATUS_SUCCESS;
+        }
     }
 }
 
@@ -2717,11 +2772,13 @@ class all_reduce_block {
         return true;
     }
 
+    //reset the block for the next-time use
     void block_uinit() { 
         initialized = false; 
         arrived=0;
         is_completed=false;
         ggml_backend_buffer_free(add_tensor->buffer);
+        ggml_free(ctx);
     }
 
     bool is_init() { return initialized; }
@@ -2731,9 +2788,10 @@ class all_reduce_block {
     std::vector<std::vector<uint8_t>> & get_all_reduce_buffer() { return all_reduce_buffer; }
   private:
     bool                              initialized = false;   //whether the tensor to be reduced has been set
-    ggml_cgraph *                     graph;                 //addition graph
+    ggml_cgraph *                     graph=nullptr;                 //addition graph
     ggml_tensor *                     tensor;                //tensor to be reduced
     ggml_tensor *                     add_tensor;            //data collected from other servers
+    ggml_tensor *                     tensor_out;
     int                               op;                    //reduction operation
     int                               num_of_servers;        //number of servers to wait for
     std::mutex                        add_mutex;             //mutex for adding data
@@ -2743,6 +2801,7 @@ class all_reduce_block {
     int                               arrived      = 0;      //number of servers that have received data
     std::vector<std::vector<uint8_t>> all_reduce_buffer;     //buffer for storing data added before initialization
     ggml_backend_t                    backend;               //backend type
+    struct ggml_context * ctx;
 };
 
 void all_reduce_block::wait_for_completion() {
@@ -2750,6 +2809,9 @@ void all_reduce_block::wait_for_completion() {
     cv.wait(lock, [this] { return is_completed; });
 }
 
+//function description: create the all_reduce_block for a specific tensor and initialize it by the current server, create the add tensor and graph
+//when to be called:    when the current server finishes graph computing
+//note:                 since the first time to be called, no data in the buffer
 all_reduce_block::all_reduce_block(ggml_tensor * tensor, int op, int device_count, ggml_backend_t backend) :
     op(op),
     num_of_servers(device_count),
@@ -2765,7 +2827,7 @@ all_reduce_block::all_reduce_block(ggml_tensor * tensor, int op, int device_coun
         /*.mem_buffer =*/NULL,
         /*.no_alloc   =*/true,
     };
-    struct ggml_context * ctx   = ggml_init(params);
+    ctx   = ggml_init(params);
     struct ggml_cgraph *  graph = ggml_new_graph_custom(ctx, 3, false);
     graph->n_nodes              = 0;
     add_tensor = ggml_new_tensor_4d(ctx, tensor->type, tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]);
@@ -2775,8 +2837,6 @@ all_reduce_block::all_reduce_block(ggml_tensor * tensor, int op, int device_coun
     add_tensor->buffer                = buffer;
     if(buffer==nullptr){
         GGML_LOG_INFO("empty buffer\n");
-    }else{
-        GGML_LOG_INFO("%x\n",buffer);
     }
     add_tensor->data                = buffer->iface.get_base(buffer);
     // GGML_LOG_INFO("init tensor\n");
@@ -2810,6 +2870,9 @@ all_reduce_block::all_reduce_block(ggml_tensor * tensor, int op, int device_coun
     // }
 }
 
+//function description: initialize the block with updating tensor
+//when to be called:    when the server receiving all_reduce msg from other servers
+//note: only update pointer to tensor and create buffer for add if graph exists, else create the graph
 bool all_reduce_block::block_init(ggml_tensor * tensor, int op, int device_count, ggml_backend_t backend,uint8_t device_id) {
     // GGML_LOG_INFO("all_reduce_block init called\n");
     if (initialized) {
@@ -2826,11 +2889,11 @@ bool all_reduce_block::block_init(ggml_tensor * tensor, int op, int device_count
     //create addition graph
     size_t                  buf_size = ggml_tensor_overhead() * (1 + 3) + ggml_graph_overhead_custom(3, false);
     struct ggml_init_params params   = {
-        /*.mem_size   =*/buf_size,
-        /*.mem_buffer =*/NULL,
-        /*.no_alloc   =*/true,
+            /*.mem_size   =*/buf_size,
+            /*.mem_buffer =*/NULL,
+            /*.no_alloc   =*/true,
     };
-    struct ggml_context * ctx   = ggml_init(params);
+    ctx   = ggml_init(params);
     struct ggml_cgraph *  graph = ggml_new_graph_custom(ctx, 3, false);
     graph->n_nodes              = 0;
     add_tensor = ggml_new_tensor_4d(ctx, tensor->type, tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]);
@@ -2839,7 +2902,8 @@ bool all_reduce_block::block_init(ggml_tensor * tensor, int op, int device_count
     add_tensor->buffer              = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(tensor));
     add_tensor->data                = add_tensor->buffer->iface.get_base(add_tensor->buffer);
     // add_tensor->buffer->iface.init_tensor(add_tensor->buffer, add_tensor);
-    ggml_tensor * tensor_out = ggml_add(ctx, tensor, add_tensor);
+
+    tensor_out = ggml_add(ctx, tensor, add_tensor);
     tensor_out->buffer       = tensor->buffer;
     tensor_out->data         = tensor->data;
     strncpy(tensor_out->name, "tensor_out", 11);
@@ -2867,6 +2931,9 @@ bool all_reduce_block::block_init(ggml_tensor * tensor, int op, int device_count
 all_reduce_block::~all_reduce_block() {
     ggml_backend_buffer_free(add_tensor->buffer);
     //TODO: does the graph and context need to be freed?
+    if(ctx!=nullptr){
+        ggml_free(ctx);
+    }
 }
 
 bool all_reduce_block::add(std::vector<uint8_t> & input,uint8_t device_id) {
@@ -2897,7 +2964,71 @@ bool all_reduce_block::add(std::vector<uint8_t> & input,uint8_t device_id) {
         initialized  = false;
         cv.notify_all();
     }
+    GGML_UNUSED(device_id);
     return is_completed;
+}
+
+struct graph_info{
+    uint8_t      graph_number;
+    ggml_cgraph * cgraph;
+    ggml_context * ctx;
+    uint8_t      signal;
+    graph_info* next=nullptr;
+};
+
+class graph_compute_info{
+    public:
+        graph_compute_info(uint8_t graph_number, ggml_cgraph * cgraph, ggml_context * ctx, uint8_t signal);
+        ~graph_compute_info(); 
+        bool add_info(ggml_cgraph * cgraph, ggml_context * ctx, uint8_t signal);
+        bool replace_info(ggml_cgraph * cgraph, ggml_context * ctx, uint8_t signal);
+        graph_info * head=nullptr;
+        graph_info * tail=nullptr;
+        uint8_t      graph_number;
+        uint8_t      graph_count=0;
+        
+};
+
+graph_compute_info::graph_compute_info(uint8_t graph_number, ggml_cgraph * cgraph, ggml_context * ctx, uint8_t signal){
+    this->graph_number=graph_number;
+    graph_info* info=new graph_info();
+    info->graph_number=graph_number;
+    info->cgraph=cgraph;
+    info->ctx=ctx;
+    info->signal=signal;
+    head=info;
+    tail=info;
+    graph_count=1;
+}
+
+bool graph_compute_info::add_info(ggml_cgraph * cgraph, ggml_context * ctx, uint8_t signal){
+    graph_info* info=new graph_info();
+    info->graph_number=graph_number;
+    info->cgraph=cgraph;
+    info->ctx=ctx;
+    info->signal=signal;
+    tail->next=info;
+    tail=info;
+    graph_count++;
+    return true;
+}
+
+bool graph_compute_info::replace_info(ggml_cgraph * cgraph, ggml_context * ctx, uint8_t signal){
+    ggml_free(tail->ctx);
+    tail->graph_number=graph_number;
+    tail->cgraph=cgraph;
+    tail->ctx=ctx;
+    tail->signal=signal;
+    return true;
+}
+graph_compute_info::~graph_compute_info() {
+    graph_info* current = head;
+    while (current != nullptr) {
+        graph_info* next = current->next;
+        ggml_free(current->ctx);
+        delete current;
+        current = next;
+    }
 }
 
 class rpc_server {
@@ -2923,6 +3054,7 @@ class rpc_server {
                                 rpc_msg_create_peer_connection_rsp &       response);
     void add_socket_listen(const std::shared_ptr<socket_t> & sock);
     bool all_reduce(std::vector<uint8_t> & input);
+    bool do_computation(const rpc_msg_do_computation_req & request);
 
     ggml_backend_t & get_backend() { return backend; }
   private:
@@ -2930,6 +3062,7 @@ class rpc_server {
     ggml_tensor *                             create_node(uint64_t id, struct ggml_context * ctx,
                                                           const std::unordered_map<uint64_t, const rpc_tensor *> & tensor_ptrs,
                                                           std::unordered_map<uint64_t, struct ggml_tensor *> &     tensor_map);
+    void store_graph_compute_info(uint8_t graph_number, ggml_cgraph * cgraph, ggml_context * ctx, uint8_t signal);
     ggml_backend_t                            backend;
     std::unordered_set<ggml_backend_buffer_t> buffers;
     bool                                      server_split = false;
@@ -2940,7 +3073,10 @@ class rpc_server {
     uint8_t                                                  device_count;       //total num of servers
     std::unordered_map<std::string, all_reduce_block *>      all_reduce_blocks;  //blocks for all reduce
     std::mutex                                               block_mutex;        //mutex for adding or checking blocks
+    std::unordered_map<uint8_t, graph_compute_info *>          graph_compute_infos; // map graph_number to graph_compute_info
 };
+
+
 
 bool rpc_server::get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response) {
     ggml_backend_buffer_type_t buft;
@@ -3321,14 +3457,25 @@ ggml_tensor * rpc_server::create_node(uint64_t id, struct ggml_context * ctx,
 
         return result;
     } catch (const std::exception & e) {
-        GGML_LOG_ERROR("[%s] tensor %llu with not found in tensor_ptrs: %s\n", __func__, id, e.what());
+        GGML_LOG_ERROR("[%s] tensor %lu with not found in tensor_ptrs: %s\n", __func__, id, e.what());
         return nullptr;
+    }
+}
+
+void rpc_server::store_graph_compute_info(uint8_t graph_number, ggml_cgraph * cgraph, ggml_context * ctx,
+                                          uint8_t signal) {
+    auto it = graph_compute_infos.find(graph_number);
+    if (it == graph_compute_infos.end()) {
+        graph_compute_info * info = new graph_compute_info(graph_number, cgraph, ctx, signal);
+        graph_compute_infos[graph_number] = info;
+    } else {
+        it->second->add_info(cgraph, ctx, signal);
     }
 }
 
 bool rpc_server::graph_compute(const std::vector<uint8_t> & input, rpc_msg_graph_compute_rsp & response) {
     // serialization format:
-    // signal (1 byte) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
+    // signal (1 byte) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) | graph_number (1 byte)
     // GGML_LOG_INFO("graph compute called with input size: %zu\n", input.size());
     if (input.size() < sizeof(uint32_t)) {
         return false;
@@ -3354,6 +3501,9 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, rpc_msg_graph
     const rpc_tensor * tensors = (const rpc_tensor *) (input.data() + sizeof(uint8_t) + sizeof(n_nodes) +
                                                        n_nodes * sizeof(uint64_t) + sizeof(n_tensors));
 
+    uint8_t graph_number;
+    memcpy(&graph_number, input.data() + sizeof(uint8_t) + sizeof(n_nodes) + n_nodes * sizeof(uint64_t) +
+                                   sizeof(n_tensors) + n_tensors * sizeof(rpc_tensor), sizeof(graph_number));
     size_t buf_size = ggml_tensor_overhead() * (n_nodes + n_tensors) + ggml_graph_overhead_custom(n_nodes, false);
     struct ggml_init_params params = {
         /*.mem_size   =*/buf_size,
@@ -3368,9 +3518,9 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, rpc_msg_graph
         tensor_ptrs[tensors[i].id] = &tensors[i];
     }
     // Print all entries in tensor_ptrs
-    for (const auto & pair : tensor_ptrs) {
-        const rpc_tensor * t = pair.second;
-    }
+    // for (const auto & pair : tensor_ptrs) {
+    //     const rpc_tensor * t = pair.second;
+    // }
 
     std::unordered_map<uint64_t, ggml_tensor *> tensor_map;
     try {
@@ -3384,94 +3534,192 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, rpc_msg_graph
         ggml_free(ctx);
         return false;
     }
-    try {
-        ggml_status status = ggml_backend_graph_compute(backend, graph);
-        response.result    = status;
-    } catch (const std::exception & e) {
-        GGML_LOG_INFO("[%s] exception during graph compute: %s\n", __func__, e.what());
-        ggml_free(ctx);
+
+    //store graph compute info
+    store_graph_compute_info(graph_number, graph, ctx, signal);
+    GGML_LOG_INFO("stored graph compute info for graph number %d\n", graph_number);
+    response.result= GGML_STATUS_SUCCESS;
+    return true;
+}
+
+void compare_node(ggml_tensor* node, ggml_tensor* node_to_compare){
+    std::string filename="compare.txt";
+    std::ofstream outfile;
+    outfile.open(filename, std::ios_base::app); // append instead of overwrite
+    if(node->buffer!=node_to_compare->buffer){
+        outfile << "node " << node->name << " and node " << node_to_compare->name << " are different\n";
+        outfile << "buffer different: " << node->buffer << " vs " << node_to_compare->buffer << "\n";
+    }
+    if(node->ne[0]!=node_to_compare->ne[0]||
+        node->ne[1]!=node_to_compare->ne[1]||
+        node->ne[2]!=node_to_compare->ne[2]||
+        node->ne[3]!=node_to_compare->ne[3]){
+            outfile << "node " << node->name << " and node " << node_to_compare->name << " are different\n";
+            outfile << "ne different: [" << node->ne[0] << "," << node->ne[1] << "," << node->ne[2] << "," << node->ne[3] << "] vs ["
+                    << node_to_compare->ne[0] << "," << node_to_compare->ne[1] << "," << node_to_compare->ne[2] << "," << node_to_compare->ne[3] << "]\n";
+    }
+    if(node->nb[0]!=node_to_compare->nb[0]||
+        node->nb[1]!=node_to_compare->nb[1]||
+        node->nb[2]!=node_to_compare->nb[2]||
+        node->nb[3]!=node_to_compare->nb[3]){
+            outfile << "node " << node->name << " and node " << node_to_compare->name << " are different\n";
+            outfile << "nb different: [" << node->nb[0] << "," << node->nb[1] << "," << node->nb[2] << "," << node->nb[3] << "] vs ["
+                    << node_to_compare->nb[0] << "," << node_to_compare->nb[1] << "," << node_to_compare->nb[2] << "," << node_to_compare->nb[3] << "]\n";
+    }
+        
+    if(node->view_src!=node_to_compare->view_src||
+        node->view_offs!=node_to_compare->view_offs){   
+            outfile << "node " << node->name << " and node " << node_to_compare->name << " are different\n";
+            outfile << "view_src or view_offs different: " << node->view_src << " vs " << node_to_compare->view_src << ", "
+                    << node->view_offs << " vs " << node_to_compare->view_offs << "\n";
+            outfile << "view_src difference: " << (uint64_t)node->view_src-(uint64_t)node_to_compare->view_src <<
+                    ", view_off difference: "<< node->view_offs-node_to_compare->view_offs << "\n";
+    }
+    outfile.close();
+
+}
+
+void compare_two_graph(ggml_cgraph* graph, ggml_cgraph* graph_to_compare){
+    for(int i=0;i<graph->n_nodes;i++){
+        compare_node(graph->nodes[i],graph_to_compare->nodes[i]);
+    }
+}
+
+bool rpc_server::do_computation(const rpc_msg_do_computation_req & request) {
+    // GGML_LOG_INFO("do computation called\n");
+    uint8_t graph_number = request.graph_number;
+    if(graph_number%2==0&&graph_number>=2){
+        GGML_LOG_INFO("graph number is %d, doing comparason\n",graph_number);
+        std::string filename="compare.txt";
+        std::ofstream outfile;
+        outfile.open(filename, std::ios_base::app); 
+        outfile << "Comparason for graph number " << std::to_string(graph_number) << "\n";
+        outfile.close();
+        auto    it           = graph_compute_infos.find(graph_number);
+        if (it == graph_compute_infos.end()) {
+            GGML_LOG_INFO("graph number %d not found\n", graph_number);
+            return false;
+        }
+        auto compare=graph_compute_infos.find(graph_number-2);
+        if(compare== graph_compute_infos.end()) {
+            GGML_LOG_INFO("graph number %d not found\n", graph_number);
+            return false;
+        }
+        graph_info * info = it->second->head;
+        graph_info * compare_info = compare->second->head;
+        while(info){
+            ggml_cgraph *  graph = info->cgraph;
+            ggml_cgraph *  compared_graph = compare_info->cgraph;
+            compare_two_graph(graph,compared_graph);
+            info = info->next;
+            compare_info = compare_info->next;
+        }
+        GGML_LOG_INFO("comparason done for graph number %d\n", graph_number);
+    }
+    auto    it           = graph_compute_infos.find(graph_number);
+    if (it == graph_compute_infos.end()) {
+        GGML_LOG_INFO("graph number %d not found\n", graph_number);
         return false;
     }
-
-    //get the data to be sent first
-    ggml_tensor * tensor_to_all_reduce = graph->nodes[n_nodes - 1];
-    std::string   tensor_name          = tensor_to_all_reduce->name;
-    std::vector<uint8_t> add_data;
-    add_data.resize(ggml_nbytes(tensor_to_all_reduce) + sizeof(tensor_to_all_reduce->name),0);
-    memcpy(add_data.data(), tensor_to_all_reduce->name, sizeof(tensor_to_all_reduce->name));
-    ggml_backend_tensor_get(tensor_to_all_reduce, add_data.data() + sizeof(tensor_to_all_reduce->name), 0,
-                                ggml_nbytes(tensor_to_all_reduce));
-    //now broadcast result to all connected clients
-    // GGML_LOG_INFO("Broadcasting all reduce if needed, signal=%d, tensor name: %s", signal, graph->nodes[n_nodes - 1]->name);
-    if (signal == 0) {
-        //get the tensor to be all reduced
-        
-        // GGML_LOG_INFO("doing all reduce for tensor %s\n", tensor_name.c_str());
-
+    GGML_LOG_INFO("found graph number %d, doing computation\n", graph_number);
+    graph_info * info = it->second->head;
+    while(info){
+        ggml_cgraph *  graph = info->cgraph;
+        ggml_context * ctx   = info->ctx;
+        uint8_t       signal= info->signal;
         
 
-        //first setup for itself
-        block_mutex.lock();
-        auto it = all_reduce_blocks.find(tensor_name);
-        if (it != all_reduce_blocks.end()) {
-            // GGML_LOG_INFO("all_reduce block for tensor %s already exists\n", tensor_name.c_str());
-            //if the block already exists, just reinit it
-            it->second->block_init(tensor_to_all_reduce, signal, device_count, backend,device_id);
-        } else {
-            // GGML_LOG_INFO("creating all_reduce block for tensor %s\n", tensor_name.c_str());
-            try {
-                //if not, create the block and add it to the map
-                all_reduce_block * block = new all_reduce_block(tensor_to_all_reduce, signal, device_count, backend);
-                all_reduce_blocks[tensor_name] = block;
-            } catch (const std::exception & e) {
-                GGML_LOG_INFO("[%s] error: %s\n", __func__, e.what());
-            }
-        }
-        block_mutex.unlock();
+        ggml_tensor * tensor_to_all_reduce = graph->nodes[graph->n_nodes - 1];
+        std::string   tensor_name          = tensor_to_all_reduce->name;
+        // GGML_LOG_INFO("graph compute done for graph number %d, tensor to all reduce: %s, signal: %d\n", graph_number,
+        //               tensor_name.c_str(), signal);
 
-        //notify all other servers to do all_reduce
-        // GGML_LOG_INFO("begin notifying all other servers tensor %s\n",tensor_to_all_reduce->name);
-    
-        
-
-        for (auto & sock_weak : sockets_connectto) {
-            if (auto sock = sock_weak.second.lock()) {
-                bool status = send_rpc_cmd(sock, RPC_CMD_ALL_REDUCE, add_data.data(), add_data.size(), nullptr, 0);
-                if (!status) {
-                    GGML_LOG_INFO("failed to send all_reduce command to %s\n", sock_weak.first.c_str());
-                }
-            }else{
-                // GGML_LOG_INFO("recreating socket\n");
-                std::string host;
-                int         port;
-                std::string endpoint=sock_weak.first;
-                if (!parse_endpoint(endpoint, host, port)) {
-                    GGML_LOG_INFO("unable to parse endpoint %s", endpoint.c_str());
-                }
-                auto socket = socket_connect(host.c_str(), port);
-                if (socket == nullptr) {
-                    GGML_LOG_INFO("nullptr socket");
-                }
-                sockets_connectto[endpoint] = socket;
-                // GGML_LOG_INFO("create connection for device %s\n", endpoint.c_str());
-                // GGML_LOG_INFO("sending data to sock %d\n",socket->fd);
-                bool status = send_rpc_cmd(socket, RPC_CMD_ALL_REDUCE, add_data.data(), add_data.size(), nullptr, 0);
-                if (!status) {
-                    GGML_LOG_INFO("failed to send all_reduce command to %s\n", sock_weak.first.c_str());
-                }
-            }
+        info = info->next;
+        try {
+            ggml_status status = ggml_backend_graph_compute(backend, graph);
+            GGML_ASSERT(status == GGML_STATUS_SUCCESS);
+        } catch (const std::exception & e) {
+            GGML_LOG_INFO("[%s] exception during graph compute: %s\n", __func__, e.what());
+            ggml_free(ctx);
+            return false;
         }
 
-        //wait for another thread to notify that all_reduce is done
-        // GGML_LOG_INFO("waiting for all_reduce to complete for tensor %s\n", tensor_name.c_str());
-        all_reduce_blocks[tensor_name]->wait_for_completion();
+        //get the data to be sent first
+        std::vector<uint8_t> add_data;
+        add_data.resize(ggml_nbytes(tensor_to_all_reduce) + sizeof(tensor_to_all_reduce->name),0);
+        memcpy(add_data.data(), tensor_to_all_reduce->name, sizeof(tensor_to_all_reduce->name));
+        ggml_backend_tensor_get(tensor_to_all_reduce, add_data.data() + sizeof(tensor_to_all_reduce->name), 0,
+                                    ggml_nbytes(tensor_to_all_reduce));
+        //now broadcast result to all connected clients
+        // GGML_LOG_INFO("Broadcasting all reduce if needed, signal=%d, tensor name: %s", signal, graph->nodes[graph->n_nodes - 1]->name);
+        if (signal == 0) {
+            //get the tensor to be all reduced
+            
+            // GGML_LOG_INFO("doing all reduce for tensor %s\n", tensor_name.c_str());
 
-        //uninit the block
-        all_reduce_blocks[tensor_name]->block_uinit();
+            
+
+            //first setup for itself
+            block_mutex.lock();
+            auto it = all_reduce_blocks.find(tensor_name);
+            if (it != all_reduce_blocks.end()) {
+                GGML_LOG_INFO("all_reduce block for tensor %s already exists\n", tensor_name.c_str());
+                //if the block already exists, just reinit it
+                it->second->block_init(tensor_to_all_reduce, signal, device_count, backend,device_id);
+            } else {
+                GGML_LOG_INFO("creating all_reduce block for tensor %s\n", tensor_name.c_str());
+                try {
+                    //if not, create the block and add it to the map
+                    all_reduce_block * block = new all_reduce_block(tensor_to_all_reduce, signal, device_count, backend);
+                    all_reduce_blocks[tensor_name] = block;
+                } catch (const std::exception & e) {
+                    GGML_LOG_INFO("[%s] error: %s\n", __func__, e.what());
+                }
+            }
+            block_mutex.unlock();
+
+            //notify all other servers to do all_reduce
+            // GGML_LOG_INFO("begin notifying all other servers tensor %s\n",tensor_to_all_reduce->name);
+        
+            
+
+            for (auto & sock_weak : sockets_connectto) {
+                if (auto sock = sock_weak.second.lock()) {
+                    bool status = send_rpc_cmd(sock, RPC_CMD_ALL_REDUCE, add_data.data(), add_data.size(), nullptr, 0);
+                    if (!status) {
+                        GGML_LOG_INFO("failed to send all_reduce command to %s\n", sock_weak.first.c_str());
+                    }
+                }else{
+                    GGML_LOG_INFO("recreating socket\n");
+                    std::string host;
+                    int         port;
+                    std::string endpoint=sock_weak.first;
+                    if (!parse_endpoint(endpoint, host, port)) {
+                        GGML_LOG_INFO("unable to parse endpoint %s", endpoint.c_str());
+                    }
+                    auto socket = socket_connect(host.c_str(), port);
+                    if (socket == nullptr) {
+                        GGML_LOG_INFO("nullptr socket");
+                    }
+                    sockets_connectto[endpoint] = socket;
+                    // GGML_LOG_INFO("create connection for device %s\n", endpoint.c_str());
+                    // GGML_LOG_INFO("sending data to sock %d\n",socket->fd);
+                    bool status = send_rpc_cmd(socket, RPC_CMD_ALL_REDUCE, add_data.data(), add_data.size(), nullptr, 0);
+                    if (!status) {
+                        GGML_LOG_INFO("failed to send all_reduce command to %s\n", sock_weak.first.c_str());
+                    }
+                }
+            }
+
+            //wait for another thread to notify that all_reduce is done
+            GGML_LOG_INFO("waiting for all_reduce to complete for tensor %s\n", tensor_name.c_str());
+            all_reduce_blocks[tensor_name]->wait_for_completion();
+
+            //uninit the block
+            all_reduce_blocks[tensor_name]->block_uinit();
+        }
     }
-
-    
-    ggml_free(ctx);
+        
     return true;
 }
 
@@ -3589,6 +3837,9 @@ rpc_server::~rpc_server() {
     }
     for (auto block : all_reduce_blocks) {
         delete block.second;
+    }
+    for (auto info : graph_compute_infos) {
+        delete info.second;
     }
 }
 
@@ -3828,6 +4079,20 @@ static void rpc_serve_client(rpc_server & server, sockfd_t sockfd, size_t free_m
                     }
                     break;
                 }
+            case RPC_CMD_DO_COMPUTATION:
+                {
+                    rpc_msg_do_computation_req request;
+                    if (!recv_msg(sockfd, &request, sizeof(request))) {
+                        return;
+                    }
+                    if (!server.do_computation(request)) {
+                        return;
+                    }
+                    if (!send_msg(sockfd, nullptr, 0)) {
+                        return;
+                    }
+                    break;
+                }
             default:
                 {
                     fprintf(stderr, "Unknown command: %d\n", cmd);
@@ -3907,6 +4172,8 @@ void ggml_backend_rpc_start_server(ggml_backend_t backend, const char * endpoint
 #ifdef _WIN32
     WSACleanup();
 #endif
+    GGML_UNUSED(free_mem);
+    GGML_UNUSED(total_mem);
 }
 
 // device interface
