@@ -484,6 +484,10 @@ static bool parse_endpoint(const std::string & endpoint, std::string & host, int
 // RPC response: | response_size (8 bytes) | response_data (response_size bytes) |
 static bool send_rpc_cmd(const std::shared_ptr<socket_t> & sock, enum rpc_cmd cmd, const void * input,
                          size_t input_size, void * output, size_t output_size) {
+    if (sock == nullptr) {
+        GGML_LOG_INFO("[send_rpc_cmd] NULL socket for cmd %d\n", (int) cmd);
+        return false;
+    }
     uint8_t cmd_byte = cmd;
     if (!send_data(sock->fd, &cmd_byte, sizeof(cmd_byte))) {
         GGML_LOG_INFO("Failed to send command byte %d\n", cmd_byte);
