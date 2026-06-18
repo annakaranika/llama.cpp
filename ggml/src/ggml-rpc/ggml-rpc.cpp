@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
+#include <sys/stat.h>  // mkdir, for the on-disk weight cache
 #include <map>
 #include <memory>
 #include <mutex>
@@ -118,6 +119,8 @@ enum rpc_cmd {
     RPC_CMD_CREATE_PEER_CONNECTION,
     RPC_CMD_ALL_REDUCE,
     RPC_CMD_DO_COMPUTATION,
+    RPC_CMD_LOAD_CACHED,      // "do you have this slice cached? if so load it into the buffer" (skip upload)
+    RPC_CMD_SET_TENSOR_CACHE, // set_tensor that ALSO persists the slice to the on-disk weight cache
     RPC_CMD_COUNT,
 };
 
@@ -214,6 +217,22 @@ struct rpc_msg_create_peer_connection_rsp {
 
 struct rpc_msg_do_computation_req {
     uint8_t graph_number;
+};
+
+// Weight cache -- avoid re-uploading identical weights over the network every run.
+//   LOAD_CACHED: client asks "do you have the slice with this content hash?". On a
+//     hit the server loads it from its on-disk cache straight into the buffer (no
+//     upload) and reports hit=1. req carries the dst tensor + the content hash.
+//   SET_TENSOR_CACHE (raw payload | rpc_tensor | offset(8) | hash(8) | data |): sent
+//     on a miss -- writes the buffer like SET_TENSOR AND persists the slice to the
+//     cache file keyed by hash so the next run hits.
+struct rpc_msg_load_cached_req {
+    rpc_tensor tensor;
+    uint64_t   hash;
+};
+
+struct rpc_msg_load_cached_rsp {
+    uint8_t hit;
 };
 
 #pragma pack(pop)
@@ -836,6 +855,19 @@ static void ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_t buffer, gg
     }
 }
 
+// Content hash of a weight slice -- the key for the on-disk weight cache. FNV-1a
+// 64-bit: cheap (~GB/s), and a content key means the cache stays correct across
+// model swaps (different bytes -> different key -> miss -> re-upload).
+static uint64_t rpc_fnv1a(const void * data, size_t n) {
+    const uint8_t * p = (const uint8_t *) data;
+    uint64_t        h = 0xcbf29ce484222325ULL;
+    for (size_t i = 0; i < n; ++i) {
+        h ^= p[i];
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
 static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data,
                                                size_t offset, size_t size) {
     // GGML_LOG_INFO("[%s] setting tensor %s, offset=%zu, size=%zu\n", __func__, tensor->name, offset, size);
@@ -1336,62 +1368,71 @@ static void ggml_backend_rpc_split_buffer_set_tensor(ggml_backend_buffer_t buffe
     }
     std::vector<std::thread> threads;
 
-    auto upload_slice = [&](int id) {
-        if (extra->split_dim == 1) {
-            int64_t row_low  = extra->rows[id].first;
-            int64_t row_high = extra->rows[id].second;
+    // Weight cache: before uploading a slice, ask the server (by content hash) whether
+    // it already has it on disk from a previous run. On a HIT the server loads it from
+    // its cache and we skip the network upload; on a MISS we upload via SET_TENSOR_CACHE
+    // so the server persists it for next time. RPC_NO_WEIGHT_CACHE disables the cache.
+    static const bool weight_cache = (getenv("RPC_NO_WEIGHT_CACHE") == nullptr);
 
+    // Given a contiguous slice, either skip it (server cache hit) or upload it.
+    auto cache_or_upload = [&](int id, const rpc_tensor & rt, const uint8_t * slice, size_t slice_size) {
+        if (weight_cache) {
+            const uint64_t          hash = rpc_fnv1a(slice, slice_size);
+            rpc_msg_load_cached_req qreq;
+            qreq.tensor = rt;
+            qreq.hash   = hash;
+            rpc_msg_load_cached_rsp qrsp;
+            qrsp.hit     = 0;
+            bool qstatus = send_rpc_cmd(socks[id], RPC_CMD_LOAD_CACHED, &qreq, sizeof(qreq), &qrsp, sizeof(qrsp));
+            GGML_ASSERT(qstatus);
+            if (qrsp.hit) {
+                total_size += slice_size;  // server loaded it from its cache -- no upload
+                return;
+            }
+            // miss: | rpc_tensor | offset (8) | hash (8) | data | -> server writes AND caches
+            std::vector<uint8_t> input(sizeof(rpc_tensor) + sizeof(offset) + sizeof(hash) + slice_size);
+            memcpy(input.data(), &rt, sizeof(rpc_tensor));
+            memcpy(input.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
+            memcpy(input.data() + sizeof(rpc_tensor) + sizeof(offset), &hash, sizeof(hash));
+            memcpy(input.data() + sizeof(rpc_tensor) + sizeof(offset) + sizeof(hash), slice, slice_size);
+            bool status =
+                send_rpc_cmd(socks[id], RPC_CMD_SET_TENSOR_CACHE, input.data(), input.size(), nullptr, 0);
+            GGML_ASSERT(status);
+        } else {
+            // | rpc_tensor | offset (8) | data |
+            std::vector<uint8_t> input(sizeof(rpc_tensor) + sizeof(offset) + slice_size);
+            memcpy(input.data(), &rt, sizeof(rpc_tensor));
+            memcpy(input.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
+            memcpy(input.data() + sizeof(rpc_tensor) + sizeof(offset), slice, slice_size);
+            bool status = send_rpc_cmd(socks[id], RPC_CMD_SET_TENSOR, input.data(), input.size(), nullptr, 0);
+            GGML_ASSERT(status);
+        }
+        total_size += slice_size;
+    };
+
+    auto upload_slice = [&](int id) {
+        rpc_tensor rt = split_serialize_tensor(tensor, (ggml_tensor_extra_rpc *) tensor->extra, id);
+        if (extra->split_dim == 1) {
+            int64_t row_low     = extra->rows[id].first;
+            int64_t row_high    = extra->rows[id].second;
             int64_t nrows_split = row_high - row_low;
             if (nrows_split == 0) {
                 return;
             }
-
-            const size_t         offset_split = row_low * nb1;
-            size_t               split_size   = ggml_nbytes_split(tensor, nrows_split);
-            // input serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes) |
-            size_t               input_size   = sizeof(rpc_tensor) + sizeof(uint64_t) + split_size;
-            std::vector<uint8_t> input(input_size, 0);
-            rpc_tensor rpc_tensor = split_serialize_tensor(tensor, (ggml_tensor_extra_rpc *) tensor->extra, id);
-
-            memcpy(input.data(), &rpc_tensor, sizeof(rpc_tensor));
-            memcpy(input.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
-            memcpy(input.data() + sizeof(rpc_tensor) + sizeof(offset), ((const char *) data) + offset_split,
-                   split_size);
-            bool status =
-                send_rpc_cmd(socks[id], RPC_CMD_SET_TENSOR, input.data(), input.size(), nullptr, 0);
-            if (!status) {
-                GGML_LOG_INFO("[%s] failed to set tensor %s on device %d, offset=%zu, size=%zu\n", __func__,
-                              tensor->name, id, offset, size);
-            }
-            GGML_ASSERT(status);
-            total_size += split_size;
+            const size_t offset_split = row_low * nb1;
+            size_t       split_size   = ggml_nbytes_split(tensor, nrows_split);
+            cache_or_upload(id, rt, ((const uint8_t *) data) + offset_split, split_size);
         } else if (extra->split_dim == 0) {
-            int64_t col_low  = extra->rows[id].first;
-            int64_t col_high = extra->rows[id].second;
-
+            int64_t col_low     = extra->rows[id].first;
+            int64_t col_high    = extra->rows[id].second;
             int64_t ncols_split = col_high - col_low;
             if (ncols_split == 0) {
                 return;
             }
-
             size_t               split_size = ggml_nbytes_split_col(tensor, ncols_split);
-            // input serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes) |
-            size_t               input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + split_size;
-            std::vector<uint8_t> input(input_size, 0);
-            rpc_tensor rpc_tensor = split_serialize_tensor(tensor, (ggml_tensor_extra_rpc *) tensor->extra, id);
-            memcpy(input.data(), &rpc_tensor, sizeof(rpc_tensor));
-            memcpy(input.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
             std::vector<uint8_t> input_data(split_size, 0);
             get_split_col_data(input_data.data(), tensor, col_low, col_high, data);
-            memcpy(input.data() + sizeof(rpc_tensor) + sizeof(offset), input_data.data(), split_size);
-            bool status =
-                send_rpc_cmd(socks[id], RPC_CMD_SET_TENSOR, input.data(), input.size(), nullptr, 0);
-            if (!status) {
-                GGML_LOG_INFO("[%s] failed to set tensor %s on device %d, offset=%zu, size=%zu\n", __func__,
-                              tensor->name, id, offset, size);
-            }
-            GGML_ASSERT(status);
-            total_size += split_size;
+            cache_or_upload(id, rt, input_data.data(), split_size);
         } else {
             GGML_LOG_INFO("[%s]set split tensor for non-split tensor %s\n", __func__, tensor->name);
         }
@@ -3146,6 +3187,8 @@ class rpc_server {
     void add_socket_listen(const std::shared_ptr<socket_t> & sock);
     bool all_reduce(std::vector<uint8_t> & input);
     bool do_computation(const rpc_msg_do_computation_req & request);
+    bool load_cached(const rpc_msg_load_cached_req & request, rpc_msg_load_cached_rsp & response);
+    bool set_tensor_cache(const std::vector<uint8_t> & input);
 
     ggml_backend_t & get_backend() { return backend; }
   private:
@@ -3303,6 +3346,124 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
     result->data  = reinterpret_cast<void *>(tensor->data);
     ggml_set_name(result, tensor->name);
     return result;
+}
+
+// ---- on-disk weight cache (server side) -----------------------------------
+// Persist each uploaded weight slice to disk so reruns skip the network upload.
+// Keyed by a content hash the client computes. Dir: $RPC_WEIGHT_CACHE_DIR, else
+// $HOME/.cache/llama-rpc-weights. Disable entirely with RPC_NO_WEIGHT_CACHE.
+static bool rpc_weight_cache_enabled() {
+    static const bool on = (getenv("RPC_NO_WEIGHT_CACHE") == nullptr);
+    return on;
+}
+
+static const std::string & rpc_weight_cache_dir() {
+    static const std::string dir = [] {
+        const char * env  = getenv("RPC_WEIGHT_CACHE_DIR");
+        const char * home = getenv("HOME");
+        std::string  d    = env ? std::string(env)
+                                : std::string(home ? home : ".") + "/.cache/llama-rpc-weights";
+        // mkdir -p (POSIX, best-effort -- EEXIST is fine)
+        std::string cur;
+        for (size_t i = 0; i < d.size(); ++i) {
+            cur += d[i];
+            if ((d[i] == '/' && cur.size() > 1) || i + 1 == d.size()) {
+                mkdir(cur.c_str(), 0755);
+            }
+        }
+        return d;
+    }();
+    return dir;
+}
+
+static std::string rpc_weight_cache_path(uint64_t hash) {
+    char name[20];
+    snprintf(name, sizeof(name), "%016llx", (unsigned long long) hash);
+    return rpc_weight_cache_dir() + "/" + name;
+}
+
+// LOAD_CACHED: if the slice with this content hash is on disk, load it straight
+// into the destination buffer and report hit=1; otherwise hit=0 (client uploads).
+bool rpc_server::load_cached(const rpc_msg_load_cached_req & request, rpc_msg_load_cached_rsp & response) {
+    response.hit = 0;
+    if (!rpc_weight_cache_enabled()) {
+        return true;
+    }
+    std::ifstream f(rpc_weight_cache_path(request.hash), std::ios::binary | std::ios::ate);
+    if (!f) {
+        return true;  // miss
+    }
+    const std::streamsize n = f.tellg();
+    f.seekg(0, std::ios::beg);
+    std::vector<uint8_t> data((size_t) std::max<std::streamsize>(n, 0));
+    if (n <= 0 || !f.read((char *) data.data(), n)) {
+        return true;  // miss (unreadable / empty)
+    }
+    struct ggml_init_params params{ ggml_tensor_overhead(), NULL, true };
+    struct ggml_context *   ctx    = ggml_init(params);
+    ggml_tensor *           tensor = deserialize_tensor(ctx, &request.tensor);
+    if (tensor == nullptr || (size_t) n != ggml_nbytes(tensor)) {
+        // size/shape mismatch -> treat as a miss so the client re-uploads (cache stays safe)
+        ggml_free(ctx);
+        return true;
+    }
+    ggml_backend_tensor_set(tensor, data.data(), 0, (size_t) n);
+    ggml_free(ctx);
+    static const bool dbg_wcache = (getenv("RPC_DBG_WCACHE") != nullptr);
+    if (dbg_wcache) {
+        GGML_LOG_INFO("[wcache] HIT   %016llx (%lld bytes)\n", (unsigned long long) request.hash, (long long) n);
+    }
+    response.hit = 1;
+    return true;
+}
+
+// SET_TENSOR_CACHE: | rpc_tensor | offset(8) | hash(8) | data |. Writes the buffer
+// exactly like SET_TENSOR, then persists the slice to the cache file keyed by hash.
+bool rpc_server::set_tensor_cache(const std::vector<uint8_t> & input) {
+    if (input.size() < sizeof(rpc_tensor) + (2 * sizeof(uint64_t))) {
+        GGML_LOG_INFO("[%s] input size too small: %zu\n", __func__, input.size());
+        return false;
+    }
+    const rpc_tensor * in_tensor = (const rpc_tensor *) input.data();
+    uint64_t           offset;
+    uint64_t           hash;
+    memcpy(&offset, input.data() + sizeof(rpc_tensor), sizeof(offset));
+    memcpy(&hash, input.data() + sizeof(rpc_tensor) + sizeof(offset), sizeof(hash));
+    const size_t size = input.size() - sizeof(rpc_tensor) - (2 * sizeof(uint64_t));
+    const void * data = input.data() + sizeof(rpc_tensor) + (2 * sizeof(uint64_t));
+
+    struct ggml_init_params params{ ggml_tensor_overhead(), NULL, true };
+    struct ggml_context *   ctx    = ggml_init(params);
+    ggml_tensor *           tensor = deserialize_tensor(ctx, in_tensor);
+    if (tensor == nullptr) {
+        GGML_LOG_INFO("[%s] error deserializing tensor\n", __func__);
+        ggml_free(ctx);
+        return false;
+    }
+    // sanitize tensor->data (same bounds check as set_tensor)
+    {
+        const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
+        const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
+        if (in_tensor->data + offset < p0 || in_tensor->data + offset >= p1 ||
+            size > (p1 - in_tensor->data - offset)) {
+            GGML_ABORT("[%s] tensor->data out of bounds\n", __func__);
+        }
+    }
+    ggml_backend_tensor_set(tensor, data, offset, size);
+    ggml_free(ctx);
+
+    // persist to the on-disk cache (best-effort; a failed write just misses next run)
+    if (rpc_weight_cache_enabled()) {
+        std::ofstream out(rpc_weight_cache_path(hash), std::ios::binary | std::ios::trunc);
+        if (out) {
+            out.write((const char *) data, size);
+        }
+        static const bool dbg_wcache = (getenv("RPC_DBG_WCACHE") != nullptr);
+        if (dbg_wcache) {
+            GGML_LOG_INFO("[wcache] STORE %016llx (%zu bytes)\n", (unsigned long long) hash, size);
+        }
+    }
+    return true;
 }
 
 bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
@@ -4234,6 +4395,35 @@ static void rpc_serve_client(rpc_server & server, sockfd_t sockfd, size_t free_m
                         return;
                     }
                     if (!server.do_computation(request)) {
+                        return;
+                    }
+                    if (!send_msg(sockfd, nullptr, 0)) {
+                        return;
+                    }
+                    break;
+                }
+            case RPC_CMD_LOAD_CACHED:
+                {
+                    rpc_msg_load_cached_req request;
+                    if (!recv_msg(sockfd, &request, sizeof(request))) {
+                        return;
+                    }
+                    rpc_msg_load_cached_rsp response;
+                    if (!server.load_cached(request, response)) {
+                        return;
+                    }
+                    if (!send_msg(sockfd, &response, sizeof(response))) {
+                        return;
+                    }
+                    break;
+                }
+            case RPC_CMD_SET_TENSOR_CACHE:
+                {
+                    std::vector<uint8_t> input;
+                    if (!recv_msg(sockfd, input)) {
+                        return;
+                    }
+                    if (!server.set_tensor_cache(input)) {
                         return;
                     }
                     if (!send_msg(sockfd, nullptr, 0)) {
