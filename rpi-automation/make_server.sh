@@ -33,12 +33,12 @@ cd ~/llama.cpp/
 git pull
 
 cd build-rpc
-cmake .. -DGGML_RPC=ON -DGGML_VULKAN=OFF -DGGML_METAL=OFF -DGGML_CUDA=OFF
-cmake --build . --config Release
+cmake .. -DGGML_RPC=ON -DGGML_VULKAN=OFF -DGGML_METAL=OFF -DGGML_CUDA=OFF -DGGML_NATIVE=OFF
+cmake --build . --config Release -j$(nproc)
 killall -9 rpc-server || true
 
-rpi1="172.16.107.154"
-rpi7="172.16.112.192"
+rpi1="128.174.61.160"
+rpi7="128.174.61.172"
 
 # Parse arguments
 host="$1"
@@ -64,7 +64,7 @@ if [ "$tmux" = "attach" ]; then
     # tmux attach-session -t llm
 
     # Send the server command to window 1
-    tmux send-keys -t llm:1 "./build-rpc/bin/rpc-server -H $server_ip -m 1000" C-m
+    tmux send-keys -t llm:1 "./bin/rpc-server -H $server_ip -m 1000" C-m
 else
     ./bin/rpc-server -H $server_ip -m 1000
 fi
