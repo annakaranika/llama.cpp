@@ -1,3 +1,6 @@
 # name ip
+# peer compute servers (4 -> enables N=4 -sm row TP; GQA needs N | num_kv_heads=4)
 rpi24 128.174.61.171
 rpi25 128.174.61.156
+rpi20 128.174.61.170
+rpi22 128.174.61.157
