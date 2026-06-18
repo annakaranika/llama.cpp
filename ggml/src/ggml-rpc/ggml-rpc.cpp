@@ -859,12 +859,23 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
     // if split, we need to set the tensor on all other devices
     if (split && multi_cpy) {
         ggml_tensor_extra_rpc * extra = (ggml_tensor_extra_rpc *) tensor->extra;
-        //TODO: in a parallel way
-        for (int id = 0; id < ggml_backend_rpc_get_device_count(); ++id) {
+        const int               n_dev = ggml_backend_rpc_get_device_count();
+        // Upload the replicated copy to every other device concurrently. Pre-fetch
+        // and HOLD the sockets on the main thread first (the worker threads must
+        // not race get_socket / let the weak_ptr-cached sockets churn -- see the
+        // split upload). RPC_SERIAL_UPLOAD=1 reverts to one-at-a-time.
+        static const bool                      serial_upload = getenv("RPC_SERIAL_UPLOAD") != nullptr;
+        std::vector<std::shared_ptr<socket_t>> socks(n_dev);
+        for (int id = 0; id < n_dev; ++id) {
+            socks[id] =
+                get_socket(((ggml_backend_rpc_device_context *) reg_ctx->devices[id]->context)->endpoint);
+        }
+        std::vector<std::thread> threads;
+        auto                     send_copy = [&](int id) {
             ggml_backend_rpc_device_context * dev_ctx =
                 (ggml_backend_rpc_device_context *) reg_ctx->devices[id]->context;
             if (dev_ctx->endpoint == buft_ctx->endpoint) {
-                continue;
+                return;
             }
             // input serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes) |
             size_t               input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + size;
@@ -877,19 +888,30 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
                 rpc_tensor2.buffer = extra->buffer_ctx[id]->remote_ptr;
                 rpc_tensor2.data   = reinterpret_cast<uint64_t>(ggml_backend_rpc_buffer_context_get_base(
                     reinterpret_cast<ggml_backend_rpc_buffer_context *>(extra->buffer_ctx[id])));
-                // GGML_LOG_INFO("rpc_tensor.data=%" PRIx64 ", rpc_tensor.buffer=%" PRIx64 "\n", rpc_tensor2.data, rpc_tensor2.buffer);
             }
             memcpy(input_.data(), &rpc_tensor2, sizeof(rpc_tensor));
             memcpy(input_.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
             memcpy(input_.data() + sizeof(rpc_tensor) + sizeof(offset), data, size);
 
-            bool status = send_rpc_cmd(get_socket(dev_ctx->endpoint), RPC_CMD_SET_TENSOR, input_.data(), input_.size(),
-                                       nullptr, 0);
+            bool status =
+                send_rpc_cmd(socks[id], RPC_CMD_SET_TENSOR, input_.data(), input_.size(), nullptr, 0);
             if (!status) {
                 GGML_LOG_INFO("[%s] failed to set tensor %s, offset=%zu, size=%zu\n", __func__, tensor->name, offset,
                               size);
             }
             GGML_ASSERT(status);
+        };
+        for (int id = 0; id < n_dev; ++id) {
+            if (serial_upload) {
+                send_copy(id);
+            } else {
+                threads.emplace_back(send_copy, id);
+            }
+        }
+        for (auto & t : threads) {
+            if (t.joinable()) {
+                t.join();
+            }
         }
     }
 }
