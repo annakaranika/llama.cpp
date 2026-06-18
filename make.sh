@@ -25,8 +25,8 @@
 # -----------------------------------------------------------------------------
 set -e
 
-rpis=("172.16.107.154" "172.16.112.192")
-model="models/tinyllama-1.1b-chat-v1.0.Q2_K.gguf"
+rpis=("128.174.61.171" "128.174.61.156")   # rpi24, rpi25 on dprgnet (dedicated to peer)
+model="models/tinyllama-chat/tinyllama-1.1b-chat-v1.0.Q5_K_M.gguf"
 build_dir="build-rpc"
 
 # Parse arguments
@@ -47,7 +47,7 @@ if [[ "$restart" == "yes" ]]; then
     # SSH into each server and restart the rpc-server
     git push
     for rpi in "${rpis[@]}"; do
-        ssh -t pi@"$rpi" "pkill -9 rpc-server; cd ~/test/dprg_llama.cpp/llama.cpp && ./make_server.sh $rpi attach" &
+        ssh -t pi@"$rpi" "pkill -9 rpc-server; cd ~/llama.cpp && ./make_server.sh $rpi attach" &
     done
 fi
 

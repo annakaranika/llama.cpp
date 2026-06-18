@@ -29,7 +29,7 @@
 
 set -e
 
-cd ~/test/dprg_llama.cpp/llama.cpp/
+cd ~/llama.cpp/
 git pull
 
 cd build-rpc
