@@ -742,25 +742,34 @@ static void ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_t buffer, gg
             }
 
             //allocate buffer on other servers
-            //TODO: allocate in the parallel way, seems allocate buffer for whole size?
-            for (int id = 0; id < ggml_backend_rpc_get_device_count(); ++id) {
+            // Allocate each device's buffer concurrently: extra->buffer_ctx[id]/rows[id]
+            // are per-id (disjoint) writes, sockets are pre-fetched + held so the weak_ptr
+            // cache can't churn under the workers. RPC_SERIAL_UPLOAD=1 reverts to serial.
+            // (On alloc failure we set buffer_ctx[id]=nullptr -- which downstream already
+            //  null-checks -- instead of `delete extra`, which under threading would
+            //  double-free and was a use-after-free even serially via `tensor->extra=extra`.)
+            static const bool                      serial_alloc = getenv("RPC_SERIAL_UPLOAD") != nullptr;
+            const int                              n_dev        = ggml_backend_rpc_get_device_count();
+            std::vector<std::shared_ptr<socket_t>> socks(n_dev);
+            for (int id = 0; id < n_dev; ++id) {
+                socks[id] = get_socket(((ggml_backend_rpc_device_context *) reg_ctx->devices[id]->context)->endpoint);
+            }
+            std::vector<std::thread> threads;
+            auto alloc_one = [&](int id) {
                 if (!found) {
                     size_t size;
                     if (cache) {
                         float split_part = (id == ggml_backend_rpc_get_device_count() - 1) ?
                                                (1 - tensor_splits[id]) :
                                                (tensor_splits[id + 1] - tensor_splits[id]);
-                        // GGML_LOG_INFO("tensor_splits: %f %f",tensor_splits[id],split_part);
                         size             = split_part * tensor->ne[0] * tensor->nb[0] / ggml_blck_size(tensor->type);
                         for (int i = 1; i < GGML_MAX_DIMS; ++i) {
                             size += (tensor->ne[i] - 1) * tensor->nb[i];
                         }
-                        // GGML_LOG_INFO("size = %ld\n",size);
                     } else {
                         size = ggml_nbytes(tensor);
                     }
                     rpc_msg_alloc_buffer_req          request = { size };  //the size to allocate
-                    // GGML_LOG_INFO("[%s] allocating buffer for tensor %s on device %d, size=%zu\n", __func__, tensor->name, id, request.size);
                     rpc_msg_alloc_buffer_rsp          response;
                     ggml_backend_rpc_device_context * dev_ctx =
                         (ggml_backend_rpc_device_context *) reg_ctx->devices[id]->context;
@@ -768,25 +777,34 @@ static void ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_t buffer, gg
                         buft_ctx->endpoint) {  //for the main device, we already have the buffer context
                         extra->buffer_ctx[id] = ctx;
                         extra->rows[id]       = { 0, tensor->ne[0] };
-                        continue;
+                        return;
                     }
-                    auto sock   = get_socket(dev_ctx->endpoint);
-                    bool status = send_rpc_cmd(sock, RPC_CMD_ALLOC_BUFFER, &request, sizeof(request), &response,
+                    bool status = send_rpc_cmd(socks[id], RPC_CMD_ALLOC_BUFFER, &request, sizeof(request), &response,
                                                sizeof(response));
                     GGML_ASSERT(status);
                     if (response.remote_ptr != 0) {
                         extra->buffer_ctx[id] =
-                            new ggml_backend_rpc_buffer_context{ sock, nullptr, response.remote_ptr };
+                            new ggml_backend_rpc_buffer_context{ socks[id], nullptr, response.remote_ptr };
                         extra->rows[id] = { 0, tensor->ne[0] };
-                        // GGML_LOG_INFO("[%s] allocated buffer for tensor %s device %d, remote_ptr=%" PRIx64 ", remote_size=%" PRIu64 "\n", __func__, tensor->name, id, response.remote_ptr, response.remote_size);
                     } else {
                         GGML_LOG_INFO("[%s] failed to allocate buffer for device %d\n", __func__, id);
-                        delete extra;
+                        extra->buffer_ctx[id] = nullptr;
                     }
                 } else {
                     extra->rows[id] = { 0, tensor->ne[0] };
                 }
-                // GGML_LOG_INFO("[%s] buffer context for device %d: remote_ptr=%" PRIx64 ", rows=(%lld, %lld)\n", __func__, id, extra->buffer_ctx[id]->remote_ptr, extra->rows[id].first, extra->rows[id].second);
+            };
+            for (int id = 0; id < n_dev; ++id) {
+                if (serial_alloc) {
+                    alloc_one(id);
+                } else {
+                    threads.emplace_back(alloc_one, id);
+                }
+            }
+            for (auto & t : threads) {
+                if (t.joinable()) {
+                    t.join();
+                }
             }
             tensor->extra = extra;
         }
@@ -1197,71 +1215,78 @@ static void ggml_backend_rpc_split_buffer_init_tensor(ggml_backend_buffer_t buff
             // GGML_LOG_INFO("split_dim = %d\n",extra->split_dim);
         }
 
-        //TODO: in a parallel way
-        for (int id = 0; id < ggml_backend_rpc_get_device_count(); ++id) {
+        // Allocate each device's split buffer concurrently -- per-id (disjoint) writes to
+        // extra->buffer_ctx[id]/rows[id]; sockets pre-fetched + HELD so the weak_ptr cache
+        // can't churn under the workers (see the split upload). RPC_SERIAL_UPLOAD=1 reverts.
+        static const bool                      serial_alloc = getenv("RPC_SERIAL_UPLOAD") != nullptr;
+        const int                              n_dev        = ggml_backend_rpc_get_device_count();
+        std::vector<std::shared_ptr<socket_t>> socks(n_dev);
+        for (int id = 0; id < n_dev; ++id) {
+            socks[id] = get_socket(((ggml_backend_rpc_device_context *) reg_ctx->devices[id]->context)->endpoint);
+        }
+        std::vector<std::thread> threads;
+        auto alloc_split = [&](int id) {
             if (extra->split_dim == 1) {
                 int64_t row_low;
                 int64_t row_high;
                 rpc_get_row_split(&row_low, &row_high, tensor, buft_ctx->tensor_split, id);
-
                 int64_t nrows_split = row_high - row_low;
                 if (nrows_split == 0) {
-                    continue;
+                    return;
                 }
-                //it needs first to allocate the buffer on the server, since we didn't do it at the buffer allocation time
-                //so first calculate the size
-                size_t                            size    = ggml_nbytes_split(tensor, nrows_split);
-                rpc_msg_alloc_buffer_req          request = { size };
-                rpc_msg_alloc_buffer_rsp          response;
-                ggml_backend_rpc_device_context * dev_ctx =
-                    (ggml_backend_rpc_device_context *) reg_ctx->devices[id]->context;
-                auto sock = get_socket(dev_ctx->endpoint);
-                bool status =
-                    send_rpc_cmd(sock, RPC_CMD_ALLOC_BUFFER, &request, sizeof(request), &response, sizeof(response));
+                //it needs first to allocate the buffer on the server (not done at buffer-alloc time)
+                size_t                   size    = ggml_nbytes_split(tensor, nrows_split);
+                rpc_msg_alloc_buffer_req request = { size };
+                rpc_msg_alloc_buffer_rsp response;
+                bool status = send_rpc_cmd(socks[id], RPC_CMD_ALLOC_BUFFER, &request, sizeof(request), &response,
+                                           sizeof(response));
                 GGML_ASSERT(status);
                 if (response.remote_ptr != 0) {
-                    ggml_backend_rpc_buffer_context * buffer_ctx =
-                        new ggml_backend_rpc_buffer_context{ sock, nullptr, response.remote_ptr };
-                    extra->buffer_ctx[id] = buffer_ctx;
-                    extra->rows[id]       = { row_low, row_high };
-                    // GGML_LOG_INFO("row_low:%ld, row_high:%ld\n",row_low,row_high);
+                    extra->buffer_ctx[id] =
+                        new ggml_backend_rpc_buffer_context{ socks[id], nullptr, response.remote_ptr };
+                    extra->rows[id] = { row_low, row_high };
                 } else {
-                    GGML_LOG_INFO("[%s] failed to allocate buffer for tensor %s on device %d\n", __func__, tensor->name,
-                                  id);
+                    GGML_LOG_INFO("[%s] failed to allocate buffer for tensor %s on device %d\n", __func__,
+                                  tensor->name, id);
                     extra->buffer_ctx[id] = nullptr;
-                    continue;
                 }
             } else if (extra->split_dim == 0) {
                 int64_t col_low;
                 int64_t col_high;
                 rpc_get_col_split(&col_low, &col_high, tensor, buft_ctx->tensor_split, id);
-
                 int64_t ncols_split = col_high - col_low;
                 if (ncols_split == 0) {
-                    continue;
+                    return;
                 }
-                size_t                            size    = ggml_nbytes_split_col(tensor, ncols_split);
-                rpc_msg_alloc_buffer_req          request = { size };
-                rpc_msg_alloc_buffer_rsp          response;
-                ggml_backend_rpc_device_context * dev_ctx =
-                    (ggml_backend_rpc_device_context *) reg_ctx->devices[id]->context;
-                auto sock = get_socket(dev_ctx->endpoint);
-                bool status =
-                    send_rpc_cmd(sock, RPC_CMD_ALLOC_BUFFER, &request, sizeof(request), &response, sizeof(response));
+                size_t                   size    = ggml_nbytes_split_col(tensor, ncols_split);
+                rpc_msg_alloc_buffer_req request = { size };
+                rpc_msg_alloc_buffer_rsp response;
+                bool status = send_rpc_cmd(socks[id], RPC_CMD_ALLOC_BUFFER, &request, sizeof(request), &response,
+                                           sizeof(response));
                 GGML_ASSERT(status);
                 if (response.remote_ptr != 0) {
-                    ggml_backend_rpc_buffer_context * buffer_ctx =
-                        new ggml_backend_rpc_buffer_context{ sock, nullptr, response.remote_ptr };
-                    extra->buffer_ctx[id] = buffer_ctx;
-                    extra->rows[id]       = { col_low, col_high };
+                    extra->buffer_ctx[id] =
+                        new ggml_backend_rpc_buffer_context{ socks[id], nullptr, response.remote_ptr };
+                    extra->rows[id] = { col_low, col_high };
                 } else {
-                    GGML_LOG_INFO("[%s] failed to allocate buffer for tensor %s on device %d\n", __func__, tensor->name,
-                                  id);
+                    GGML_LOG_INFO("[%s] failed to allocate buffer for tensor %s on device %d\n", __func__,
+                                  tensor->name, id);
                     extra->buffer_ctx[id] = nullptr;
-                    continue;
                 }
             } else {
                 GGML_LOG_INFO("[%s] alloc split buffer for non-split tensor %s\n", __func__, tensor->name);
+            }
+        };
+        for (int id = 0; id < n_dev; ++id) {
+            if (serial_alloc) {
+                alloc_split(id);
+            } else {
+                threads.emplace_back(alloc_split, id);
+            }
+        }
+        for (auto & t : threads) {
+            if (t.joinable()) {
+                t.join();
             }
         }
         tensor->extra = extra;
@@ -1504,56 +1529,72 @@ static void ggml_backend_rpc_split_buffer_get_tensor(ggml_backend_buffer_t buffe
     //     (ggml_backend_rpc_split_buffer_type_context *) buffer->buft->context;
     const size_t            nb1        = tensor->nb[1];
     ggml_tensor_extra_rpc * extra      = (ggml_tensor_extra_rpc *) tensor->extra;
-    size_t                  total_size = 0;
+    std::atomic<size_t>     total_size{ 0 };
 
-    //TODO: in a parallel way
-    for (int id = 0; id < ggml_backend_rpc_get_device_count(); ++id) {
+    // Download each device's slice concurrently (latency-bound round-trips). Each
+    // thread writes a DISJOINT region of `data` (its own row/col range), so the only
+    // shared state is the atomic counter. Pre-fetch + HOLD the sockets on the main
+    // thread so the weak_ptr cache can't churn under the workers (see the split
+    // upload). RPC_SERIAL_UPLOAD=1 reverts to one-at-a-time.
+    static const bool                      serial_download = getenv("RPC_SERIAL_UPLOAD") != nullptr;
+    const int                              n_dev           = ggml_backend_rpc_get_device_count();
+    std::vector<std::shared_ptr<socket_t>> socks(n_dev);
+    for (int id = 0; id < n_dev; ++id) {
+        socks[id] = get_socket(((ggml_backend_rpc_device_context *) reg_ctx->devices[id]->context)->endpoint);
+    }
+    std::vector<std::thread> threads;
+
+    auto download_slice = [&](int id) {
         if (extra->split_dim == 1) {
-            int64_t row_low  = extra->rows[id].first;
-            int64_t row_high = extra->rows[id].second;
-
+            int64_t row_low     = extra->rows[id].first;
+            int64_t row_high    = extra->rows[id].second;
             int64_t nrows_split = row_high - row_low;
             if (nrows_split == 0) {
-                continue;
+                return;
             }
-
-            const size_t offset_split = row_low * nb1;
-            size_t       split_size   = ggml_nbytes_split(tensor, nrows_split);
-            // GGML_LOG_INFO("[%s] getting tensor %s on device %d, offset=%zu, size=%zu\n", __func__, tensor->name, id, offset_split, split_size);
-
+            const size_t           offset_split = row_low * nb1;
+            size_t                 split_size   = ggml_nbytes_split(tensor, nrows_split);
             rpc_msg_get_tensor_req request;
             request.tensor = split_serialize_tensor(tensor, (ggml_tensor_extra_rpc *) tensor->extra, id);
             request.offset = offset;
             request.size   = split_size;
-            ggml_backend_rpc_device_context * dev_ctx =
-                (ggml_backend_rpc_device_context *) reg_ctx->devices[id]->context;
-            bool status = send_rpc_cmd(get_socket(dev_ctx->endpoint), RPC_CMD_GET_TENSOR, &request, sizeof(request),
-                                       (void *) ((uint8_t *) data + offset_split), split_size);
+            bool status    = send_rpc_cmd(socks[id], RPC_CMD_GET_TENSOR, &request, sizeof(request),
+                                          (void *) ((uint8_t *) data + offset_split), split_size);
             GGML_ASSERT(status);
             total_size += split_size;
         } else if (extra->split_dim == 0) {
-            int64_t col_low  = extra->rows[id].first;
-            int64_t col_high = extra->rows[id].second;
-
+            int64_t col_low     = extra->rows[id].first;
+            int64_t col_high    = extra->rows[id].second;
             int64_t ncols_split = col_high - col_low;
             if (ncols_split == 0) {
-                continue;
+                return;
             }
             size_t                 split_size = ggml_nbytes_split_col(tensor, ncols_split);
             rpc_msg_get_tensor_req request;
             request.tensor = split_serialize_tensor(tensor, (ggml_tensor_extra_rpc *) tensor->extra, id);
             request.offset = offset;
             request.size   = split_size;
-            ggml_backend_rpc_device_context * dev_ctx =
-                (ggml_backend_rpc_device_context *) reg_ctx->devices[id]->context;
             std::vector<uint8_t> output_data(split_size);
-            bool status = send_rpc_cmd(get_socket(dev_ctx->endpoint), RPC_CMD_GET_TENSOR, &request, sizeof(request),
-                                       output_data.data(), split_size);
+            bool                 status = send_rpc_cmd(socks[id], RPC_CMD_GET_TENSOR, &request, sizeof(request),
+                                                       output_data.data(), split_size);
             GGML_ASSERT(status);
-            set_split_col_data(output_data.data(), tensor, col_low, col_high, data);
+            set_split_col_data(output_data.data(), tensor, col_low, col_high, data);  // disjoint cols per device
             total_size += split_size;
         } else {
             GGML_LOG_INFO("[%s] get split tensor for non-split tensor %s\n", __func__, tensor->name);
+        }
+    };
+
+    for (int id = 0; id < n_dev; ++id) {
+        if (serial_download) {
+            download_slice(id);
+        } else {
+            threads.emplace_back(download_slice, id);
+        }
+    }
+    for (auto & t : threads) {
+        if (t.joinable()) {
+            t.join();
         }
     }
     GGML_ASSERT(size == total_size);
