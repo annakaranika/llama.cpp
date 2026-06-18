@@ -997,6 +997,42 @@ static ggml_backend_buffer_i ggml_backend_rpc_buffer_interface = {
     /* .reset           = */ NULL,
 };
 
+// The split grid = the largest quant block among the model's split weights,
+// discovered at load (rpc_note_split_block, called from rpc_get_*_split as each
+// weight is split). Any split of a contraction dimension -- and the F32
+// activation that feeds it (which has no block of its own) -- must tile on this
+// grid so the producer's and consumer's slices agree. K-quants = 256, legacy
+// Q4_0/Q8_0 = 32, F16/F32 = 1. Starts at 1, raised as split weights are seen, so
+// it is correct by the time the first forward runs.
+static int64_t g_rpc_split_block = 1;
+
+static inline void rpc_note_split_block(const ggml_tensor * tensor) {
+    g_rpc_split_block = std::max<int64_t>(g_rpc_split_block, ggml_blck_size(tensor->type));
+}
+
+// Canonical per-device split boundary: device `id` gets [*low, *high) of `total`,
+// each boundary floored to a multiple of `align` (so a quantized dimension splits
+// on whole blocks). Single source of truth for rpc_get_row_split/rpc_get_col_split
+// AND the compute-time activation split, so a weight and the activation feeding it
+// tile on the exact same grid.
+static void rpc_split_range(int64_t total, int64_t align, const std::array<float, RPC_MAX_DEVICES> & tensor_split,
+                            int id, int64_t * low, int64_t * high) {
+    align              = std::max<int64_t>(align, 1);
+    const int64_t devs = ggml_backend_rpc_get_device_count();
+    *low               = (id == 0) ? 0 : (int64_t) (total * tensor_split[id]);
+    *low -= *low % align;
+    *high = (id == devs - 1) ? total : (int64_t) (total * tensor_split[id + 1]);
+    *high -= *high % align;
+}
+
+static int64_t rpc_split_count(int64_t total, int64_t align, const std::array<float, RPC_MAX_DEVICES> & tensor_split,
+                               int id) {
+    int64_t low  = 0;
+    int64_t high = 0;
+    rpc_split_range(total, align, tensor_split, id, &low, &high);
+    return high - low;
+}
+
 //split buffer interface
 static int64_t rpc_get_row_rounding(const std::array<float, RPC_MAX_DEVICES> & tensor_split) {
     int64_t row_rounding = 0;
@@ -1013,18 +1049,22 @@ static int64_t rpc_get_row_rounding(const std::array<float, RPC_MAX_DEVICES> & t
 
 static void rpc_get_row_split(int64_t * row_low, int64_t * row_high, const ggml_tensor * tensor,
                               const std::array<float, RPC_MAX_DEVICES> & tensor_split, int id) {
-    const int64_t nrows    = ggml_nrows(tensor);
-    const int64_t rounding = rpc_get_row_rounding(tensor_split);
-
-    *row_low = id == 0 ? 0 : nrows * tensor_split[id];
-    *row_low -= *row_low % rounding;
-
-    if (id == ggml_backend_rpc_get_device_count() - 1) {
-        *row_high = nrows;
-    } else {
-        *row_high = nrows * tensor_split[id + 1];
-        *row_high -= *row_high % rounding;
+    const int64_t nrows = ggml_nrows(tensor);
+    rpc_note_split_block(tensor);  // record this weight's quant block in the split grid
+    int64_t       rounding = rpc_get_row_rounding(tensor_split);
+    // A row-split tensor whose split dim pairs with a downstream COLUMN split on
+    // the same dim (ffn_gate/up rows -> ffn_down cols; q rows -> attn_output cols)
+    // must use the SAME boundaries as that col split (block-aligned), else producer
+    // and consumer slice the dim differently and the result is garbage. Only
+    // block-align when each device still gets >= one quant block, so a sub-block
+    // per-head split (k/v: num_kv_heads*d_k = 256, 64/device at N=4) is NOT
+    // collapsed onto a single device.
+    const int64_t devs  = ggml_backend_rpc_get_device_count();
+    const int64_t block = ggml_blck_size(tensor->type);
+    if (devs > 0 && nrows / devs >= block) {
+        rounding = std::max(rounding, block);
     }
+    rpc_split_range(nrows, rounding, tensor_split, id, row_low, row_high);
 }
 
 static size_t ggml_nbytes_split(const struct ggml_tensor * tensor, int nrows_split) {
@@ -1048,23 +1088,17 @@ static int64_t rpc_get_col_rounding(const std::array<float, RPC_MAX_DEVICES> & t
 
 static void rpc_get_col_split(int64_t * col_low, int64_t * col_high, const ggml_tensor * tensor,
                               const std::array<float, RPC_MAX_DEVICES> & tensor_split, int id) {
-    const int64_t ncols    = ggml_ncols(tensor);
-    // Column boundaries must land on quant-block edges: a quantized tensor cannot
-    // be split mid-block. ggml_nbytes_split_col() sizes the per-device buffer by
-    // truncated blocks while get_split_col_data() copies whole (ceil) blocks, so a
-    // non-block-aligned boundary overruns the buffer (heap overflow / segfault).
-    // N=2 happens to land on a block edge for these tensors; N>=4 does not.
+    const int64_t ncols = ggml_ncols(tensor);
+    rpc_note_split_block(tensor);  // record this weight's quant block in the split grid
+    // The column dimension (ne[0]) is the *quantized* dimension, so a split MUST
+    // land on a quant-block boundary, else ncols_split is a fractional number of
+    // blocks and the per-device byte size is computed inconsistently (ggml_row_size
+    // vs ceil-blocks in get_split_col_data vs floor-blocks in nb[1]) -> heap
+    // overflow / wrong shape. Buffer byte alignment alone (~32) is finer than a
+    // block (256 for Q5_K) so does NOT block-align; max() with the block size does.
+    // (N=2 lined up by luck; N>=4 did not.)
     const int64_t rounding = std::max(rpc_get_col_rounding(tensor_split), ggml_blck_size(tensor->type));
-
-    *col_low = id == 0 ? 0 : ncols * tensor_split[id];
-    *col_low -= *col_low % rounding;
-
-    if (id == ggml_backend_rpc_get_device_count() - 1) {
-        *col_high = ncols;
-    } else {
-        *col_high = ncols * tensor_split[id + 1];
-        *col_high -= *col_high % rounding;
-    }
+    rpc_split_range(ncols, rounding, tensor_split, id, col_low, col_high);
 }
 
 static size_t ggml_nbytes_split_col(const struct ggml_tensor * tensor, int ncols_split) {
@@ -1904,7 +1938,21 @@ static int change_ne_and_nb(ggml_tensor * tensor, rpc_tensor & rpc_t, std::map<g
                     float        split_part = (id == ggml_backend_rpc_get_device_count() - 1) ?
                                                   (1 - tensor_splits[id]) :
                                                   (tensor_splits[id + 1] - tensor_splits[id]);
-                    src_tensor.ne[0]        = split_part * src_tensor.ne[0];
+                    // Block-align the activation's contraction slice to the weight's
+                    // quant grid (g_rpc_split_block) so it matches the column-split
+                    // weight it feeds; raw split_part*ne[0] only lined up at N=2.
+                    // Guard: only when each device gets >= one block (small/per-head
+                    // views keep the fine-grained float split).
+                    {
+                        const int64_t devs = ggml_backend_rpc_get_device_count();
+                        const int64_t full = src_tensor.ne[0];
+                        if (devs > 0 && full / devs >= g_rpc_split_block) {
+                            const int64_t align = std::max(rpc_get_col_rounding(tensor_splits), g_rpc_split_block);
+                            src_tensor.ne[0]    = rpc_split_count(full, align, tensor_splits, id);
+                        } else {
+                            src_tensor.ne[0] = split_part * full;
+                        }
+                    }
                     src_tensor.nb[1] = src_tensor.ne[0] * src_tensor.nb[0] / ggml_blck_size(tensor->src[0]->type);
                     src_tensor.nb[2] = src_tensor.ne[1] * src_tensor.nb[1];
                     src_tensor.nb[3] = src_tensor.ne[2] * src_tensor.nb[2];
