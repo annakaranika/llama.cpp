@@ -2701,27 +2701,20 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         }
         return GGML_STATUS_SUCCESS;
     } else {
-        if(graph_splits.find((uint64_t)cgraph)==graph_splits.end()){
-            std::vector<uint8_t> input;
-            serialize_graph(cgraph, input);
-            rpc_msg_graph_compute_rsp response;
-            auto                      sock = get_socket(rpc_ctx->endpoint);
-            bool                      status =
-                send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size(), &response, sizeof(response));
-            GGML_ASSERT(status);
-            graph_splits[reinterpret_cast<uint64_t>(cgraph)] = global_graph_number;
-            global_graph_number++;
-            return (enum ggml_status) response.result;
-        }else{
-            GGML_LOG_INFO("graph %ld has been computed before with graph number %d, skip computation\n",
-                          (uint64_t)cgraph, graph_splits[reinterpret_cast<uint64_t>(cgraph)]);
-            rpc_msg_do_computation_req compute_info;
-            compute_info.graph_number = graph_splits[reinterpret_cast<uint64_t>(cgraph)];
-            auto                      sock = get_socket(rpc_ctx->endpoint);
-            bool status=send_rpc_cmd(sock,RPC_CMD_DO_COMPUTATION,&compute_info,sizeof(compute_info),nullptr,0);
-            GGML_ASSERT(status);
-            return GGML_STATUS_SUCCESS;
-        }
+        // Non-split (single device / no -sm row): always compute the graph
+        // inline on the server and return its status -- the stock llama.cpp RPC
+        // behavior. The graph_splits cache + DO_COMPUTATION path is only valid
+        // for the tensor-parallel store-then-execute flow above (the server
+        // stores graphs there); in non-split mode the server never stores, so a
+        // cached DO_COMPUTATION would have nothing to run.
+        std::vector<uint8_t> input;
+        serialize_graph(cgraph, input);
+        rpc_msg_graph_compute_rsp response;
+        auto                      sock   = get_socket(rpc_ctx->endpoint);
+        bool                      status =
+            send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size(), &response, sizeof(response));
+        GGML_ASSERT(status);
+        return (enum ggml_status) response.result;
     }
 }
 
@@ -3527,6 +3520,58 @@ void rpc_server::store_graph_compute_info(uint8_t graph_number, ggml_cgraph * cg
 }
 
 bool rpc_server::graph_compute(const std::vector<uint8_t> & input, rpc_msg_graph_compute_rsp & response) {
+    // Non-split / single-device path: the client only sends RPC_CMD_SET_SPLIT
+    // (which sets server_split) in tensor-parallel (-sm row) mode. Without it,
+    // the client uses the stock serialize_graph layout (no leading signal byte,
+    // no trailing graph_number) and expects the graph COMPUTED inline with its
+    // status returned -- standard llama.cpp RPC. The split path below instead
+    // STORES the graph for a later DO_COMPUTATION + peer all-reduce.
+    if (!server_split) {
+        // stock format: | n_nodes (4) | nodes (n_nodes*8) | n_tensors (4) | tensors (n_tensors*rpc_tensor) |
+        if (input.size() < sizeof(uint32_t)) {
+            return false;
+        }
+        uint32_t n_nodes;
+        memcpy(&n_nodes, input.data(), sizeof(n_nodes));
+        if (input.size() < sizeof(uint32_t) + (n_nodes * sizeof(uint64_t)) + sizeof(uint32_t)) {
+            return false;
+        }
+        const uint64_t * nodes = (const uint64_t *) (input.data() + sizeof(n_nodes));
+        uint32_t         n_tensors;
+        memcpy(&n_tensors, input.data() + sizeof(n_nodes) + (n_nodes * sizeof(uint64_t)), sizeof(n_tensors));
+        if (input.size() < sizeof(uint32_t) + (n_nodes * sizeof(uint64_t)) + sizeof(uint32_t) +
+                               (n_tensors * sizeof(rpc_tensor))) {
+            return false;
+        }
+        const rpc_tensor * tensors =
+            (const rpc_tensor *) (input.data() + sizeof(n_nodes) + (n_nodes * sizeof(uint64_t)) + sizeof(n_tensors));
+        size_t buf_size = (ggml_tensor_overhead() * (n_nodes + n_tensors)) + ggml_graph_overhead_custom(n_nodes, false);
+        struct ggml_init_params params = { /*.mem_size=*/ buf_size, /*.mem_buffer=*/ NULL, /*.no_alloc=*/ true };
+        struct ggml_context * ctx   = ggml_init(params);
+        struct ggml_cgraph *  graph = ggml_new_graph_custom(ctx, n_nodes, false);
+        graph->n_nodes              = n_nodes;
+        std::unordered_map<uint64_t, const rpc_tensor *> tensor_ptrs;
+        for (uint32_t i = 0; i < n_tensors; i++) {
+            tensor_ptrs[tensors[i].id] = &tensors[i];
+        }
+        std::unordered_map<uint64_t, ggml_tensor *> tensor_map;
+        try {
+            for (uint32_t i = 0; i < n_nodes; i++) {
+                int64_t id;
+                memcpy(&id, &nodes[i], sizeof(id));
+                graph->nodes[i] = create_node(id, ctx, tensor_ptrs, tensor_map);
+            }
+        } catch (const std::exception & e) {
+            GGML_LOG_ERROR("[%s] exception during node creation: %s\n", __func__, e.what());
+            ggml_free(ctx);
+            return false;
+        }
+        ggml_status status = ggml_backend_graph_compute(backend, graph);
+        response.result    = status;
+        ggml_free(ctx);
+        return true;
+    }
+
     // serialization format:
     // signal (1 byte) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) | graph_number (1 byte)
     // GGML_LOG_INFO("graph compute called with input size: %zu\n", input.size());
