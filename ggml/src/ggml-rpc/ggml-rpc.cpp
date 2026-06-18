@@ -1049,7 +1049,12 @@ static int64_t rpc_get_col_rounding(const std::array<float, RPC_MAX_DEVICES> & t
 static void rpc_get_col_split(int64_t * col_low, int64_t * col_high, const ggml_tensor * tensor,
                               const std::array<float, RPC_MAX_DEVICES> & tensor_split, int id) {
     const int64_t ncols    = ggml_ncols(tensor);
-    const int64_t rounding = rpc_get_col_rounding(tensor_split);
+    // Column boundaries must land on quant-block edges: a quantized tensor cannot
+    // be split mid-block. ggml_nbytes_split_col() sizes the per-device buffer by
+    // truncated blocks while get_split_col_data() copies whole (ceil) blocks, so a
+    // non-block-aligned boundary overruns the buffer (heap overflow / segfault).
+    // N=2 happens to land on a block edge for these tensors; N>=4 does not.
+    const int64_t rounding = std::max(rpc_get_col_rounding(tensor_split), ggml_blck_size(tensor->type));
 
     *col_low = id == 0 ? 0 : ncols * tensor_split[id];
     *col_low -= *col_low % rounding;
