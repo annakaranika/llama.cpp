@@ -3136,6 +3136,11 @@ class rpc_server {
     std::unordered_set<ggml_backend_buffer_t>                buffers;
     bool                                                     server_split = false;
     std::unordered_map<std::string, std::weak_ptr<socket_t>> sockets_connectto;  //sockets that the server connects to
+    // Hold a shared_ptr to each dialed peer socket so the weak_ptrs above don't
+    // expire. Otherwise create_peer_connection's local shared_ptr is released
+    // immediately and EVERY all-reduce re-dials its peers (a TCP handshake per
+    // peer, per layer, per token) -- the dominant decode cost over WiFi.
+    std::vector<std::shared_ptr<socket_t>>                   peer_socks_held;
     std::vector<std::weak_ptr<socket_t>>                     sockets_listento;   //sockets that the server listen to
     std::mutex                                               sockets_mutex;      //mutex for adding sockets to the list
     uint8_t                                                  device_id;          //device id for current server
@@ -3860,6 +3865,7 @@ bool rpc_server::create_peer_connection(const rpc_msg_create_peer_connection_req
     // GGML_LOG_INFO("creating peer connection\n");
     device_id    = request.device_id;
     device_count = request.device_count;
+    peer_socks_held.clear();  // re-init: drop any previously held peer sockets
 #ifdef _WIN32
     {
         WSADATA wsaData;
@@ -3890,6 +3896,7 @@ bool rpc_server::create_peer_connection(const rpc_msg_create_peer_connection_req
                 GGML_LOG_INFO("nullptr socket");
             }
             sockets_connectto[endpoint] = sock;
+            peer_socks_held.push_back(sock);  // keep alive so it isn't re-dialed every all-reduce
             GGML_LOG_INFO("create connection for device %s\n", endpoint.c_str());
         }
     }
