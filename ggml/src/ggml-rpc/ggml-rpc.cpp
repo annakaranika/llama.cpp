@@ -2843,11 +2843,19 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
             buf->iface.set_tensor(buf, tensor, data.data(), 0, data.size());
             static const bool dbg_timing = getenv("RPC_DBG_TIMING") != nullptr;
             if (dbg_timing) {
-                long long gs = g_graph_send_ns.load();
-                long long dc = g_do_comp_ns.load();
-                GGML_LOG_INFO("[rpc-timing] token %d: cumulative graph_send=%.2fs execute+allreduce=%.2fs "
-                              "(graph_send = %.1f%% of client wait)\n",
-                              ++g_compute_tokens, gs / 1e9, dc / 1e9, 100.0 * gs / (double) (gs + dc + 1));
+                // log THIS forward's split (delta since last) -- the first forward is the
+                // prompt eval (big execute, tiny graph-send %); decode forwards reveal the
+                // real steady-state ratio. Also keep the cumulative.
+                static long long prev_gs = 0, prev_dc = 0;
+                long long gs  = g_graph_send_ns.load();
+                long long dc  = g_do_comp_ns.load();
+                long long dgs = gs - prev_gs, ddc = dc - prev_dc;
+                prev_gs = gs;
+                prev_dc = dc;
+                GGML_LOG_INFO("[rpc-timing] fwd %d: this graph_send=%.3fs execute+allreduce=%.3fs (this=%.1f%%) "
+                              "| cumulative=%.1f%%\n",
+                              ++g_compute_tokens, dgs / 1e9, ddc / 1e9,
+                              100.0 * dgs / (double) (dgs + ddc + 1), 100.0 * gs / (double) (gs + dc + 1));
             }
         }
         return GGML_STATUS_SUCCESS;
