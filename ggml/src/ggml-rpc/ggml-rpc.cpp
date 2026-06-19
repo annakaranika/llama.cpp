@@ -2621,17 +2621,19 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
     static struct sync_split change_split;
     // GGML_LOG_INFO("[%s] computing graph with %d nodes\n", __func__, cgraph->n_nodes);
     if (split) {
-        // The split (-sm row) decode graph is structurally identical across tokens
-        // once it settles (verified via RPC_DBG_GHASH: a constant op/type/shape/name
-        // hash from ~token 3 on; n_kv is bucket-padded so it does not drift within a
-        // bucket). RPC_GRAPH_CACHE exploits that: key a cache on the pointer-
-        // INDEPENDENT structural hash and, on a hit, skip re-shipping the ~44 per-
-        // segment graphs -- the server still holds them and do_computation is re-
-        // entrant, so we just re-run by graph_number with this token's fresh inputs
-        // (set_tensor already updated them server-side). The previous attempt keyed
-        // on the cgraph POINTER, which is reused but whose contents differ during
-        // warmup -> unsafe; a content hash hits cleanly only once settled.
-        // RPC_DBG_GHASH only logs the hash. Both default off -> no behavior change.
+        // RPC_GRAPH_CACHE: skip re-shipping the ~44 per-segment graphs when a token's
+        // graph is structurally identical to one the servers already hold (the server
+        // is re-entrant and re-runs by graph_number with this token's fresh inputs).
+        // The key MUST include view_offs/strides: op/type/shape/name are stable across
+        // decode tokens, but the KV-cache WRITE position lives in a node's view_offs and
+        // advances every token, so the full graph genuinely DIFFERS each token. A correct
+        // (view_offs-inclusive) hash therefore gets ~0 hits in autoregressive decode ->
+        // this simple whole-graph skip is correct (never a false hit) but a no-op for
+        // decode. (Excluding view_offs made false hits that re-ran a stale-KV-position
+        // graph -> garbage; that, not tensor-pointer instability, is why graph caching
+        // was shelved.) Capturing the ~20% graph-send would need a DIFF cache: ship the
+        // structure once, then per token re-send only the few changed view_offs and patch
+        // them server-side. RPC_DBG_GHASH logs the hash. Both default off.
         static const bool                            dbg_ghash       = getenv("RPC_DBG_GHASH") != nullptr;
         static const bool                            use_graph_cache = getenv("RPC_GRAPH_CACHE") != nullptr;
         static std::unordered_map<uint64_t, uint8_t> graph_cache;  // structural hash -> server graph_number
@@ -2651,6 +2653,8 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                 mix(&nd->op, sizeof(nd->op));
                 mix(&nd->type, sizeof(nd->type));
                 mix(nd->ne, sizeof(nd->ne));
+                mix(nd->nb, sizeof(nd->nb));            // strides
+                mix(&nd->view_offs, sizeof(nd->view_offs));  // KV-cache write position advances per token
                 mix(nd->name, sizeof(nd->name));
             }
         }
@@ -3020,16 +3024,23 @@ class all_reduce_block {
   public:
     all_reduce_block() {}
 
-    all_reduce_block(ggml_tensor * tensor, int op, int device_count, ggml_backend_t backend);
+    all_reduce_block(ggml_tensor * tensor, int op, int device_count, ggml_backend_t backend, uint32_t seq);
     ~all_reduce_block();
-    bool block_init(ggml_tensor * tensor, int op, int device_count, ggml_backend_t backend, uint8_t device_id);
+    bool block_init(ggml_tensor * tensor, int op, int device_count, ggml_backend_t backend, uint8_t device_id,
+                    uint32_t seq);
     bool add(std::vector<uint8_t> & input, uint8_t device_id);
 
-    bool add_to_buffer(std::vector<uint8_t> input) {
+    // Buffer a partial that arrived before we reached this all-reduce, keyed by its
+    // sequence (token). Lets a peer run ahead without its partial being misapplied to
+    // the wrong token or lost on reset -- needed once the graph cache removes the
+    // GRAPH_COMPUTE round-trips that used to implicitly barrier the peers.
+    bool add_to_buffer(uint32_t seq, const std::vector<uint8_t> & input) {
         std::lock_guard<std::mutex> lock(add_mutex);
-        all_reduce_buffer.push_back(input);
+        all_reduce_buffer[seq].push_back(input);
         return true;
     }
+
+    uint32_t get_current_seq() const { return current_seq; }
 
     //reset the block for the next-time use
     void block_uinit() {
@@ -3044,7 +3055,6 @@ class all_reduce_block {
 
     bool wait_for_completion();
 
-    std::vector<std::vector<uint8_t>> & get_all_reduce_buffer() { return all_reduce_buffer; }
   private:
     bool                              initialized = false;    //whether the tensor to be reduced has been set
     ggml_cgraph *                     graph       = nullptr;  //addition graph
@@ -3058,7 +3068,9 @@ class all_reduce_block {
     std::condition_variable           cv;                     //condition variable for signaling
     bool                              is_completed = false;   //whether the all-reduce is completed
     int                               arrived      = 0;       //number of servers that have received data
-    std::vector<std::vector<uint8_t>> all_reduce_buffer;      //buffer for storing data added before initialization
+    std::unordered_map<uint32_t, std::vector<std::vector<uint8_t>>>
+                                      all_reduce_buffer;       //seq(token) -> partials that arrived before init
+    uint32_t                          current_seq = 0;         //the sequence (token) this block is reducing now
     ggml_backend_t                    backend;                //backend type
     struct ggml_context *             ctx;
 };
@@ -3075,11 +3087,13 @@ bool all_reduce_block::wait_for_completion() {
 //function description: create the all_reduce_block for a specific tensor and initialize it by the current server, create the add tensor and graph
 //when to be called:    when the current server finishes graph computing
 //note:                 since the first time to be called, no data in the buffer
-all_reduce_block::all_reduce_block(ggml_tensor * tensor, int op, int device_count, ggml_backend_t backend) :
+all_reduce_block::all_reduce_block(ggml_tensor * tensor, int op, int device_count, ggml_backend_t backend,
+                                   uint32_t seq) :
     op(op),
     num_of_servers(device_count),
     backend(backend) {
     // GGML_LOG_INFO("all_reduce_block called\n");
+    current_seq = seq;  // first all-reduce of this tensor on this server -> token `seq`
     //set tensor to be reduced
     this->tensor = tensor;
 
@@ -3136,11 +3150,12 @@ all_reduce_block::all_reduce_block(ggml_tensor * tensor, int op, int device_coun
 //when to be called:    when the server receiving all_reduce msg from other servers
 //note: only update pointer to tensor and create buffer for add if graph exists, else create the graph
 bool all_reduce_block::block_init(ggml_tensor * tensor, int op, int device_count, ggml_backend_t backend,
-                                  uint8_t device_id) {
+                                  uint8_t device_id, uint32_t seq) {
     // GGML_LOG_INFO("all_reduce_block init called\n");
     if (initialized) {
         return true;
     }
+    current_seq = seq;  // this block now reduces token `seq`; only matching partials apply
 
     //initialize the block
     // GGML_LOG_INFO("initializing the block\n");
@@ -3181,12 +3196,13 @@ bool all_reduce_block::block_init(ggml_tensor * tensor, int op, int device_count
     //increment arrived count
     arrived++;
 
-    //add data in the buffer if not empty
-    if (!all_reduce_buffer.empty()) {
-        for (auto it = all_reduce_buffer.begin(); it != all_reduce_buffer.end(); /* no increment here */) {
-            add(*it, device_id);
-            it = all_reduce_buffer.erase(it);
+    //apply any partials that arrived early for THIS sequence (token); leave others buffered
+    auto buf_it = all_reduce_buffer.find(current_seq);
+    if (buf_it != all_reduce_buffer.end()) {
+        for (auto & part : buf_it->second) {
+            add(part, device_id);
         }
+        all_reduce_buffer.erase(buf_it);
     }
     return true;
 }
@@ -3225,10 +3241,15 @@ bool all_reduce_block::add(std::vector<uint8_t> & input, uint8_t device_id) {
 
     arrived++;
 
-    //if all_reduce is done, notify the main thread that waiting for all_reduce result
+    //if all_reduce is done, notify the thread in wait_for_completion. Set the predicate
+    //UNDER wait_mutex so the wakeup can't be lost (a lost wakeup here stalls for the full
+    //RPC_ALLREDUCE_TIMEOUT -- which is what surfaced once the graph cache let peers drift).
     if (arrived >= num_of_servers) {
-        is_completed = true;
-        initialized  = false;
+        {
+            std::lock_guard<std::mutex> wlock(wait_mutex);
+            is_completed = true;
+            initialized  = false;
+        }
         cv.notify_all();
     }
     GGML_UNUSED(device_id);
@@ -3346,6 +3367,7 @@ class rpc_server {
     uint8_t                                                  device_id;          //device id for current server
     uint8_t                                                  device_count;       //total num of servers
     std::unordered_map<std::string, all_reduce_block *>      all_reduce_blocks;  //blocks for all reduce
+    std::unordered_map<std::string, uint32_t>                all_reduce_seq;     //per-tensor all-reduce sequence (token)
     std::mutex                                               block_mutex;        //mutex for adding or checking blocks
     std::unordered_map<uint8_t, graph_compute_info *> graph_compute_infos;  // map graph_number to graph_compute_info
 };
@@ -4094,11 +4116,14 @@ bool rpc_server::do_computation(const rpc_msg_do_computation_req & request) {
             return false;
         }
 
-        //get the data to be sent first
+        //get the data to be sent first. Layout: seq(4) | name(GGML_MAX_NAME) | data.
+        //seq (filled in for the all-reduce below) tags the partial with its token so a
+        //peer running ahead is buffered by sequence on the receiver, not misapplied.
         std::vector<uint8_t> add_data;
-        add_data.resize(ggml_nbytes(tensor_to_all_reduce) + sizeof(tensor_to_all_reduce->name), 0);
-        memcpy(add_data.data(), tensor_to_all_reduce->name, sizeof(tensor_to_all_reduce->name));
-        ggml_backend_tensor_get(tensor_to_all_reduce, add_data.data() + sizeof(tensor_to_all_reduce->name), 0,
+        add_data.resize(sizeof(uint32_t) + sizeof(tensor_to_all_reduce->name) + ggml_nbytes(tensor_to_all_reduce), 0);
+        memcpy(add_data.data() + sizeof(uint32_t), tensor_to_all_reduce->name, sizeof(tensor_to_all_reduce->name));
+        ggml_backend_tensor_get(tensor_to_all_reduce,
+                                add_data.data() + sizeof(uint32_t) + sizeof(tensor_to_all_reduce->name), 0,
                                 ggml_nbytes(tensor_to_all_reduce));
         //now broadcast result to all connected clients
         // GGML_LOG_INFO("Broadcasting all reduce if needed, signal=%d, tensor name: %s", signal, graph->nodes[graph->n_nodes - 1]->name);
@@ -4108,19 +4133,28 @@ bool rpc_server::do_computation(const rpc_msg_do_computation_req & request) {
 
             // GGML_LOG_INFO("doing all reduce for tensor %s\n", tensor_name.c_str());
 
+            //sequence-tag this all-reduce: the Nth reduce of this tensor name == token N.
+            //Both peers run the same graph order, so they agree on seq -> partials match.
+            uint32_t seq = ++all_reduce_seq[tensor_name];
+            memcpy(add_data.data(), &seq, sizeof(uint32_t));
+            static const bool dbg_ar = getenv("RPC_DBG_AR") != nullptr;
+            if (dbg_ar) {
+                GGML_LOG_INFO("[ar-send] gnum=%d %s seq=%u\n", graph_number, tensor_name.c_str(), seq);
+            }
+
             //first setup for itself
             block_mutex.lock();
             auto it = all_reduce_blocks.find(tensor_name);
             if (it != all_reduce_blocks.end()) {
                 GGML_LOG_INFO("all_reduce block for tensor %s already exists\n", tensor_name.c_str());
                 //if the block already exists, just reinit it
-                it->second->block_init(tensor_to_all_reduce, signal, device_count, backend, device_id);
+                it->second->block_init(tensor_to_all_reduce, signal, device_count, backend, device_id, seq);
             } else {
                 GGML_LOG_INFO("creating all_reduce block for tensor %s\n", tensor_name.c_str());
                 try {
                     //if not, create the block and add it to the map
                     all_reduce_block * block =
-                        new all_reduce_block(tensor_to_all_reduce, signal, device_count, backend);
+                        new all_reduce_block(tensor_to_all_reduce, signal, device_count, backend, seq);
                     all_reduce_blocks[tensor_name] = block;
                 } catch (const std::exception & e) {
                     GGML_LOG_INFO("[%s] error: %s\n", __func__, e.what());
@@ -4216,6 +4250,7 @@ bool rpc_server::create_peer_connection(const rpc_msg_create_peer_connection_req
             delete block.second;
         }
         all_reduce_blocks.clear();
+        all_reduce_seq.clear();  // restart all-reduce sequence numbers for the new run (both peers reset together)
     }
     for (auto & info : graph_compute_infos) {
         delete info.second;
@@ -4262,12 +4297,15 @@ bool rpc_server::create_peer_connection(const rpc_msg_create_peer_connection_req
 bool rpc_server::all_reduce(std::vector<uint8_t> & input) {
     // GGML_LOG_INFO("receiving all reduce, size: %ld\n",input.size());
 
-    //parse the tensor_name and tensor_data
+    //parse seq | tensor_name | tensor_data (layout matches do_computation's add_data)
+    uint32_t seq;
+    memcpy(&seq, input.data(), sizeof(uint32_t));
     char tensor_name_[GGML_MAX_NAME];
-    memcpy(tensor_name_, input.data(), sizeof(tensor_name_));
+    memcpy(tensor_name_, input.data() + sizeof(uint32_t), sizeof(tensor_name_));
     std::vector<uint8_t> tensor_data;
-    tensor_data.resize(input.size() - sizeof(tensor_name_), 0);
-    memcpy(tensor_data.data(), input.data() + sizeof(tensor_name_), tensor_data.size());
+    size_t               data_off = sizeof(uint32_t) + sizeof(tensor_name_);
+    tensor_data.resize(input.size() - data_off, 0);
+    memcpy(tensor_data.data(), input.data() + data_off, tensor_data.size());
 
     // std::string filename=std::to_string(device_id);
     // GGML_LOG_INFO("dumping to file %s\n",filename.c_str());
@@ -4285,29 +4323,29 @@ bool rpc_server::all_reduce(std::vector<uint8_t> & input) {
     //check whether the matched all reduce block exists
     block_mutex.lock();
     auto it = all_reduce_blocks.find(tensor_name);
+    static const bool dbg_ar = getenv("RPC_DBG_AR") != nullptr;
+    if (dbg_ar) {
+        GGML_LOG_INFO("[ar-recv] %s seq=%u cur=%u exists=%d init=%d\n", tensor_name.c_str(), seq,
+                      it == all_reduce_blocks.end() ? 0 : it->second->get_current_seq(),
+                      it != all_reduce_blocks.end(), it != all_reduce_blocks.end() && it->second->is_init());
+    }
     if (it == all_reduce_blocks.end()) {
-        // GGML_LOG_INFO("no all_reduce block found for tensor %s, going to buffer it", tensor_name.c_str());
+        // no block yet -> buffer this partial under its sequence until we reach it
         try {
             all_reduce_block * block = new all_reduce_block();
-            block->add_to_buffer(tensor_data);
+            block->add_to_buffer(seq, tensor_data);
             all_reduce_blocks[tensor_name] = block;
         } catch (const std::exception & e) {
             GGML_LOG_INFO("[%s] error: %s\n", __func__, e.what());
         }
-    } else {
-        //if the block exists, check whether it's initialized
-        if (it->second->is_init()) {
-            //just do the addition
-            // GGML_LOG_INFO("all_reduce block for tensor %s found, adding data\n", tensor_name.c_str());
-            it->second->add(tensor_data, device_id);
-
-        } else {
-            //first buffer it
-            // GGML_LOG_INFO("all_reduce block for tensor %s found but not initialized, buffering data\n",
-            //   tensor_name.c_str());
-            it->second->add_to_buffer(tensor_data);
-        }
+    } else if (it->second->is_init() && seq == it->second->get_current_seq()) {
+        //the block is reducing exactly this token -> apply now
+        it->second->add(tensor_data, device_id);
+    } else if (seq > it->second->get_current_seq()) {
+        //peer is ahead of us on this tensor -> buffer until we reach this token
+        it->second->add_to_buffer(seq, tensor_data);
     }
+    //else: seq <= current_seq but not the active reduce -> stale duplicate, drop
     block_mutex.unlock();
     return true;
 }
