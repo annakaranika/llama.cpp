@@ -8,6 +8,7 @@
 #include <sys/stat.h>  // mkdir, for the on-disk weight cache
 
 #include <algorithm>
+#include <chrono>
 #include <array>
 #include <atomic>
 #include <cinttypes>
@@ -2600,6 +2601,13 @@ static void add_data_to_data(std::vector<uint8_t> & data, ggml_tensor * tensor, 
  * - Thread safety is ensured via mutexes when aggregating results from multiple devices.
  * - The function asserts on RPC failures and unexpected tensor states.
  */
+// RPC_DBG_TIMING: per-token split of the client's wall-time -- GRAPH_COMPUTE
+// round-trips (graph transfer+store) vs DO_COMPUTATION round-trips (servers'
+// execute + peer-to-peer all-reduce). Cumulative; logged once per token.
+static std::atomic<long long> g_graph_send_ns{ 0 };
+static std::atomic<long long> g_do_comp_ns{ 0 };
+static std::atomic<int>       g_compute_tokens{ 0 };
+
 static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     // GGML_LOG_INFO("graph compute for cgraph %x\n", (uint64_t) cgraph);
     static std::unordered_map<uint64_t, uint8_t> graph_splits;  //{graph: number}
@@ -2764,8 +2772,11 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
 
                         //here the graph_compute commend actually not do the compute, but store the graph
                         //we will have another commend that will tell the servers to compute
+                        auto _t_gs  = std::chrono::steady_clock::now();
                         bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size(), &response,
                                                    sizeof(response));
+                        g_graph_send_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                               std::chrono::steady_clock::now() - _t_gs).count();
                         GGML_ASSERT(status);
 
                         if (response.result != GGML_STATUS_SUCCESS) {
@@ -2806,8 +2817,11 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
 
                 rpc_msg_do_computation_req compute_info;
                 compute_info.graph_number = graph_splits[reinterpret_cast<uint64_t>(cgraph)];
+                auto _t_dc  = std::chrono::steady_clock::now();
                 bool status =
                     send_rpc_cmd(sock, RPC_CMD_DO_COMPUTATION, &compute_info, sizeof(compute_info), nullptr, 0);
+                g_do_comp_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now() - _t_dc).count();
                 GGML_ASSERT(status);
 
                 if (strcmp(tensor->name, "result_output") == 0) {
@@ -2827,6 +2841,14 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         if (strcmp(tensor->name, "result_output") == 0) {
             ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
             buf->iface.set_tensor(buf, tensor, data.data(), 0, data.size());
+            static const bool dbg_timing = getenv("RPC_DBG_TIMING") != nullptr;
+            if (dbg_timing) {
+                long long gs = g_graph_send_ns.load();
+                long long dc = g_do_comp_ns.load();
+                GGML_LOG_INFO("[rpc-timing] token %d: cumulative graph_send=%.2fs execute+allreduce=%.2fs "
+                              "(graph_send = %.1f%% of client wait)\n",
+                              ++g_compute_tokens, gs / 1e9, dc / 1e9, 100.0 * gs / (double) (gs + dc + 1));
+            }
         }
         return GGML_STATUS_SUCCESS;
     } else {
