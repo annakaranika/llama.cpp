@@ -2621,9 +2621,58 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
     static struct sync_split change_split;
     // GGML_LOG_INFO("[%s] computing graph with %d nodes\n", __func__, cgraph->n_nodes);
     if (split) {
-        //check wether the graph is stored at the server
-        // if(graph_splits.find((uint64_t)cgraph)==graph_splits.end())
-        {
+        // The split (-sm row) decode graph is structurally identical across tokens
+        // once it settles (verified via RPC_DBG_GHASH: a constant op/type/shape/name
+        // hash from ~token 3 on; n_kv is bucket-padded so it does not drift within a
+        // bucket). RPC_GRAPH_CACHE exploits that: key a cache on the pointer-
+        // INDEPENDENT structural hash and, on a hit, skip re-shipping the ~44 per-
+        // segment graphs -- the server still holds them and do_computation is re-
+        // entrant, so we just re-run by graph_number with this token's fresh inputs
+        // (set_tensor already updated them server-side). The previous attempt keyed
+        // on the cgraph POINTER, which is reused but whose contents differ during
+        // warmup -> unsafe; a content hash hits cleanly only once settled.
+        // RPC_DBG_GHASH only logs the hash. Both default off -> no behavior change.
+        static const bool                            dbg_ghash       = getenv("RPC_DBG_GHASH") != nullptr;
+        static const bool                            use_graph_cache = getenv("RPC_GRAPH_CACHE") != nullptr;
+        static std::unordered_map<uint64_t, uint8_t> graph_cache;  // structural hash -> server graph_number
+
+        uint64_t struct_hash = 0;
+        if (dbg_ghash || use_graph_cache) {
+            struct_hash = 1469598103934665603ULL;  // FNV-1a over op/type/shape/name (no pointers)
+            auto mix    = [&](const void * p, size_t n) {
+                const uint8_t * b = (const uint8_t *) p;
+                for (size_t i = 0; i < n; i++) {
+                    struct_hash ^= b[i];
+                    struct_hash *= 1099511628211ULL;
+                }
+            };
+            for (int i = 0; i < cgraph->n_nodes; i++) {
+                ggml_tensor * nd = cgraph->nodes[i];
+                mix(&nd->op, sizeof(nd->op));
+                mix(&nd->type, sizeof(nd->type));
+                mix(nd->ne, sizeof(nd->ne));
+                mix(nd->name, sizeof(nd->name));
+            }
+        }
+        if (dbg_ghash) {
+            static uint64_t prev_h = 0;
+            GGML_LOG_INFO("[rpc-ghash] cgraph=%p n_nodes=%d hash=%016llx %s\n", (void *) cgraph, cgraph->n_nodes,
+                          (unsigned long long) struct_hash, prev_h == struct_hash ? "(SAME as prev)" : "(changed)");
+            prev_h = struct_hash;
+        }
+
+        auto    cache_it          = use_graph_cache ? graph_cache.find(struct_hash) : graph_cache.end();
+        bool    cache_hit         = use_graph_cache && cache_it != graph_cache.end();
+        uint8_t this_graph_number = cache_hit ? cache_it->second : global_graph_number;
+        if (use_graph_cache) {
+            static int hits   = 0;
+            static int misses = 0;
+            cache_hit ? ++hits : ++misses;
+            GGML_LOG_INFO("[rpc-gcache] %s gnum=%d (hits=%d misses=%d)\n", cache_hit ? "HIT " : "MISS",
+                          this_graph_number, hits, misses);
+        }
+        // MISS: ship the graph structure to the servers (a cache HIT skips all of this).
+        if (!cache_hit) {
             // Find next synchronization point
             std::vector<struct sync_split> sync_splits;
             uint32_t                       count_nodes_low = 0;
@@ -2766,7 +2815,7 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                         uint8_t * in_graph_number =
                             (uint8_t *) (input.data() + sizeof(uint8_t) + sizeof(n_nodes) + n_nodes * sizeof(uint64_t) +
                                          sizeof(uint32_t) + n_tensors * sizeof(rpc_tensor));
-                        *in_graph_number = global_graph_number;
+                        *in_graph_number = this_graph_number;
 
                         rpc_msg_graph_compute_rsp response;
 
@@ -2796,6 +2845,9 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
             }
 
             graph_splits[reinterpret_cast<uint64_t>(cgraph)] = global_graph_number;
+            if (use_graph_cache) {
+                graph_cache[struct_hash] = this_graph_number;  // remember: this structure -> this graph_number
+            }
             global_graph_number++;
         }
         // else{
@@ -2816,7 +2868,7 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                 auto sock    = get_socket(dev_ctx->endpoint);
 
                 rpc_msg_do_computation_req compute_info;
-                compute_info.graph_number = graph_splits[reinterpret_cast<uint64_t>(cgraph)];
+                compute_info.graph_number = this_graph_number;
                 auto _t_dc  = std::chrono::steady_clock::now();
                 bool status =
                     send_rpc_cmd(sock, RPC_CMD_DO_COMPUTATION, &compute_info, sizeof(compute_info), nullptr, 0);
