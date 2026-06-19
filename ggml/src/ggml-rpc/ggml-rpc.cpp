@@ -2665,6 +2665,40 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
             prev_h = struct_hash;
         }
 
+        // RPC_DBG_DIFF: size the diff-cache. Per token, count how many nodes differ
+        // from the previous same-topology token in view_offs vs nb vs ne/op. If only a
+        // few change (the KV writes), a diff cache (resend only those) is worthwhile.
+        static const bool dbg_diff = getenv("RPC_DBG_DIFF") != nullptr;
+        if (dbg_diff) {
+            static std::unordered_map<uint64_t, std::vector<std::array<uint64_t, 2>>> prev;  // topo-hash -> per-node [voffs,nb1]
+            uint64_t topo = 1469598103934665603ULL;  // hash EXCLUDING view_offs (topology only)
+            for (int i = 0; i < cgraph->n_nodes; i++) {
+                ggml_tensor * nd = cgraph->nodes[i];
+                for (auto v : { (uint64_t) nd->op, (uint64_t) nd->type, (uint64_t) nd->ne[0], (uint64_t) nd->ne[1] }) {
+                    topo ^= v; topo *= 1099511628211ULL;
+                }
+            }
+            auto & pv = prev[topo];
+            int    dv = 0;
+            int    dn = 0;
+            if ((int) pv.size() == cgraph->n_nodes) {
+                for (int i = 0; i < cgraph->n_nodes; i++) {
+                    if (cgraph->nodes[i]->view_offs != pv[i][0]) {
+                        dv++;
+                    }
+                    if (cgraph->nodes[i]->nb[1] != pv[i][1]) {
+                        dn++;
+                    }
+                }
+                GGML_LOG_INFO("[rpc-diff] n_nodes=%d view_offs_changed=%d nb_changed=%d (%.1f%% dynamic)\n",
+                              cgraph->n_nodes, dv, dn, 100.0 * dv / cgraph->n_nodes);
+            }
+            pv.resize(cgraph->n_nodes);
+            for (int i = 0; i < cgraph->n_nodes; i++) {
+                pv[i] = { (uint64_t) cgraph->nodes[i]->view_offs, (uint64_t) cgraph->nodes[i]->nb[1] };
+            }
+        }
+
         auto    cache_it          = use_graph_cache ? graph_cache.find(struct_hash) : graph_cache.end();
         bool    cache_hit         = use_graph_cache && cache_it != graph_cache.end();
         uint8_t this_graph_number = cache_hit ? cache_it->second : global_graph_number;
