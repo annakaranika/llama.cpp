@@ -2990,7 +2990,7 @@ class all_reduce_block {
 
     bool is_init() { return initialized; }
 
-    void wait_for_completion();
+    bool wait_for_completion();
 
     std::vector<std::vector<uint8_t>> & get_all_reduce_buffer() { return all_reduce_buffer; }
   private:
@@ -3011,9 +3011,13 @@ class all_reduce_block {
     struct ggml_context *             ctx;
 };
 
-void all_reduce_block::wait_for_completion() {
+bool all_reduce_block::wait_for_completion() {
     std::unique_lock<std::mutex> lock(wait_mutex);
-    cv.wait(lock, [this] { return is_completed; });
+    // Bounded wait: a lost partial over lossy wifi must not deadlock forever.
+    // Return false on timeout so the caller aborts the compute cleanly (run is
+    // retriable) instead of hanging. Override seconds via RPC_ALLREDUCE_TIMEOUT.
+    static const int timeout_s = getenv("RPC_ALLREDUCE_TIMEOUT") ? atoi(getenv("RPC_ALLREDUCE_TIMEOUT")) : 30;
+    return cv.wait_for(lock, std::chrono::seconds(timeout_s), [this] { return is_completed; });
 }
 
 //function description: create the all_reduce_block for a specific tensor and initialize it by the current server, create the add tensor and graph
@@ -3967,6 +3971,11 @@ static void compare_two_graph(ggml_cgraph * graph, ggml_cgraph * graph_to_compar
     }
 }
 
+// RPC_DBG_TIMING (server side): split the do_computation time into local graph
+// execute vs the all-reduce (broadcast partial + wait). Cumulative; logged per call.
+static std::atomic<long long> g_srv_exec_ns{ 0 };
+static std::atomic<long long> g_srv_allreduce_ns{ 0 };
+
 bool rpc_server::do_computation(const rpc_msg_do_computation_req & request) {
     // GGML_LOG_INFO("do computation called\n");
     uint8_t           graph_number   = request.graph_number;
@@ -4022,8 +4031,11 @@ bool rpc_server::do_computation(const rpc_msg_do_computation_req & request) {
 
         info = info->next;
         try {
+            auto        _te    = std::chrono::steady_clock::now();
             ggml_status status = ggml_backend_graph_compute(backend, graph);
             GGML_ASSERT(status == GGML_STATUS_SUCCESS);
+            g_srv_exec_ns +=
+                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - _te).count();
         } catch (const std::exception & e) {
             GGML_LOG_INFO("[%s] exception during graph compute: %s\n", __func__, e.what());
             ggml_free(ctx);
@@ -4039,6 +4051,7 @@ bool rpc_server::do_computation(const rpc_msg_do_computation_req & request) {
         //now broadcast result to all connected clients
         // GGML_LOG_INFO("Broadcasting all reduce if needed, signal=%d, tensor name: %s", signal, graph->nodes[graph->n_nodes - 1]->name);
         if (signal == 0) {
+            auto _ta = std::chrono::steady_clock::now();
             //get the tensor to be all reduced
 
             // GGML_LOG_INFO("doing all reduce for tensor %s\n", tensor_name.c_str());
@@ -4097,13 +4110,26 @@ bool rpc_server::do_computation(const rpc_msg_do_computation_req & request) {
 
             //wait for another thread to notify that all_reduce is done
             GGML_LOG_INFO("waiting for all_reduce to complete for tensor %s\n", tensor_name.c_str());
-            all_reduce_blocks[tensor_name]->wait_for_completion();
+            if (!all_reduce_blocks[tensor_name]->wait_for_completion()) {
+                GGML_LOG_ERROR("[%s] all-reduce TIMEOUT for tensor %s (lost partial?) -- aborting graph\n",
+                               __func__, tensor_name.c_str());
+                return false;  // clean abort instead of hanging; client run can retry
+            }
 
             //uninit the block
             all_reduce_blocks[tensor_name]->block_uinit();
+            g_srv_allreduce_ns +=
+                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - _ta).count();
         }
     }
 
+    static const bool dbg_timing = getenv("RPC_DBG_TIMING") != nullptr;
+    if (dbg_timing) {
+        long long ex = g_srv_exec_ns.load();
+        long long ar = g_srv_allreduce_ns.load();
+        GGML_LOG_INFO("[rpc-srv-timing] cumulative exec=%.2fs all_reduce=%.2fs (exec=%.1f%% all_reduce=%.1f%%)\n",
+                      ex / 1e9, ar / 1e9, 100.0 * ex / (double) (ex + ar + 1), 100.0 * ar / (double) (ex + ar + 1));
+    }
     return true;
 }
 
