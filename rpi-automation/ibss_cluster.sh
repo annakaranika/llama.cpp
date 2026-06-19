@@ -127,5 +127,33 @@ EOF
       sudo route -n delete 192.168.4.0/24 2>/dev/null && echo "removed Mac route 192.168.4.0/24"
     fi
     ;;
-  *) echo "usage: ibss_cluster.sh {up|down|status|ssh <cell-num>|ssh-config|route [add|del]}" >&2; exit 2 ;;
+  gateway)
+    # Give the cell Pis internet through rpi1 (so they can `git pull` etc. directly).
+    # `gateway on` = rpi1 ip_forward + masquerade 192.168.4.0/24 out eth0, plus each
+    # peer's default-route-via-rpi1 + a working DNS. `gateway off` = drop the NAT.
+    sub="${2:-on}"
+    if [ "$sub" = on ]; then
+      echo "rpi1: ip_forward + masquerade 192.168.4.0/24 -> eth0 (nftables; bookworm has no iptables)..."
+      ssh pi@"$ANCHOR_CAMPUS" $SSHO 'sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
+        sudo nft delete table ip ibss_nat 2>/dev/null
+        sudo nft add table ip ibss_nat
+        sudo nft "add chain ip ibss_nat postrouting { type nat hook postrouting priority 100 ; }"
+        sudo nft add rule ip ibss_nat postrouting ip saddr 192.168.4.0/24 oifname eth0 masquerade
+        echo "  masquerade rules: $(sudo nft list table ip ibss_nat 2>/dev/null | grep -c masquerade)"'
+      echo "peers: default via $ANCHOR_CELL + DNS..."
+      while read -r name ip <&3; do
+        [[ -z "$name" || "${name:0:1}" == "#" || -z "$ip" ]] && continue
+        cip=$(cell_ip "$name")
+        JUMP -o ConnectTimeout=8 pi@"$cip" "sudo ip route replace default via $ANCHOR_CELL dev wlan0
+          sudo bash -c 'rm -f /etc/resolv.conf; printf \"nameserver 8.8.8.8\nnameserver 1.1.1.1\n\" > /etc/resolv.conf'
+          echo ok" 2>/dev/null && echo "  $name ok" || echo "  $name unreachable"
+      done 3< "$PEERS_FILE"
+      echo "test (rpi24 -> internet/github):"
+      JUMP -o ConnectTimeout=12 pi@"$(cell_ip rpi24)" 'ping -c1 -W3 8.8.8.8 >/dev/null 2>&1 && echo "  ping 8.8.8.8 OK" || echo "  ping FAIL"
+        timeout 12 git ls-remote https://github.com/ggml-org/llama.cpp HEAD >/dev/null 2>&1 && echo "  git ls-remote github OK" || echo "  git/DNS FAIL"' 2>/dev/null
+    else
+      ssh pi@"$ANCHOR_CAMPUS" $SSHO 'sudo nft delete table ip ibss_nat 2>/dev/null; echo "rpi1 NAT removed"'
+    fi
+    ;;
+  *) echo "usage: ibss_cluster.sh {up|down|status|ssh <cell-num>|ssh-config|route [add|del]|gateway [on|off]}" >&2; exit 2 ;;
 esac
