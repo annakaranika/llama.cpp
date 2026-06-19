@@ -2846,10 +2846,12 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                 // log THIS forward's split (delta since last) -- the first forward is the
                 // prompt eval (big execute, tiny graph-send %); decode forwards reveal the
                 // real steady-state ratio. Also keep the cumulative.
-                static long long prev_gs = 0, prev_dc = 0;
-                long long gs  = g_graph_send_ns.load();
-                long long dc  = g_do_comp_ns.load();
-                long long dgs = gs - prev_gs, ddc = dc - prev_dc;
+                static long long prev_gs = 0;
+                static long long prev_dc = 0;
+                long long        gs  = g_graph_send_ns.load();
+                long long        dc  = g_do_comp_ns.load();
+                long long        dgs = gs - prev_gs;
+                long long        ddc = dc - prev_dc;
                 prev_gs = gs;
                 prev_dc = dc;
                 GGML_LOG_INFO("[rpc-timing] fwd %d: this graph_send=%.3fs execute+allreduce=%.3fs (this=%.1f%%) "
