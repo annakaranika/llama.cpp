@@ -71,5 +71,27 @@ case "${1:-}" in
   ssh)
     exec ssh -J pi@"$ANCHOR_CAMPUS" $SSHO -o UserKnownHostsFile=/dev/null pi@"192.168.4.${2:-1}"
     ;;
-  *) echo "usage: ibss_cluster.sh {up|down|status|ssh <cell-num>}" >&2; exit 2 ;;
+  route)
+    # Let this Mac reach 192.168.4.0/24 DIRECTLY (no -J) through rpi1. Sets up all
+    # three pieces: rpi1 ip_forward, the Mac route, and a return path on each peer.
+    # `route add` prompts for your Mac sudo password. Tear down with `route del`.
+    sub="${2:-add}"
+    if [ "$sub" = add ]; then
+      echo "1/3 rpi1 ip_forward=1..."
+      ssh pi@"$ANCHOR_CAMPUS" $SSHO 'sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null && echo ok'
+      echo "2/3 Mac route 192.168.4.0/24 -> $ANCHOR_CAMPUS (sudo)..."
+      sudo route -n add 192.168.4.0/24 "$ANCHOR_CAMPUS"
+      echo "3/3 peer return routes (default via $ANCHOR_CELL)..."
+      while read -r name ip <&3; do
+        [[ -z "$name" || "${name:0:1}" == "#" || -z "$ip" ]] && continue
+        cip=$(cell_ip "$name")
+        JUMP -o ConnectTimeout=8 pi@"$cip" "sudo ip route replace default via $ANCHOR_CELL dev wlan0" 2>/dev/null \
+          && echo "  $name ok" || echo "  $name unreachable"
+      done 3< "$PEERS_FILE"
+      echo "done -> now: ssh pi@192.168.4.<num>   (no -J needed)"
+    else
+      sudo route -n delete 192.168.4.0/24 2>/dev/null && echo "removed Mac route 192.168.4.0/24"
+    fi
+    ;;
+  *) echo "usage: ibss_cluster.sh {up|down|status|ssh <cell-num>|route [add|del]}" >&2; exit 2 ;;
 esac
