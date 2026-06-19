@@ -120,8 +120,9 @@ enum rpc_cmd {
     RPC_CMD_CREATE_PEER_CONNECTION,
     RPC_CMD_ALL_REDUCE,
     RPC_CMD_DO_COMPUTATION,
-    RPC_CMD_LOAD_CACHED,       // "do you have this slice cached? if so load it into the buffer" (skip upload)
-    RPC_CMD_SET_TENSOR_CACHE,  // set_tensor that ALSO persists the slice to the on-disk weight cache
+    RPC_CMD_LOAD_CACHED,        // "do you have this slice cached? if so load it into the buffer" (skip upload)
+    RPC_CMD_SET_TENSOR_CACHE,   // set_tensor that ALSO persists the slice to the on-disk weight cache
+    RPC_CMD_GRAPH_COMPUTE_BATCH, // all of a token's segment-graphs in ONE round-trip (vs one RPC per segment)
     RPC_CMD_COUNT,
 };
 
@@ -2768,6 +2769,22 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                 }
             }
             change_split = sync_splits[sync_splits.size() - 2];
+
+            // BATCHED graph-send: build every segment per device, then send ONE
+            // GRAPH_COMPUTE_BATCH per device below (was one RPC per segment*device ~=
+            // 176 sequential round-trips/token; the graph-send is round-trip-bound, so
+            // this collapses it to one round-trip per device). The server stores each
+            // segment exactly as the per-segment path did. Layout per device:
+            //   n_segments(4) | per segment: seg_len(4) | seg_data
+            int                               batch_dev_count = ggml_backend_rpc_get_device_count();
+            std::vector<std::vector<uint8_t>> dev_batch(batch_dev_count);
+            {
+                uint32_t n_segments = (uint32_t) sync_splits.size();
+                for (int id = 0; id < batch_dev_count; ++id) {
+                    dev_batch[id].resize(sizeof(uint32_t));
+                    memcpy(dev_batch[id].data(), &n_segments, sizeof(n_segments));
+                }
+            }
             // Compute the computation graph for the current split and synchronize results
             for (size_t count_split = 0; count_split < sync_splits.size(); count_split++) {
                 // GGML_LOG_INFO("\n------------split-------------\n");
@@ -2778,10 +2795,6 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                 // bool              checkend        = sync_split.checkend;
 
                 ggml_tensor * tensor = cgraph->nodes[count_nodes];
-
-                //compute concurrently
-                std::mutex rpc_mutex;
-                std::mutex data_mutex;
 
                 int                      device_count = ggml_backend_rpc_get_device_count();
                 std::vector<std::thread> threads;
@@ -2805,9 +2818,6 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                                 add_tensor_part(node, tensors, visited, -1, id);
                             }
                         }
-
-                        auto dev_ctx = (ggml_backend_rpc_device_context *) reg_ctx->devices[id]->context;
-                        auto sock    = get_socket(dev_ctx->endpoint);
 
                         std::vector<uint8_t> input;
                         uint32_t             n_nodes = count_nodes - count_nodes_low + 1;
@@ -2855,29 +2865,46 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                                          sizeof(uint32_t) + n_tensors * sizeof(rpc_tensor));
                         *in_graph_number = this_graph_number;
 
-                        rpc_msg_graph_compute_rsp response;
-
-                        //here the graph_compute commend actually not do the compute, but store the graph
-                        //we will have another commend that will tell the servers to compute
-                        auto _t_gs  = std::chrono::steady_clock::now();
-                        bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size(), &response,
-                                                   sizeof(response));
-                        g_graph_send_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                               std::chrono::steady_clock::now() - _t_gs).count();
-                        GGML_ASSERT(status);
-
-                        if (response.result != GGML_STATUS_SUCCESS) {
-                            std::lock_guard<std::mutex> lock(rpc_mutex);  // To avoid mixed output
-                            fprintf(stderr, "RPC graph compute failed with status %d\n", response.result);
-                            return;
-                        }
+                        // accumulate this segment into the device's batch (one send below)
+                        uint32_t seg_len = (uint32_t) input.size();
+                        size_t   base    = dev_batch[id].size();
+                        dev_batch[id].resize(base + sizeof(uint32_t) + seg_len);
+                        memcpy(dev_batch[id].data() + base, &seg_len, sizeof(uint32_t));
+                        memcpy(dev_batch[id].data() + base + sizeof(uint32_t), input.data(), seg_len);
                     });
                 }
 
-                // Join all threads
+                // Join all threads (build only -- no network here)
                 for (auto & thread : threads) {
                     if (thread.joinable()) {
                         thread.join();
+                    }
+                }
+            }
+
+            // send each device's full batch in ONE round-trip (concurrent across devices)
+            {
+                std::vector<std::thread> send_threads;
+                for (int id = 0; id < batch_dev_count; ++id) {
+                    send_threads.emplace_back([&, id]() {
+                        auto dev_ctx = (ggml_backend_rpc_device_context *) reg_ctx->devices[id]->context;
+                        auto sock    = get_socket(dev_ctx->endpoint);
+                        rpc_msg_graph_compute_rsp response;
+                        auto                      _t_gs  = std::chrono::steady_clock::now();
+                        bool                      status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE_BATCH,
+                                                                        dev_batch[id].data(), dev_batch[id].size(),
+                                                                        &response, sizeof(response));
+                        g_graph_send_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                               std::chrono::steady_clock::now() - _t_gs).count();
+                        GGML_ASSERT(status);
+                        if (response.result != GGML_STATUS_SUCCESS) {
+                            fprintf(stderr, "RPC graph compute (batch) failed with status %d\n", response.result);
+                        }
+                    });
+                }
+                for (auto & t : send_threads) {
+                    if (t.joinable()) {
+                        t.join();
                     }
                 }
             }
@@ -3369,6 +3396,7 @@ class rpc_server {
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
     bool graph_compute(const std::vector<uint8_t> & input, rpc_msg_graph_compute_rsp & response);
+    bool graph_compute_batch(const std::vector<uint8_t> & input, rpc_msg_graph_compute_rsp & response);
     bool init_tensor(const rpc_msg_init_tensor_req & request);
     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
     bool set_split(rpc_msg_set_split_rsp & response);
@@ -3915,6 +3943,36 @@ void rpc_server::store_graph_compute_info(uint8_t graph_number, ggml_cgraph * cg
     } else {
         it->second->add_info(cgraph, ctx, signal);
     }
+}
+
+// Store a token's segment-graphs delivered in ONE round-trip:
+//   n_segments(4) | per segment: seg_len(4) | seg_data (exact per-segment payload).
+// Each segment is stored exactly as the per-segment GRAPH_COMPUTE path would.
+bool rpc_server::graph_compute_batch(const std::vector<uint8_t> & input, rpc_msg_graph_compute_rsp & response) {
+    if (input.size() < sizeof(uint32_t)) {
+        return false;
+    }
+    uint32_t n_segments;
+    memcpy(&n_segments, input.data(), sizeof(n_segments));
+    size_t off = sizeof(uint32_t);
+    for (uint32_t s = 0; s < n_segments; s++) {
+        if (off + sizeof(uint32_t) > input.size()) {
+            return false;
+        }
+        uint32_t seg_len;
+        memcpy(&seg_len, input.data() + off, sizeof(seg_len));
+        off += sizeof(uint32_t);
+        if (off + seg_len > input.size()) {
+            return false;
+        }
+        std::vector<uint8_t> seg(input.begin() + off, input.begin() + off + seg_len);
+        off += seg_len;
+        if (!graph_compute(seg, response)) {
+            return false;
+        }
+    }
+    response.result = GGML_STATUS_SUCCESS;
+    return true;
 }
 
 bool rpc_server::graph_compute(const std::vector<uint8_t> & input, rpc_msg_graph_compute_rsp & response) {
@@ -4569,6 +4627,21 @@ static void rpc_serve_client(rpc_server & server, sockfd_t sockfd, size_t free_m
                     }
                     rpc_msg_graph_compute_rsp response;
                     if (!server.graph_compute(input, response)) {
+                        return;
+                    }
+                    if (!send_msg(sockfd, &response, sizeof(response))) {
+                        return;
+                    }
+                    break;
+                }
+            case RPC_CMD_GRAPH_COMPUTE_BATCH:
+                {
+                    std::vector<uint8_t> input;
+                    if (!recv_msg(sockfd, input)) {
+                        return;
+                    }
+                    rpc_msg_graph_compute_rsp response;
+                    if (!server.graph_compute_batch(input, response)) {
                         return;
                     }
                     if (!send_msg(sockfd, &response, sizeof(response))) {
