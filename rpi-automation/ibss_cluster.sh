@@ -9,10 +9,14 @@
 # peer_ips.txt); rpi1 = 192.168.4.1.
 #
 # Usage (from the repo root or rpi-automation/):
-#   ./ibss_cluster.sh up        # anchor + peers onto the cell, verify each via jump
-#   ./ibss_cluster.sh down      # revert every node to infra wifi
-#   ./ibss_cluster.sh status    # show each node's wlan0 mode/IP
-#   ./ibss_cluster.sh ssh 24    # ssh into 192.168.4.24 through the rpi1 jump
+#   ./ibss_cluster.sh up         # anchor + peers onto the cell, verify each via jump
+#   ./ibss_cluster.sh down       # revert every node to infra wifi
+#   ./ibss_cluster.sh status     # show each node's wlan0 mode/IP
+#   ./ibss_cluster.sh ssh 24     # ssh into 192.168.4.24 through the rpi1 jump
+#   ./ibss_cluster.sh ssh-config # add a ProxyJump alias so `ssh pi@192.168.4.<n>` works
+#                                # directly (the right tool when behind a router/VPN)
+#   ./ibss_cluster.sh route del  # remove a stale Mac route (route add only works if the
+#                                # Mac shares rpi1's L2 segment -- usually it doesn't)
 # ----------------------------------------------------------------------------
 set -u
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -71,12 +75,42 @@ case "${1:-}" in
   ssh)
     exec ssh -J pi@"$ANCHOR_CAMPUS" $SSHO -o UserKnownHostsFile=/dev/null pi@"192.168.4.${2:-1}"
     ;;
+  ssh-config)
+    # The reliable way to get `ssh pi@192.168.4.<num>` from a laptop that reaches
+    # rpi1 through a router/VPN: an ssh ProxyJump alias (NOT an IP route -- see
+    # `route`). Idempotent; appends a marked block to ~/.ssh/config.
+    CFG="$HOME/.ssh/config"; MARK="# >>> ibss cell via rpi1 jump >>>"
+    if grep -qE "Host .*192\.168\.4" "$CFG" 2>/dev/null; then
+      echo "a Host block matching 192.168.4.* already exists in $CFG -- leaving it"
+    else
+      mkdir -p "$HOME/.ssh"; chmod 700 "$HOME/.ssh"
+      cat >> "$CFG" <<EOF
+
+$MARK
+Host 192.168.4.*
+    ProxyJump pi@$ANCHOR_CAMPUS
+    User pi
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+# <<< ibss cell <<<
+EOF
+      echo "added ProxyJump block to $CFG  ->  now: ssh pi@192.168.4.<num>"
+    fi
+    ;;
   route)
-    # Let this Mac reach 192.168.4.0/24 DIRECTLY (no -J) through rpi1. Sets up all
-    # three pieces: rpi1 ip_forward, the Mac route, and a return path on each peer.
-    # `route add` prompts for your Mac sudo password. Tear down with `route del`.
+    # Direct Mac route into the cell via rpi1 -- ONLY works if this Mac is on the
+    # SAME L2 segment as rpi1 (an IP route can't use an off-link gateway). Behind a
+    # router/VPN it can't work; use `ssh-config` instead. `route del` tears down.
     sub="${2:-add}"
     if [ "$sub" = add ]; then
+      gw=$(route -n get "$ANCHOR_CAMPUS" 2>/dev/null | awk '/gateway:/{print $2}')
+      if [ -n "$gw" ] && [ "$gw" != "$ANCHOR_CAMPUS" ]; then
+        echo "ABORT: this Mac reaches rpi1 ($ANCHOR_CAMPUS) via router $gw, not on-link."
+        echo "       An IP route needs an on-link gateway, so it can't work over a"
+        echo "       router/VPN here. Use the ssh ProxyJump instead:"
+        echo "         ./ibss_cluster.sh ssh-config     # then: ssh pi@192.168.4.<num>"
+        exit 1
+      fi
       echo "1/3 rpi1 ip_forward=1..."
       ssh pi@"$ANCHOR_CAMPUS" $SSHO 'sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null && echo ok'
       echo "2/3 Mac route 192.168.4.0/24 -> $ANCHOR_CAMPUS (sudo)..."
@@ -93,5 +127,5 @@ case "${1:-}" in
       sudo route -n delete 192.168.4.0/24 2>/dev/null && echo "removed Mac route 192.168.4.0/24"
     fi
     ;;
-  *) echo "usage: ibss_cluster.sh {up|down|status|ssh <cell-num>|route [add|del]}" >&2; exit 2 ;;
+  *) echo "usage: ibss_cluster.sh {up|down|status|ssh <cell-num>|ssh-config|route [add|del]}" >&2; exit 2 ;;
 esac
