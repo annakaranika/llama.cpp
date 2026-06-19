@@ -3789,7 +3789,7 @@ ggml_tensor * rpc_server::create_node(uint64_t id, struct ggml_context * ctx,
 
         return result;
     } catch (const std::exception & e) {
-        GGML_LOG_ERROR("[%s] tensor %lu with not found in tensor_ptrs: %s\n", __func__, id, e.what());
+        GGML_LOG_ERROR("[%s] tensor %llu not found in tensor_ptrs: %s\n", __func__, (unsigned long long) id, e.what());
         return nullptr;
     }
 }
@@ -3928,7 +3928,7 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, rpc_msg_graph
     return true;
 }
 
-void compare_node(ggml_tensor * node, ggml_tensor * node_to_compare) {
+static void compare_node(ggml_tensor * node, ggml_tensor * node_to_compare) {
     std::string   filename = "compare.txt";
     std::ofstream outfile;
     outfile.open(filename, std::ios_base::app);  // append instead of overwrite
@@ -3961,7 +3961,7 @@ void compare_node(ggml_tensor * node, ggml_tensor * node_to_compare) {
     outfile.close();
 }
 
-void compare_two_graph(ggml_cgraph * graph, ggml_cgraph * graph_to_compare) {
+static void compare_two_graph(ggml_cgraph * graph, ggml_cgraph * graph_to_compare) {
     for (int i = 0; i < graph->n_nodes; i++) {
         compare_node(graph->nodes[i], graph_to_compare->nodes[i]);
     }
