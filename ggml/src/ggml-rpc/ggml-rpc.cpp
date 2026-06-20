@@ -123,6 +123,7 @@ enum rpc_cmd {
     RPC_CMD_LOAD_CACHED,        // "do you have this slice cached? if so load it into the buffer" (skip upload)
     RPC_CMD_SET_TENSOR_CACHE,   // set_tensor that ALSO persists the slice to the on-disk weight cache
     RPC_CMD_GRAPH_COMPUTE_BATCH, // all of a token's segment-graphs in ONE round-trip (vs one RPC per segment)
+    RPC_CMD_PATCH_VIEWS,         // diff cache: patch only the per-token-changed tensors of an already-stored graph
     RPC_CMD_COUNT,
 };
 
@@ -219,6 +220,25 @@ struct rpc_msg_create_peer_connection_rsp {
 
 struct rpc_msg_do_computation_req {
     uint8_t graph_number;
+};
+
+// Diff cache (RPC_CMD_PATCH_VIEWS). When a decode token's graph is structurally
+// identical to one the servers already hold, we don't re-ship the ~1000-tensor
+// structure -- we ship only the per-token-changed tensors. Per token the per-device
+// value-fields advance (KV-cache write positions in data/view_offs, position state in
+// op_params, and -- with tensor-parallel "k"-cache splits -- the split-adjusted ne/nb).
+// A patch carries the changed tensor's full rpc_tensor; the server copies the value
+// fields (ne/nb/op_params/flags/data/view_offs) onto its stored ggml_tensor, keeping
+// the stored wiring (src/view_src/buffer) intact. The tensor is addressed by its index
+// in the segment's originally-sent tensor array -- the server records that order at
+// store time so client and server agree on the index. We deliberately do NOT diff the
+// id/src/view_src/buffer/name fields: those are client pointers that change every token
+// but the server's stored graph already has the correct (fixed) wiring.
+// Payload (per device): graph_number(1) | n_segments(4) |
+//   per segment: n_patches(4) | rpc_view_patch[n_patches]   (segments in chain order)
+struct rpc_view_patch {
+    uint32_t   idx;
+    rpc_tensor t;
 };
 
 // Weight cache -- avoid re-uploading identical weights over the network every run.
@@ -2361,6 +2381,28 @@ static void add_tensor_part(ggml_tensor * tensor, std::vector<rpc_tensor> & tens
     }
 }
 
+// Build the per-device rpc_tensor array for one graph segment [low..high], exactly
+// as the tensor-parallel graph-send does. Factored out so the full graph-send (MISS)
+// and the diff-cache patch (HIT) build byte-identical tensor arrays -- the patch
+// path diffs this token's array against the last one to find the changed view_offs.
+static void build_segment_tensors(const ggml_cgraph * cgraph, uint32_t low, uint32_t high, int id,
+                                  std::vector<rpc_tensor> & tensors) {
+    std::map<ggml_tensor *, rpc_tensor> visited;
+    for (uint32_t count = low; count <= high; count++) {
+        ggml_tensor * node = cgraph->nodes[count];
+        if (!ggml_is_empty(node) && node->src[0] != nullptr &&
+            ggml_backend_buft_is_rpc_split(node->src[0]->buffer->buft) &&
+            (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID)) {
+            // This node is eligible for RPC splitting
+            ggml_tensor_extra_rpc * node_extra = (ggml_tensor_extra_rpc *) node->src[0]->extra;
+            add_tensor_part(node, tensors, visited, node_extra->split_dim, id);
+        } else {
+            // This node is not eligible for RPC splitting
+            add_tensor_part(node, tensors, visited, -1, id);
+        }
+    }
+}
+
 static void serialize_graph(const ggml_cgraph * cgraph, std::vector<uint8_t> & output) {
     uint32_t                          n_nodes = cgraph->n_nodes;
     std::vector<rpc_tensor>           tensors;
@@ -2622,25 +2664,29 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
     static struct sync_split change_split;
     // GGML_LOG_INFO("[%s] computing graph with %d nodes\n", __func__, cgraph->n_nodes);
     if (split) {
-        // RPC_GRAPH_CACHE: skip re-shipping the ~44 per-segment graphs when a token's
-        // graph is structurally identical to one the servers already hold (the server
-        // is re-entrant and re-runs by graph_number with this token's fresh inputs).
-        // The key MUST include view_offs/strides: op/type/shape/name are stable across
-        // decode tokens, but the KV-cache WRITE position lives in a node's view_offs and
-        // advances every token, so the full graph genuinely DIFFERS each token. A correct
-        // (view_offs-inclusive) hash therefore gets ~0 hits in autoregressive decode ->
-        // this simple whole-graph skip is correct (never a false hit) but a no-op for
-        // decode. (Excluding view_offs made false hits that re-ran a stale-KV-position
-        // graph -> garbage; that, not tensor-pointer instability, is why graph caching
-        // was shelved.) Capturing the ~20% graph-send would need a DIFF cache: ship the
-        // structure once, then per token re-send only the few changed view_offs and patch
-        // them server-side. RPC_DBG_GHASH logs the hash. Both default off.
-        static const bool                            dbg_ghash       = getenv("RPC_DBG_GHASH") != nullptr;
-        static const bool                            use_graph_cache = getenv("RPC_GRAPH_CACHE") != nullptr;
-        static std::unordered_map<uint64_t, uint8_t> graph_cache;  // structural hash -> server graph_number
+        // RPC_GRAPH_CACHE: the DIFF cache. The graph-send (~20% of decode) re-ships the
+        // whole ~1000-tensor structure every token even though only the KV-cache write
+        // views change -- their view_offs (and derived data pointer) advance one slot per
+        // token; everything else (op/type/shape/strides/wiring) is identical across decode
+        // tokens within a KV padding window. So: ship the structure ONCE (MISS), keyed by a
+        // topology hash that EXCLUDES the per-token state; on a later same-topology token
+        // (HIT) re-send only the changed tensors as RPC_CMD_PATCH_VIEWS and let the server
+        // patch its stored graph in place -- no re-deserialize. When the KV length crosses a
+        // padding boundary the shapes change -> new topology -> a fresh MISS re-stores it.
+        // (Earlier a whole-graph skip excluding view_offs gave false hits that re-ran a
+        // stale-KV-position graph -> garbage; the diff cache fixes that by patching the
+        // positions every token.) RPC_DBG_GHASH logs the view_offs-inclusive probe hash;
+        // RPC_DBG_DIFFCACHE logs hit/miss + patch counts. All default off.
+        static const bool                            dbg_ghash      = getenv("RPC_DBG_GHASH") != nullptr;
+        static const bool                            use_diff_cache = getenv("RPC_GRAPH_CACHE") != nullptr;
+        static const bool                            dbg_diffcache  = getenv("RPC_DBG_DIFFCACHE") != nullptr;
+        static std::unordered_map<uint64_t, uint8_t> graph_cache;  // topology hash (excl. view_offs) -> server graph_number
+        // server graph_number -> [segment][device] -> rpc_tensor array we last shipped, so a
+        // HIT can diff this token's array against it and patch only what changed.
+        static std::unordered_map<uint8_t, std::vector<std::vector<std::vector<rpc_tensor>>>> last_sent;
 
         uint64_t struct_hash = 0;
-        if (dbg_ghash || use_graph_cache) {
+        if (dbg_ghash) {
             struct_hash = 1469598103934665603ULL;  // FNV-1a over op/type/shape/name (no pointers)
             auto mix    = [&](const void * p, size_t n) {
                 const uint8_t * b = (const uint8_t *) p;
@@ -2666,71 +2712,113 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
             prev_h = struct_hash;
         }
 
-        // RPC_DBG_DIFF: size the diff-cache. Per token, count how many nodes differ
-        // from the previous same-topology token in view_offs vs nb vs ne/op. If only a
-        // few change (the KV writes), a diff cache (resend only those) is worthwhile.
+        // RPC_DBG_DIFF: size the diff-cache. Per token, count how many nodes differ from
+        // the previous same-topology token, broken down by field. Confirms which fields
+        // the patch must ship: measured per decode token only view_offs (~48/40 nodes) and
+        // op_params (~24/20) change in the client cgraph; ne/nb/name are stable there (the
+        // per-device split-adjusted ne/nb still vary, which is why the patch re-sends them).
         static const bool dbg_diff = getenv("RPC_DBG_DIFF") != nullptr;
         if (dbg_diff) {
-            static std::unordered_map<uint64_t, std::vector<std::array<uint64_t, 2>>> prev;  // topo-hash -> per-node [voffs,nb1]
+            auto fnv = [](const void * p, size_t n) {
+                const uint8_t * b = (const uint8_t *) p;
+                uint64_t        h = 1469598103934665603ULL;
+                for (size_t i = 0; i < n; i++) {
+                    h ^= b[i];
+                    h *= 1099511628211ULL;
+                }
+                return h;
+            };
             uint64_t topo = 1469598103934665603ULL;  // hash EXCLUDING view_offs (topology only)
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * nd = cgraph->nodes[i];
                 for (auto v : { (uint64_t) nd->op, (uint64_t) nd->type, (uint64_t) nd->ne[0], (uint64_t) nd->ne[1] }) {
-                    topo ^= v; topo *= 1099511628211ULL;
+                    topo ^= v;
+                    topo *= 1099511628211ULL;
                 }
             }
-            auto & pv = prev[topo];
-            int    dv = 0;
-            int    dn = 0;
-            if ((int) pv.size() == cgraph->n_nodes) {
+            static std::unordered_map<uint64_t, std::vector<std::array<uint64_t, 7>>> prevf;  // per-node field snapshot
+            auto & pf = prevf[topo];
+            if ((int) pf.size() == cgraph->n_nodes) {
+                int dvo = 0;
+                int dne = 0;
+                int dnb = 0;
+                int dop = 0;
+                int dnm = 0;
                 for (int i = 0; i < cgraph->n_nodes; i++) {
-                    if (cgraph->nodes[i]->view_offs != pv[i][0]) {
-                        dv++;
+                    ggml_tensor * nd = cgraph->nodes[i];
+                    if ((uint64_t) nd->view_offs != pf[i][0]) {
+                        dvo++;
                     }
-                    if (cgraph->nodes[i]->nb[1] != pv[i][1]) {
-                        dn++;
+                    if (fnv(nd->ne, sizeof(nd->ne)) != pf[i][1]) {
+                        dne++;
+                    }
+                    if (fnv(nd->nb, sizeof(nd->nb)) != pf[i][2]) {
+                        dnb++;
+                    }
+                    if (fnv(nd->op_params, sizeof(nd->op_params)) != pf[i][3]) {
+                        dop++;
+                    }
+                    if (fnv(nd->name, sizeof(nd->name)) != pf[i][4]) {
+                        dnm++;
                     }
                 }
-                GGML_LOG_INFO("[rpc-diff] n_nodes=%d view_offs_changed=%d nb_changed=%d (%.1f%% dynamic)\n",
-                              cgraph->n_nodes, dv, dn, 100.0 * dv / cgraph->n_nodes);
+                GGML_LOG_INFO("[rpc-diff] n_nodes=%d view_offs=%d ne=%d nb=%d op_params=%d name=%d\n",
+                              cgraph->n_nodes, dvo, dne, dnb, dop, dnm);
             }
-            pv.resize(cgraph->n_nodes);
+            pf.resize(cgraph->n_nodes);
             for (int i = 0; i < cgraph->n_nodes; i++) {
-                pv[i] = { (uint64_t) cgraph->nodes[i]->view_offs, (uint64_t) cgraph->nodes[i]->nb[1] };
+                ggml_tensor * nd = cgraph->nodes[i];
+                pf[i] = { (uint64_t) nd->view_offs, fnv(nd->ne, sizeof(nd->ne)), fnv(nd->nb, sizeof(nd->nb)),
+                          fnv(nd->op_params, sizeof(nd->op_params)), fnv(nd->name, sizeof(nd->name)), 0, 0 };
             }
         }
 
-        auto    cache_it          = use_graph_cache ? graph_cache.find(struct_hash) : graph_cache.end();
-        bool    cache_hit         = use_graph_cache && cache_it != graph_cache.end();
-        uint8_t this_graph_number = cache_hit ? cache_it->second : global_graph_number;
-        if (use_graph_cache) {
-            static int hits   = 0;
-            static int misses = 0;
-            cache_hit ? ++hits : ++misses;
-            GGML_LOG_INFO("[rpc-gcache] %s gnum=%d (hits=%d misses=%d)\n", cache_hit ? "HIT " : "MISS",
-                          this_graph_number, hits, misses);
+        // Topology hash for the diff cache -- STABLE structure only (op/type/shape/
+        // strides/name), deliberately EXCLUDING view_offs, data pointers AND op_params:
+        // those three carry the per-token state (KV write position + position offsets) the
+        // patch ships. (Measured: per decode token only view_offs (~48 nodes) and op_params
+        // (~24 nodes) change; ne/nb/name are stable within a KV padding window.) Same hash
+        // across decode tokens => the servers already hold this graph.
+        uint64_t topo_hash = 0;
+        if (use_diff_cache) {
+            topo_hash = 1469598103934665603ULL;
+            auto mix  = [&](const void * p, size_t n) {
+                const uint8_t * b = (const uint8_t *) p;
+                for (size_t i = 0; i < n; i++) {
+                    topo_hash ^= b[i];
+                    topo_hash *= 1099511628211ULL;
+                }
+            };
+            for (int i = 0; i < cgraph->n_nodes; i++) {
+                ggml_tensor * nd = cgraph->nodes[i];
+                mix(&nd->op, sizeof(nd->op));
+                mix(&nd->type, sizeof(nd->type));
+                mix(nd->ne, sizeof(nd->ne));
+                mix(nd->nb, sizeof(nd->nb));
+                mix(nd->name, sizeof(nd->name));
+            }
         }
-        // MISS: ship the graph structure to the servers (a cache HIT skips all of this).
-        if (!cache_hit) {
-            // Find next synchronization point
-            std::vector<struct sync_split> sync_splits;
-            uint32_t                       count_nodes_low = 0;
+
+        bool    cache_hit         = false;
+        uint8_t this_graph_number = global_graph_number;
+        if (use_diff_cache) {
+            auto it = graph_cache.find(topo_hash);
+            // require last_sent too: we can only patch a graph we still hold the baseline for
+            if (it != graph_cache.end() && last_sent.count(it->second)) {
+                cache_hit         = true;
+                this_graph_number = it->second;
+            }
+        }
+
+        int device_count = ggml_backend_rpc_get_device_count();
+
+        // Segment boundaries (sync points). Same for the store (MISS) and patch (HIT)
+        // paths, so compute once up front.
+        std::vector<struct sync_split> sync_splits;
+        {
+            uint32_t count_nodes_low = 0;
             for (int count_nodes = 0; count_nodes < cgraph->n_nodes; count_nodes++) {
                 ggml_tensor * node = cgraph->nodes[count_nodes];
-                // if(node->op==GGML_OP_VIEW){
-                //     GGML_LOG_INFO("\ntensor %s ne0 :%ld ne1: %ld ne2: %ld ne3: %ld nb0: %ld nb1: %ld nb2: %ld nb3: %ld \n",
-                //         node->name,node->ne[0],node->ne[1],node->ne[2],node->ne[3],node->nb[0],node->nb[1],node->nb[2],node->nb[3]);
-                //     GGML_LOG_INFO("view_offs %ld\n",node->view_offs);
-                // }
-                // GGML_LOG_INFO("\ntensor %s ne0 :%ld ne1: %ld ne2: %ld ne3: %ld nb0: %ld nb1: %ld nb2: %ld nb3: %ld \n",
-                //         node->name,node->ne[0],node->ne[1],node->ne[2],node->ne[3],node->nb[0],node->nb[1],node->nb[2],node->nb[3]);
-                // for(int i=0;i<GGML_MAX_SRC;i++){
-                //     ggml_tensor* src=node->src[i];
-                //     if(src){
-                //         GGML_LOG_INFO("src %d %s ne0 :%ld ne1: %ld ne2: %ld ne3: %ld nb0: %ld nb1: %ld nb2: %ld nb3: %ld \n",
-                //                 i,src->name,src->ne[0],src->ne[1],src->ne[2],src->ne[3],src->nb[0],src->nb[1],src->nb[2],src->nb[3]);
-                //     }
-                // }
                 if (!ggml_is_empty(node) && node->src[0] != nullptr &&
                     ggml_backend_buft_is_rpc_split(node->src[0]->buffer->buft) &&
                     (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID)) {
@@ -2745,7 +2833,6 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                         };
                         sync_splits.push_back(sync_split);
                         count_nodes_low = count_nodes + 1;
-                        // GGML_LOG_INFO("\n-----another split-----\n");
                     } else if (node_extra->split_dim == 1) {
                         GGML_ASSERT(ggml_backend_buft_is_rpc(node->src[1]->buffer->buft));
                         GGML_ASSERT(ggml_backend_buft_is_rpc(node->buffer->buft));
@@ -2764,26 +2851,44 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                             true
                         };
                         sync_splits.push_back(sync_split);
-                        // GGML_LOG_INFO("\n-----end of subgraph-----\n");
                     }
                 }
             }
             change_split = sync_splits[sync_splits.size() - 2];
+        }
+        uint32_t n_segments = (uint32_t) sync_splits.size();
 
+        if (dbg_diffcache) {
+            static int hits   = 0;
+            static int misses = 0;
+            cache_hit ? ++hits : ++misses;
+            GGML_LOG_INFO("[rpc-diffcache] %s gnum=%d segs=%u (hits=%d misses=%d)\n",
+                          cache_hit ? "HIT " : "MISS", this_graph_number, n_segments, hits, misses);
+        }
+
+        // MISS: ship the graph structure to the servers (a cache HIT patches instead).
+        if (!cache_hit) {
             // BATCHED graph-send: build every segment per device, then send ONE
             // GRAPH_COMPUTE_BATCH per device below (was one RPC per segment*device ~=
             // 176 sequential round-trips/token; the graph-send is round-trip-bound, so
             // this collapses it to one round-trip per device). The server stores each
             // segment exactly as the per-segment path did. Layout per device:
             //   n_segments(4) | per segment: seg_len(4) | seg_data
-            int                               batch_dev_count = ggml_backend_rpc_get_device_count();
+            int                               batch_dev_count = device_count;
             std::vector<std::vector<uint8_t>> dev_batch(batch_dev_count);
             {
-                uint32_t n_segments = (uint32_t) sync_splits.size();
                 for (int id = 0; id < batch_dev_count; ++id) {
                     dev_batch[id].resize(sizeof(uint32_t));
                     memcpy(dev_batch[id].data(), &n_segments, sizeof(n_segments));
                 }
+            }
+            // Diff cache: remember each device's per-segment tensor array so the next
+            // same-topology token can diff against it and patch only what changed.
+            std::vector<std::vector<std::vector<rpc_tensor>>> * sent = nullptr;
+            if (use_diff_cache) {
+                last_sent[this_graph_number].assign(n_segments,
+                                                    std::vector<std::vector<rpc_tensor>>(batch_dev_count));
+                sent = &last_sent[this_graph_number];
             }
             // Compute the computation graph for the current split and synchronize results
             for (size_t count_split = 0; count_split < sync_splits.size(); count_split++) {
@@ -2796,28 +2901,13 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
 
                 ggml_tensor * tensor = cgraph->nodes[count_nodes];
 
-                int                      device_count = ggml_backend_rpc_get_device_count();
                 std::vector<std::thread> threads;
 
                 for (int id = 0; id < device_count; ++id) {
                     threads.emplace_back([&, id]() {
                         //we need to compute the next part of the graph
-                        std::vector<rpc_tensor>             tensors;
-                        std::map<ggml_tensor *, rpc_tensor> visited;
-
-                        for (uint32_t count = count_nodes_low; count <= count_nodes; count++) {
-                            ggml_tensor * node = cgraph->nodes[count];
-                            if (!ggml_is_empty(node) && node->src[0] != nullptr &&
-                                ggml_backend_buft_is_rpc_split(node->src[0]->buffer->buft) &&
-                                (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID)) {
-                                // This node is eligible for RPC splitting
-                                ggml_tensor_extra_rpc * node_extra = (ggml_tensor_extra_rpc *) node->src[0]->extra;
-                                add_tensor_part(node, tensors, visited, node_extra->split_dim, id);
-                            } else {
-                                // This node is not eligible for RPC splitting
-                                add_tensor_part(node, tensors, visited, -1, id);
-                            }
-                        }
+                        std::vector<rpc_tensor> tensors;
+                        build_segment_tensors(cgraph, count_nodes_low, count_nodes, id, tensors);
 
                         std::vector<uint8_t> input;
                         uint32_t             n_nodes = count_nodes - count_nodes_low + 1;
@@ -2871,6 +2961,11 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                         dev_batch[id].resize(base + sizeof(uint32_t) + seg_len);
                         memcpy(dev_batch[id].data() + base, &seg_len, sizeof(uint32_t));
                         memcpy(dev_batch[id].data() + base + sizeof(uint32_t), input.data(), seg_len);
+
+                        // diff cache: keep this segment's array for next token's patch diff
+                        if (sent) {
+                            (*sent)[count_split][id] = std::move(tensors);
+                        }
                     });
                 }
 
@@ -2910,18 +3005,102 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
             }
 
             graph_splits[reinterpret_cast<uint64_t>(cgraph)] = global_graph_number;
-            if (use_graph_cache) {
-                graph_cache[struct_hash] = this_graph_number;  // remember: this structure -> this graph_number
+            if (use_diff_cache) {
+                graph_cache[topo_hash] = this_graph_number;  // remember: this topology -> this graph_number
             }
             global_graph_number++;
+        } else {
+            // HIT: the servers already hold this graph (this_graph_number). Rebuild each
+            // device's per-segment tensor array, diff it against what we last shipped, and
+            // send only the changed tensors (advancing KV-cache write positions + the
+            // split-adjusted ne/nb/op_params) as RPC_CMD_PATCH_VIEWS. The server patches its
+            // stored graph in place, skipping the re-deserialize of the whole ~1000-tensor
+            // structure. Payload per device: graph_number(1) | n_segments(4) |
+            //   per segment: n_patches(4) | rpc_view_patch[n_patches]
+            auto &                            sent = last_sent[this_graph_number];
+            std::vector<std::vector<uint8_t>> dev_patch(device_count);
+            std::atomic<int>                  total_patches{ 0 };
+
+            std::vector<std::thread> build_threads;
+            for (int id = 0; id < device_count; ++id) {
+                build_threads.emplace_back([&, id]() {
+                    std::vector<uint8_t> & out = dev_patch[id];
+                    out.resize(sizeof(uint8_t) + sizeof(uint32_t));
+                    out[0] = this_graph_number;
+                    memcpy(out.data() + sizeof(uint8_t), &n_segments, sizeof(n_segments));
+
+                    for (size_t s = 0; s < sync_splits.size(); s++) {
+                        uint32_t                  low  = sync_splits[s].nodes_split.first;
+                        uint32_t                  high = sync_splits[s].nodes_split.second;
+                        std::vector<rpc_tensor>   tensors;
+                        build_segment_tensors(cgraph, low, high, id, tensors);
+
+                        std::vector<rpc_tensor> & prev = sent[s][id];
+                        std::vector<rpc_view_patch> patches;
+                        // same topology => same count/order; guard defensively against drift
+                        size_t n = std::min(tensors.size(), prev.size());
+                        for (size_t i = 0; i < n; i++) {
+                            const rpc_tensor & a = tensors[i];
+                            const rpc_tensor & b = prev[i];
+                            // compare only the value-fields the server re-applies (NOT the
+                            // pointer wiring id/src/view_src/buffer/name, which always differ)
+                            bool changed = a.data != b.data || a.view_offs != b.view_offs ||
+                                           a.flags != b.flags ||
+                                           memcmp(a.ne, b.ne, sizeof(a.ne)) != 0 ||
+                                           memcmp(a.nb, b.nb, sizeof(a.nb)) != 0 ||
+                                           memcmp(a.op_params, b.op_params, sizeof(a.op_params)) != 0;
+                            if (changed) {
+                                rpc_view_patch p;
+                                p.idx = (uint32_t) i;
+                                p.t   = a;
+                                patches.push_back(p);
+                            }
+                        }
+                        total_patches += (int) patches.size();
+
+                        uint32_t n_patches = (uint32_t) patches.size();
+                        size_t   base      = out.size();
+                        out.resize(base + sizeof(uint32_t) + n_patches * sizeof(rpc_view_patch));
+                        memcpy(out.data() + base, &n_patches, sizeof(n_patches));
+                        memcpy(out.data() + base + sizeof(uint32_t), patches.data(),
+                               n_patches * sizeof(rpc_view_patch));
+
+                        prev = std::move(tensors);  // server now holds these values
+                    }
+                });
+            }
+            for (auto & t : build_threads) {
+                if (t.joinable()) {
+                    t.join();
+                }
+            }
+
+            // send each device's patch in ONE round-trip (concurrent), timed as graph-send
+            std::vector<std::thread> send_threads;
+            for (int id = 0; id < device_count; ++id) {
+                send_threads.emplace_back([&, id]() {
+                    auto dev_ctx = (ggml_backend_rpc_device_context *) reg_ctx->devices[id]->context;
+                    auto sock    = get_socket(dev_ctx->endpoint);
+                    auto _t_gs   = std::chrono::steady_clock::now();
+                    bool status  = send_rpc_cmd(sock, RPC_CMD_PATCH_VIEWS, dev_patch[id].data(),
+                                                dev_patch[id].size(), nullptr, 0);
+                    g_graph_send_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                           std::chrono::steady_clock::now() - _t_gs).count();
+                    GGML_ASSERT(status);
+                });
+            }
+            for (auto & t : send_threads) {
+                if (t.joinable()) {
+                    t.join();
+                }
+            }
+            if (dbg_diffcache) {
+                GGML_LOG_INFO("[rpc-diffcache] patched %d tensors (across %d devices)\n",
+                              total_patches.load(), device_count);
+            }
         }
-        // else{
-        //     GGML_LOG_INFO("graph %ld has been computed before with graph number %d, skip computation\n",
-        //                   (uint64_t)cgraph, graph_splits[reinterpret_cast<uint64_t>(cgraph)]);
-        // }
 
         //send a commend to servers to ask them do the computation job here
-        int                      device_count = ggml_backend_rpc_get_device_count();
         std::vector<std::thread> threads;
 
         ggml_tensor *        tensor = cgraph->nodes[cgraph->n_nodes - 1];
@@ -3323,6 +3502,10 @@ struct graph_info {
     ggml_context * ctx;
     uint8_t        signal;
     graph_info *   next = nullptr;
+    // Diff cache: the ggml_tensor created for the i-th rpc_tensor the client sent for
+    // this segment (same index the client patches by). Lets RPC_CMD_PATCH_VIEWS update
+    // a stored tensor's view_offs/data in place without re-deserializing the graph.
+    std::vector<ggml_tensor *> by_idx;
 };
 
 class graph_compute_info {
@@ -3405,6 +3588,7 @@ class rpc_server {
     void add_socket_listen(const std::shared_ptr<socket_t> & sock);
     bool all_reduce(std::vector<uint8_t> & input);
     bool do_computation(const rpc_msg_do_computation_req & request);
+    bool patch_views(const std::vector<uint8_t> & input);
     bool load_cached(const rpc_msg_load_cached_req & request, rpc_msg_load_cached_rsp & response);
     bool set_tensor_cache(const std::vector<uint8_t> & input);
 
@@ -3414,7 +3598,8 @@ class rpc_server {
     ggml_tensor * create_node(uint64_t id, struct ggml_context * ctx,
                               const std::unordered_map<uint64_t, const rpc_tensor *> & tensor_ptrs,
                               std::unordered_map<uint64_t, struct ggml_tensor *> &     tensor_map);
-    void store_graph_compute_info(uint8_t graph_number, ggml_cgraph * cgraph, ggml_context * ctx, uint8_t signal);
+    void store_graph_compute_info(uint8_t graph_number, ggml_cgraph * cgraph, ggml_context * ctx, uint8_t signal,
+                                  std::vector<ggml_tensor *> && by_idx);
     ggml_backend_t                                           backend;
     std::unordered_set<ggml_backend_buffer_t>                buffers;
     bool                                                     server_split = false;
@@ -3935,14 +4120,17 @@ ggml_tensor * rpc_server::create_node(uint64_t id, struct ggml_context * ctx,
 }
 
 void rpc_server::store_graph_compute_info(uint8_t graph_number, ggml_cgraph * cgraph, ggml_context * ctx,
-                                          uint8_t signal) {
+                                          uint8_t signal, std::vector<ggml_tensor *> && by_idx) {
     auto it = graph_compute_infos.find(graph_number);
     if (it == graph_compute_infos.end()) {
         graph_compute_info * info         = new graph_compute_info(graph_number, cgraph, ctx, signal);
         graph_compute_infos[graph_number] = info;
+        it                                = graph_compute_infos.find(graph_number);
     } else {
         it->second->add_info(cgraph, ctx, signal);
     }
+    // the segment just stored is the chain tail; attach its array-index -> tensor map
+    it->second->tail->by_idx = std::move(by_idx);
 }
 
 // Store a token's segment-graphs delivered in ONE round-trip:
@@ -4091,8 +4279,19 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, rpc_msg_graph
         return false;
     }
 
+    // Diff cache: record, in the client's sent order, the ggml_tensor created for each
+    // rpc_tensor. A later RPC_CMD_PATCH_VIEWS addresses tensors by this index to patch
+    // their advancing view_offs/data without re-shipping the whole graph.
+    std::vector<ggml_tensor *> by_idx(n_tensors, nullptr);
+    for (uint32_t i = 0; i < n_tensors; i++) {
+        auto mit = tensor_map.find(tensors[i].id);
+        if (mit != tensor_map.end()) {
+            by_idx[i] = mit->second;
+        }
+    }
+
     //store graph compute info
-    store_graph_compute_info(graph_number, graph, ctx, signal);
+    store_graph_compute_info(graph_number, graph, ctx, signal, std::move(by_idx));
     GGML_LOG_INFO("stored graph compute info for graph number %d\n", graph_number);
     response.result = GGML_STATUS_SUCCESS;
     return true;
@@ -4135,6 +4334,73 @@ static void compare_two_graph(ggml_cgraph * graph, ggml_cgraph * graph_to_compar
     for (int i = 0; i < graph->n_nodes; i++) {
         compare_node(graph->nodes[i], graph_to_compare->nodes[i]);
     }
+}
+
+// Diff cache (RPC_CMD_PATCH_VIEWS): the client found this token's graph structurally
+// identical to one we already stored, so instead of re-shipping the whole graph it sends
+// only the changed view tensors (advancing KV-cache write positions). Patch them into the
+// stored graph in place, addressed by the array index recorded at store time, then the
+// following DO_COMPUTATION re-runs the patched graph. No re-deserialize of the structure.
+// Payload: graph_number(1) | n_segments(4) | per segment: n_patches(4) | rpc_view_patch[].
+bool rpc_server::patch_views(const std::vector<uint8_t> & input) {
+    if (input.size() < sizeof(uint8_t) + sizeof(uint32_t)) {
+        return false;
+    }
+    size_t  off          = 0;
+    uint8_t graph_number = input[off];
+    off += sizeof(uint8_t);
+    uint32_t n_segments;
+    memcpy(&n_segments, input.data() + off, sizeof(n_segments));
+    off += sizeof(uint32_t);
+
+    auto it = graph_compute_infos.find(graph_number);
+    if (it == graph_compute_infos.end()) {
+        GGML_LOG_ERROR("[%s] graph number %d not found\n", __func__, graph_number);
+        return false;
+    }
+    graph_info * info     = it->second->head;
+    int          n_patched = 0;
+    for (uint32_t s = 0; s < n_segments; s++) {
+        if (off + sizeof(uint32_t) > input.size()) {
+            return false;
+        }
+        uint32_t n_patches;
+        memcpy(&n_patches, input.data() + off, sizeof(n_patches));
+        off += sizeof(uint32_t);
+        if (off + (size_t) n_patches * sizeof(rpc_view_patch) > input.size()) {
+            return false;
+        }
+        const rpc_view_patch * patches = (const rpc_view_patch *) (input.data() + off);
+        off += (size_t) n_patches * sizeof(rpc_view_patch);
+
+        for (uint32_t p = 0; p < n_patches; p++) {
+            const rpc_view_patch & patch = patches[p];
+            if (info && patch.idx < info->by_idx.size() && info->by_idx[patch.idx] != nullptr) {
+                ggml_tensor * t = info->by_idx[patch.idx];
+                // re-apply exactly the value-fields deserialize_tensor sets, keeping the
+                // stored wiring (src/view_src/buffer) untouched. op/type don't change on a
+                // hit (they're in the topology hash) so they're left as stored.
+                for (uint32_t d = 0; d < GGML_MAX_DIMS; d++) {
+                    t->ne[d] = patch.t.ne[d];
+                    t->nb[d] = patch.t.nb[d];
+                }
+                memcpy(t->op_params, patch.t.op_params, sizeof(t->op_params));
+                t->flags     = patch.t.flags;
+                t->data      = reinterpret_cast<void *>(patch.t.data);
+                t->view_offs = patch.t.view_offs;
+                n_patched++;
+            }
+        }
+        if (info) {
+            info = info->next;
+        }
+    }
+    static const bool dbg_diffcache = getenv("RPC_DBG_DIFFCACHE") != nullptr;
+    if (dbg_diffcache) {
+        GGML_LOG_INFO("[rpc-diffcache-srv] gnum=%d patched %d tensors over %u segments\n",
+                      graph_number, n_patched, n_segments);
+    }
+    return true;
 }
 
 // RPC_DBG_TIMING (server side): split the do_computation time into local graph
@@ -4645,6 +4911,20 @@ static void rpc_serve_client(rpc_server & server, sockfd_t sockfd, size_t free_m
                         return;
                     }
                     if (!send_msg(sockfd, &response, sizeof(response))) {
+                        return;
+                    }
+                    break;
+                }
+            case RPC_CMD_PATCH_VIEWS:
+                {
+                    std::vector<uint8_t> input;
+                    if (!recv_msg(sockfd, input)) {
+                        return;
+                    }
+                    if (!server.patch_views(input)) {
+                        return;
+                    }
+                    if (!send_msg(sockfd, nullptr, 0)) {
                         return;
                     }
                     break;
