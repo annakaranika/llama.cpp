@@ -777,6 +777,16 @@ static bool rpc_opt_enabled() {
     return on;
 }
 
+// fp16 all-reduce partials (opt-in, RPC_AR_FP16): ship each 8KB f32 partial as f16 (half the
+// bytes / airtime on the shared cell), upcast back to f32 on receive so the fold stays f32 +
+// id-ordered (deterministic). Output is NOT bit-identical to the f32-partial path (each
+// partial is f16-rounded) -- a quality/throughput tradeoff -- so it's a separate opt-in on
+// top of the optimized path, NOT part of the default. Must be set consistently on all nodes.
+static bool rpc_ar_fp16() {
+    static const bool on = rpc_opt_enabled() && (getenv("RPC_AR_FP16") != nullptr);
+    return on;
+}
+
 static void ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
     ggml_backend_rpc_buffer_context *      ctx      = (ggml_backend_rpc_buffer_context *) buffer->context;
     ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *) buffer->buft->context;
@@ -3360,6 +3370,19 @@ class all_reduce_block {
     bool wait_for_completion();
 
   private:
+    // fp16 partials: round-trip this server's own partial (slot self_id) through f16 so it
+    // matches the f16-rounded copies the peers received -> the ordered fold is bit-identical
+    // on every server. No-op unless RPC_AR_FP16 and the reduced tensor is f32.
+    void ar_fp16_roundtrip_self() {
+        if (!rpc_ar_fp16() || tensor->type != GGML_TYPE_F32 || self_id < 0) {
+            return;
+        }
+        int64_t                  n = (int64_t) (reduce_nbytes / sizeof(float));
+        std::vector<ggml_fp16_t> h(n);
+        ggml_fp32_to_fp16_row((const float *) slots[self_id].data(), h.data(), n);
+        ggml_fp16_to_fp32_row(h.data(), (float *) slots[self_id].data(), n);
+    }
+
     bool                              initialized = false;    //whether the tensor to be reduced has been set
     ggml_cgraph *                     graph       = nullptr;  //addition graph
     ggml_tensor *                     tensor;                 //tensor to be reduced
@@ -3455,6 +3478,7 @@ all_reduce_block::all_reduce_block(ggml_tensor * tensor, int op, int device_coun
         slots.assign(num_of_servers, {});
         slots[device_id].resize(reduce_nbytes);
         ggml_backend_tensor_get(tensor, slots[device_id].data(), 0, reduce_nbytes);
+        ar_fp16_roundtrip_self();  // fp16: round-trip self so all servers fold identical slots
     }
     arrived = 1;
 
@@ -3522,6 +3546,7 @@ bool all_reduce_block::block_init(ggml_tensor * tensor, int op, int device_count
         slots.assign(num_of_servers, {});
         slots[device_id].resize(reduce_nbytes);
         ggml_backend_tensor_get(tensor, slots[device_id].data(), 0, reduce_nbytes);
+        ar_fp16_roundtrip_self();  // fp16: round-trip self so all servers fold identical slots
     }
     arrived = 1;
 
@@ -3577,11 +3602,19 @@ bool all_reduce_block::add(std::vector<uint8_t> & input, uint8_t src_id) {
 
     // OPTIMIZED: store this peer's partial in its device-id slot (don't sum yet). Counting
     // only the first arrival per source keeps arrived correct even if a duplicate slips in.
+    // fp16: `input` arrived as f16 -- upcast to f32 into the slot so the fold stays f32.
     if (src_id < slots.size()) {
         if (slots[src_id].empty()) {
             arrived++;
         }
-        slots[src_id] = input;
+        if (rpc_ar_fp16() && tensor->type == GGML_TYPE_F32) {
+            int64_t              n = (int64_t) (reduce_nbytes / sizeof(float));
+            std::vector<uint8_t> f32(reduce_nbytes);
+            ggml_fp16_to_fp32_row((const ggml_fp16_t *) input.data(), (float *) f32.data(), n);
+            slots[src_id] = std::move(f32);
+        } else {
+            slots[src_id] = input;
+        }
     }
 
     // Once every server's partial is in, fold them in ASCENDING device-id order (slot 0,
@@ -4618,6 +4651,8 @@ bool rpc_server::do_computation(const rpc_msg_do_computation_req & request) {
     // 1C: reuse one partial buffer across the ~44 reduces (grows as needed; no per-reduce
     // allocation -- every byte is overwritten before it's sent).
     std::vector<uint8_t> add_data;
+    std::vector<float>   ar_fp32_tmp;  // reused f32 scratch for the fp16 partial conversion
+    const bool           ar_fp16 = rpc_ar_fp16();
 
     graph_info * info = it->second->head;
     while (info) {
@@ -4651,16 +4686,26 @@ bool rpc_server::do_computation(const rpc_msg_do_computation_req & request) {
             // build this server's partial into the reused buffer: seq(4) | src_id(4) |
             // name(GGML_MAX_NAME) | data. seq tags the token (a peer running ahead is buffered
             // by seq, not misapplied); src_id lets the receiver fold partials in a fixed order.
-            const size_t ar_hdr = sizeof(uint32_t) + sizeof(uint32_t) + sizeof(tensor_to_all_reduce->name);
-            add_data.resize(ar_hdr + ggml_nbytes(tensor_to_all_reduce));  // reused; every byte set below
+            const size_t  ar_hdr = sizeof(uint32_t) + sizeof(uint32_t) + sizeof(tensor_to_all_reduce->name);
+            const size_t  nbytes = ggml_nbytes(tensor_to_all_reduce);
+            const int64_t nelem  = ggml_nelements(tensor_to_all_reduce);
+            // fp16 only for f32 partials (the row-split outputs are f32); else ship raw bytes.
+            const bool    fp16   = ar_fp16 && tensor_to_all_reduce->type == GGML_TYPE_F32;
+            const size_t  payload = fp16 ? (size_t) nelem * sizeof(ggml_fp16_t) : nbytes;
+            add_data.resize(ar_hdr + payload);  // reused; every byte set below
             uint32_t src_id = device_id;
             uint32_t seq    = ++all_reduce_seq[tensor_name];  // Nth reduce of this name == token N
             memcpy(add_data.data(), &seq, sizeof(uint32_t));
             memcpy(add_data.data() + sizeof(uint32_t), &src_id, sizeof(uint32_t));
             memcpy(add_data.data() + 2 * sizeof(uint32_t), tensor_to_all_reduce->name,
                    sizeof(tensor_to_all_reduce->name));
-            ggml_backend_tensor_get(tensor_to_all_reduce, add_data.data() + ar_hdr, 0,
-                                    ggml_nbytes(tensor_to_all_reduce));
+            if (fp16) {
+                ar_fp32_tmp.resize((size_t) nelem);
+                ggml_backend_tensor_get(tensor_to_all_reduce, ar_fp32_tmp.data(), 0, nbytes);
+                ggml_fp32_to_fp16_row(ar_fp32_tmp.data(), (ggml_fp16_t *) (add_data.data() + ar_hdr), nelem);
+            } else {
+                ggml_backend_tensor_get(tensor_to_all_reduce, add_data.data() + ar_hdr, 0, nbytes);
+            }
             static const bool dbg_ar = getenv("RPC_DBG_AR") != nullptr;
             if (dbg_ar) {
                 GGML_LOG_INFO("[ar-send] gnum=%d %s seq=%u\n", graph_number, tensor_name.c_str(), seq);
@@ -4722,13 +4767,26 @@ bool rpc_server::do_computation(const rpc_msg_do_computation_req & request) {
                 }
             }
 
+            // look up the block UNDER block_mutex: the peer ALL_REDUCE handler mutates this map
+            // (find/insert) and the block under the same mutex, so the bare operator[] here was a
+            // concurrent-map-access race. The block object itself is stable for this token.
+            block_mutex.lock();
+            all_reduce_block * blk = all_reduce_blocks[tensor_name];
+            block_mutex.unlock();
+
             //wait for the peers' partials; bounded so a lost partial can't deadlock forever
-            if (!all_reduce_blocks[tensor_name]->wait_for_completion()) {
+            if (!blk->wait_for_completion()) {
                 GGML_LOG_ERROR("[%s] all-reduce TIMEOUT for tensor %s (lost partial?) -- aborting graph\n",
                                __func__, tensor_name.c_str());
                 return false;  // clean abort instead of hanging; client run can retry
             }
-            all_reduce_blocks[tensor_name]->block_uinit();
+            // Reset UNDER block_mutex: block_uinit() frees add_tensor->buffer + ctx (where the
+            // add graph lives), and a peer thread runs add() under block_mutex -- without this
+            // lock the free could race a peer still inside add() => use-after-free. This is THE
+            // intermittent all-reduce crash (Heisenbug: extra logging slowed the race away).
+            block_mutex.lock();
+            blk->block_uinit();
+            block_mutex.unlock();
             g_srv_allreduce_ns +=
                 std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - _ta).count();
         }
