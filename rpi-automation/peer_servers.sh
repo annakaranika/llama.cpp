@@ -58,24 +58,37 @@ stop_all() {
     done
 }
 
+# is the rpc-server on $1 actually ACCEPTING connections on RPC_PORT? (process-up via pgrep
+# is not enough -- a client that connects before the listen socket is ready gets "Connection
+# closed by peer" at warmup. The peer checks its own port locally so it works whether the
+# coordinator is rpi1 (on-cell) or the Mac (behind the proxy).
+listening_on() {
+    # the server binds to the peer's own IBSS IP ($1), not loopback -- probe that.
+    $SSH "pi@$1" "for i in \$(seq 1 20); do
+        (exec 3<>/dev/tcp/$1/$RPC_PORT) 2>/dev/null && { echo LISTEN; exec 3>&-; exit 0; }
+        sleep 0.5
+      done; echo NOLISTEN" 2>/dev/null | awk '/LISTEN|NOLISTEN/{print; exit}'
+}
+
 start_all() {
     for ip in $(peers); do
         $SSH "pi@$ip" "cd ~/llama.cpp && ($RPC_SERVER_ENV setsid $RPC_BIN -H $ip -p $RPC_PORT -m $RPC_MEM_MB </dev/null >/tmp/rpc.log 2>&1 &)" 2>/dev/null
     done
-    sleep 4
+    sleep 2
     local ok=1
     for ip in $(peers); do
         local n; n="$(count_on "$ip")"
-        if [ "$n" = "1" ]; then
-            echo "  $ip: OK (1 rpc-server)"
+        local l; l="$(listening_on "$ip")"  # poll until the port accepts (or ~10s timeout)
+        if [ "$n" = "1" ] && [ "$l" = "LISTEN" ]; then
+            echo "  $ip: OK (1 rpc-server, listening)"
         else
-            echo "  $ip: BAD (count=${n:-?}) -- not a clean slate"; ok=0
+            echo "  $ip: BAD (count=${n:-?} listen=${l:-?}) -- not a clean ready slate"; ok=0
         fi
     done
     if [ "$ok" = "1" ]; then
-        echo "clean slate: exactly one rpc-server per peer"
+        echo "clean slate: exactly one rpc-server per peer, all accepting connections"
     else
-        echo "WARNING: NOT a clean 1/peer slate -- a client run may hit stale state / GGML_ASSERT" >&2
+        echo "WARNING: NOT a clean ready slate -- a client run may hit stale state / GGML_ASSERT" >&2
         return 1
     fi
 }
