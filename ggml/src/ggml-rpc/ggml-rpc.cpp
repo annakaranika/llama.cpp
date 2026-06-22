@@ -541,6 +541,28 @@ static bool send_rpc_cmd(const std::shared_ptr<socket_t> & sock, enum rpc_cmd cm
     return true;
 }
 
+// Fire-and-forget command: send cmd|size|payload and DON'T wait for a reply. Used for
+// the peer-to-peer all-reduce broadcast, where the app-level ack added a full round-trip
+// per peer per reduce but no reliability (TCP already guarantees delivery+order, the
+// receiver buffers partials by seq, and a dead link is caught by the all-reduce timeout).
+// The matching server handler must NOT send a reply on this socket, or the unread acks
+// would pile up in the sender's recv buffer and eventually backpressure the peer.
+static bool send_rpc_cmd_oneway(const std::shared_ptr<socket_t> & sock, enum rpc_cmd cmd, const void * input,
+                                size_t input_size) {
+    if (sock == nullptr) {
+        GGML_LOG_INFO("[send_rpc_cmd_oneway] NULL socket for cmd %d\n", (int) cmd);
+        return false;
+    }
+    uint8_t cmd_byte = cmd;
+    if (!send_data(sock->fd, &cmd_byte, sizeof(cmd_byte))) {
+        return false;
+    }
+    if (!send_data(sock->fd, &input_size, sizeof(input_size))) {
+        return false;
+    }
+    return send_data(sock->fd, input, input_size);
+}
+
 // RPC client-side implementation
 
 static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
@@ -3264,19 +3286,21 @@ class all_reduce_block {
   public:
     all_reduce_block() {}
 
-    all_reduce_block(ggml_tensor * tensor, int op, int device_count, ggml_backend_t backend, uint32_t seq);
+    all_reduce_block(ggml_tensor * tensor, int op, int device_count, ggml_backend_t backend, uint8_t device_id,
+                     uint32_t seq);
     ~all_reduce_block();
     bool block_init(ggml_tensor * tensor, int op, int device_count, ggml_backend_t backend, uint8_t device_id,
                     uint32_t seq);
-    bool add(std::vector<uint8_t> & input, uint8_t device_id);
+    bool add(std::vector<uint8_t> & input, uint8_t src_id);
 
     // Buffer a partial that arrived before we reached this all-reduce, keyed by its
     // sequence (token). Lets a peer run ahead without its partial being misapplied to
     // the wrong token or lost on reset -- needed once the graph cache removes the
-    // GRAPH_COMPUTE round-trips that used to implicitly barrier the peers.
-    bool add_to_buffer(uint32_t seq, const std::vector<uint8_t> & input) {
+    // GRAPH_COMPUTE round-trips that used to implicitly barrier the peers. The source
+    // device id is kept so the deterministic fold can place it in the right slot.
+    bool add_to_buffer(uint32_t seq, uint8_t src_id, const std::vector<uint8_t> & input) {
         std::lock_guard<std::mutex> lock(add_mutex);
-        all_reduce_buffer[seq].push_back(input);
+        all_reduce_buffer[seq].push_back({ src_id, input });
         return true;
     }
 
@@ -3287,6 +3311,7 @@ class all_reduce_block {
         initialized  = false;
         arrived      = 0;
         is_completed = false;
+        slots.clear();
         ggml_backend_buffer_free(add_tensor->buffer);
         ggml_free(ctx);
     }
@@ -3307,9 +3332,16 @@ class all_reduce_block {
     std::mutex                        wait_mutex;             //mutex for waiting completion
     std::condition_variable           cv;                     //condition variable for signaling
     bool                              is_completed = false;   //whether the all-reduce is completed
-    int                               arrived      = 0;       //number of servers that have received data
-    std::unordered_map<uint32_t, std::vector<std::vector<uint8_t>>>
-                                      all_reduce_buffer;       //seq(token) -> partials that arrived before init
+    int                               arrived      = 0;       //number of servers whose partial has arrived
+    // Deterministic fold: collect every server's partial in a per-source slot and sum them
+    // in ascending device-id order (== ascending contraction-K-slice order == what a single
+    // device's contiguous-K matmul reduction does), independent of network arrival order.
+    // Without this the F32 sum order races on arrival and N>=3 output varies run-to-run.
+    std::vector<std::vector<uint8_t>> slots;                  //slots[d] = device d's partial bytes
+    int                               self_id       = -1;     //this server's device id (its own slot)
+    size_t                            reduce_nbytes = 0;      //bytes per partial
+    std::unordered_map<uint32_t, std::vector<std::pair<uint8_t, std::vector<uint8_t>>>>
+                                      all_reduce_buffer;       //seq(token) -> (src_id, partial) that arrived before init
     uint32_t                          current_seq = 0;         //the sequence (token) this block is reducing now
     ggml_backend_t                    backend;                //backend type
     struct ggml_context *             ctx;
@@ -3328,7 +3360,7 @@ bool all_reduce_block::wait_for_completion() {
 //when to be called:    when the current server finishes graph computing
 //note:                 since the first time to be called, no data in the buffer
 all_reduce_block::all_reduce_block(ggml_tensor * tensor, int op, int device_count, ggml_backend_t backend,
-                                   uint32_t seq) :
+                                   uint8_t device_id, uint32_t seq) :
     op(op),
     num_of_servers(device_count),
     backend(backend) {
@@ -3374,8 +3406,14 @@ all_reduce_block::all_reduce_block(ggml_tensor * tensor, int op, int device_coun
     //set initialized flag
     initialized = true;
 
-    //increment arrived count
-    arrived++;
+    // capture this server's own partial into its device-id slot; the fold sums all slots
+    // in ascending id order once every server's partial has arrived (deterministic).
+    reduce_nbytes = ggml_nbytes(tensor);
+    self_id       = device_id;
+    slots.assign(num_of_servers, {});
+    slots[device_id].resize(reduce_nbytes);
+    ggml_backend_tensor_get(tensor, slots[device_id].data(), 0, reduce_nbytes);
+    arrived = 1;
 
     //add any buffered data (no need as this is constructor, the first time to be called)
     // if(!all_reduce_buffer.empty()){
@@ -3433,14 +3471,20 @@ bool all_reduce_block::block_init(ggml_tensor * tensor, int op, int device_count
     //set initialized flag
     initialized = true;
 
-    //increment arrived count
-    arrived++;
+    // capture this server's own partial into its device-id slot (see ctor); arrived starts
+    // at 1 (self). Peers fill their slots via add(); the fold runs once all have arrived.
+    reduce_nbytes = ggml_nbytes(tensor);
+    self_id       = device_id;
+    slots.assign(num_of_servers, {});
+    slots[device_id].resize(reduce_nbytes);
+    ggml_backend_tensor_get(tensor, slots[device_id].data(), 0, reduce_nbytes);
+    arrived = 1;
 
     //apply any partials that arrived early for THIS sequence (token); leave others buffered
     auto buf_it = all_reduce_buffer.find(current_seq);
     if (buf_it != all_reduce_buffer.end()) {
         for (auto & part : buf_it->second) {
-            add(part, device_id);
+            add(part.second, part.first);  // (src_id, bytes) -> place in the right slot
         }
         all_reduce_buffer.erase(buf_it);
     }
@@ -3460,31 +3504,42 @@ all_reduce_block::~all_reduce_block() {
     }
 }
 
-bool all_reduce_block::add(std::vector<uint8_t> & input, uint8_t device_id) {
+bool all_reduce_block::add(std::vector<uint8_t> & input, uint8_t src_id) {
     // GGML_LOG_INFO("all_reduce_block add called\n");
     std::lock_guard<std::mutex> lock(add_mutex);
 
-    std::vector<uint8_t> origin;
-    origin.resize(input.size(), 0);
-    ggml_backend_tensor_get(tensor, origin.data(), 0, origin.size());
-
-    //do the addition
-    ggml_backend_tensor_set(add_tensor, input.data(), 0, input.size());
-    ggml_status result = ggml_backend_graph_compute(backend, graph);
-    if (result != GGML_STATUS_SUCCESS) {
-        GGML_LOG_INFO("graph_compute failed\n");
+    // Store this peer's partial in its device-id slot (don't sum yet). Counting only the
+    // first arrival per source keeps arrived correct even if a duplicate slips through.
+    if (src_id < slots.size()) {
+        if (slots[src_id].empty()) {
+            arrived++;
+        }
+        slots[src_id] = input;
     }
 
-    std::vector<uint8_t> output;
-    output.resize(input.size(), 0);
-    ggml_backend_tensor_get(tensor, output.data(), 0, output.size());
-
-    arrived++;
-
-    //if all_reduce is done, notify the thread in wait_for_completion. Set the predicate
-    //UNDER wait_mutex so the wakeup can't be lost (a lost wakeup here stalls for the full
-    //RPC_ALLREDUCE_TIMEOUT -- which is what surfaced once the graph cache let peers drift).
+    // Once every server's partial is in, fold them in ASCENDING device-id order (slot 0,
+    // 1, ... N-1). FP addition isn't associative, so a fixed order is what makes the result
+    // reproducible run-to-run AND bit-identical on every server (all hold the same slots).
     if (arrived >= num_of_servers) {
+        bool first = true;
+        for (int d = 0; d < num_of_servers; d++) {
+            if (slots[d].empty()) {
+                continue;
+            }
+            if (first) {
+                ggml_backend_tensor_set(tensor, slots[d].data(), 0, slots[d].size());  // tensor = slots[d]
+                first = false;
+            } else {
+                ggml_backend_tensor_set(add_tensor, slots[d].data(), 0, slots[d].size());
+                ggml_status result = ggml_backend_graph_compute(backend, graph);  // tensor += add_tensor
+                if (result != GGML_STATUS_SUCCESS) {
+                    GGML_LOG_INFO("graph_compute failed\n");
+                }
+            }
+        }
+
+        //notify the thread in wait_for_completion. Set the predicate UNDER wait_mutex so the
+        //wakeup can't be lost (a lost wakeup stalls for the full RPC_ALLREDUCE_TIMEOUT).
         {
             std::lock_guard<std::mutex> wlock(wait_mutex);
             is_completed = true;
@@ -3492,7 +3547,6 @@ bool all_reduce_block::add(std::vector<uint8_t> & input, uint8_t device_id) {
         }
         cv.notify_all();
     }
-    GGML_UNUSED(device_id);
     return is_completed;
 }
 
@@ -4474,14 +4528,17 @@ bool rpc_server::do_computation(const rpc_msg_do_computation_req & request) {
             return false;
         }
 
-        //get the data to be sent first. Layout: seq(4) | name(GGML_MAX_NAME) | data.
-        //seq (filled in for the all-reduce below) tags the partial with its token so a
-        //peer running ahead is buffered by sequence on the receiver, not misapplied.
+        //get the data to be sent first. Layout: seq(4) | src_id(4) | name(GGML_MAX_NAME) | data.
+        //seq (filled in for the all-reduce below) tags the partial with its token so a peer
+        //running ahead is buffered by sequence on the receiver, not misapplied. src_id is
+        //this server's device id so the receiver folds partials in a fixed (id) order.
+        const size_t         ar_hdr = sizeof(uint32_t) + sizeof(uint32_t) + sizeof(tensor_to_all_reduce->name);
         std::vector<uint8_t> add_data;
-        add_data.resize(sizeof(uint32_t) + sizeof(tensor_to_all_reduce->name) + ggml_nbytes(tensor_to_all_reduce), 0);
-        memcpy(add_data.data() + sizeof(uint32_t), tensor_to_all_reduce->name, sizeof(tensor_to_all_reduce->name));
-        ggml_backend_tensor_get(tensor_to_all_reduce,
-                                add_data.data() + sizeof(uint32_t) + sizeof(tensor_to_all_reduce->name), 0,
+        add_data.resize(ar_hdr + ggml_nbytes(tensor_to_all_reduce), 0);
+        uint32_t             src_id = device_id;
+        memcpy(add_data.data() + sizeof(uint32_t), &src_id, sizeof(uint32_t));
+        memcpy(add_data.data() + 2 * sizeof(uint32_t), tensor_to_all_reduce->name, sizeof(tensor_to_all_reduce->name));
+        ggml_backend_tensor_get(tensor_to_all_reduce, add_data.data() + ar_hdr, 0,
                                 ggml_nbytes(tensor_to_all_reduce));
         //now broadcast result to all connected clients
         // GGML_LOG_INFO("Broadcasting all reduce if needed, signal=%d, tensor name: %s", signal, graph->nodes[graph->n_nodes - 1]->name);
@@ -4512,7 +4569,7 @@ bool rpc_server::do_computation(const rpc_msg_do_computation_req & request) {
                 try {
                     //if not, create the block and add it to the map
                     all_reduce_block * block =
-                        new all_reduce_block(tensor_to_all_reduce, signal, device_count, backend, seq);
+                        new all_reduce_block(tensor_to_all_reduce, signal, device_count, backend, device_id, seq);
                     all_reduce_blocks[tensor_name] = block;
                 } catch (const std::exception & e) {
                     GGML_LOG_INFO("[%s] error: %s\n", __func__, e.what());
@@ -4523,13 +4580,13 @@ bool rpc_server::do_computation(const rpc_msg_do_computation_req & request) {
             //notify all other servers to do all_reduce
             // GGML_LOG_INFO("begin notifying all other servers tensor %s\n",tensor_to_all_reduce->name);
 
+            // Resolve every peer socket first (recreate any expired one) -- done SERIALLY so
+            // the sockets_connectto map mutation can't race the broadcast threads below.
+            std::vector<std::shared_ptr<socket_t>> peer_socks;
+            std::vector<std::string>               peer_names;
             for (auto & sock_weak : sockets_connectto) {
-                if (auto sock = sock_weak.second.lock()) {
-                    bool status = send_rpc_cmd(sock, RPC_CMD_ALL_REDUCE, add_data.data(), add_data.size(), nullptr, 0);
-                    if (!status) {
-                        GGML_LOG_INFO("failed to send all_reduce command to %s\n", sock_weak.first.c_str());
-                    }
-                } else {
+                auto sock = sock_weak.second.lock();
+                if (!sock) {
                     GGML_LOG_INFO("recreating socket\n");
                     std::string host;
                     int         port;
@@ -4537,17 +4594,33 @@ bool rpc_server::do_computation(const rpc_msg_do_computation_req & request) {
                     if (!parse_endpoint(endpoint, host, port)) {
                         GGML_LOG_INFO("unable to parse endpoint %s", endpoint.c_str());
                     }
-                    auto socket = socket_connect(host.c_str(), port);
-                    if (socket == nullptr) {
+                    sock = socket_connect(host.c_str(), port);
+                    if (sock == nullptr) {
                         GGML_LOG_INFO("nullptr socket");
                     }
-                    sockets_connectto[endpoint] = socket;
-                    // GGML_LOG_INFO("create connection for device %s\n", endpoint.c_str());
-                    // GGML_LOG_INFO("sending data to sock %d\n",socket->fd);
-                    bool status =
-                        send_rpc_cmd(socket, RPC_CMD_ALL_REDUCE, add_data.data(), add_data.size(), nullptr, 0);
-                    if (!status) {
-                        GGML_LOG_INFO("failed to send all_reduce command to %s\n", sock_weak.first.c_str());
+                    sockets_connectto[endpoint] = sock;  // existing key -> no rehash, safe mid-iteration
+                }
+                if (sock) {
+                    peer_socks.push_back(sock);
+                    peer_names.push_back(sock_weak.first);
+                }
+            }
+            // Broadcast this server's partial to all peers CONCURRENTLY and FIRE-AND-FORGET
+            // (one thread per peer, distinct sockets -> no contention; no ack to wait on).
+            // The threads only read add_data/peer_socks, which outlive the join below.
+            {
+                std::vector<std::thread> bcast;
+                for (size_t k = 0; k < peer_socks.size(); ++k) {
+                    bcast.emplace_back([&, k]() {
+                        if (!send_rpc_cmd_oneway(peer_socks[k], RPC_CMD_ALL_REDUCE, add_data.data(),
+                                                 add_data.size())) {
+                            GGML_LOG_INFO("failed to send all_reduce command to %s\n", peer_names[k].c_str());
+                        }
+                    });
+                }
+                for (auto & t : bcast) {
+                    if (t.joinable()) {
+                        t.join();
                     }
                 }
             }
@@ -4655,13 +4728,15 @@ bool rpc_server::create_peer_connection(const rpc_msg_create_peer_connection_req
 bool rpc_server::all_reduce(std::vector<uint8_t> & input) {
     // GGML_LOG_INFO("receiving all reduce, size: %ld\n",input.size());
 
-    //parse seq | tensor_name | tensor_data (layout matches do_computation's add_data)
+    //parse seq | src_id | tensor_name | tensor_data (layout matches do_computation's add_data)
     uint32_t seq;
     memcpy(&seq, input.data(), sizeof(uint32_t));
+    uint32_t src_id;
+    memcpy(&src_id, input.data() + sizeof(uint32_t), sizeof(uint32_t));
     char tensor_name_[GGML_MAX_NAME];
-    memcpy(tensor_name_, input.data() + sizeof(uint32_t), sizeof(tensor_name_));
+    memcpy(tensor_name_, input.data() + 2 * sizeof(uint32_t), sizeof(tensor_name_));
     std::vector<uint8_t> tensor_data;
-    size_t               data_off = sizeof(uint32_t) + sizeof(tensor_name_);
+    size_t               data_off = 2 * sizeof(uint32_t) + sizeof(tensor_name_);
     tensor_data.resize(input.size() - data_off, 0);
     memcpy(tensor_data.data(), input.data() + data_off, tensor_data.size());
 
@@ -4691,17 +4766,17 @@ bool rpc_server::all_reduce(std::vector<uint8_t> & input) {
         // no block yet -> buffer this partial under its sequence until we reach it
         try {
             all_reduce_block * block = new all_reduce_block();
-            block->add_to_buffer(seq, tensor_data);
+            block->add_to_buffer(seq, (uint8_t) src_id, tensor_data);
             all_reduce_blocks[tensor_name] = block;
         } catch (const std::exception & e) {
             GGML_LOG_INFO("[%s] error: %s\n", __func__, e.what());
         }
     } else if (it->second->is_init() && seq == it->second->get_current_seq()) {
         //the block is reducing exactly this token -> apply now
-        it->second->add(tensor_data, device_id);
+        it->second->add(tensor_data, (uint8_t) src_id);
     } else if (seq > it->second->get_current_seq()) {
         //peer is ahead of us on this tensor -> buffer until we reach this token
-        it->second->add_to_buffer(seq, tensor_data);
+        it->second->add_to_buffer(seq, (uint8_t) src_id, tensor_data);
     }
     //else: seq <= current_seq but not the active reduce -> stale duplicate, drop
     block_mutex.unlock();
@@ -4973,14 +5048,15 @@ static void rpc_serve_client(rpc_server & server, sockfd_t sockfd, size_t free_m
                 }
             case RPC_CMD_ALL_REDUCE:
                 {
+                    // Fire-and-forget: the peer sent this with send_rpc_cmd_oneway and is NOT
+                    // waiting for a reply, so do NOT send one (an unread ack would pile up in
+                    // the peer's recv buffer). The partial is buffered by seq; a lost peer is
+                    // caught by the receiver's all-reduce timeout, not by an ack here.
                     std::vector<uint8_t> input;
                     if (!recv_msg(sockfd, input)) {
                         return;
                     }
                     if (!server.all_reduce(input)) {
-                        return;
-                    }
-                    if (!send_msg(sockfd, nullptr, 0)) {
                         return;
                     }
                     break;
