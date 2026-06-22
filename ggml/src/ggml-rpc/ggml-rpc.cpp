@@ -765,6 +765,18 @@ static rpc_tensor split_serialize_tensor(const ggml_tensor * tensor, const ggml_
 static std::array<float, RPC_MAX_DEVICES> tensor_splits;
 static bool                               multi_cpy = true;
 
+// Master optimization gate for the research-paper A/B. RPC_NO_OPT set => ALL of our
+// optimizations are OFF (faithful baseline); unset => all ON (the optimized path). Read
+// once. Must be set consistently on the client AND every rpc-server for the all-reduce
+// fire-and-forget vs acked paths to agree. Covers: diff cache, graph-send batching,
+// parallel/fire-and-forget all-reduce broadcast + deterministic ordered fold (and 1A/1B/1C),
+// the on-disk weight cache, and the threaded weight upload/alloc/download. Finer-grained
+// gates (RPC_GRAPH_CACHE, RPC_NO_WEIGHT_CACHE, RPC_SERIAL_UPLOAD) still apply on top.
+static bool rpc_opt_enabled() {
+    static const bool on = (getenv("RPC_NO_OPT") == nullptr);
+    return on;
+}
+
 static void ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
     ggml_backend_rpc_buffer_context *      ctx      = (ggml_backend_rpc_buffer_context *) buffer->context;
     ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *) buffer->buft->context;
@@ -797,7 +809,7 @@ static void ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_t buffer, gg
             // (On alloc failure we set buffer_ctx[id]=nullptr -- which downstream already
             //  null-checks -- instead of `delete extra`, which under threading would
             //  double-free and was a use-after-free even serially via `tensor->extra=extra`.)
-            static const bool                      serial_alloc = getenv("RPC_SERIAL_UPLOAD") != nullptr;
+            static const bool                      serial_alloc = (!rpc_opt_enabled() || getenv("RPC_SERIAL_UPLOAD") != nullptr);
             const int                              n_dev        = ggml_backend_rpc_get_device_count();
             std::vector<std::shared_ptr<socket_t>> socks(n_dev);
             for (int id = 0; id < n_dev; ++id) {
@@ -967,7 +979,7 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
         // and HOLD the sockets on the main thread first (the worker threads must
         // not race get_socket / let the weak_ptr-cached sockets churn -- see the
         // split upload). RPC_SERIAL_UPLOAD=1 reverts to one-at-a-time.
-        static const bool                      serial_upload = getenv("RPC_SERIAL_UPLOAD") != nullptr;
+        static const bool                      serial_upload = (!rpc_opt_enabled() || getenv("RPC_SERIAL_UPLOAD") != nullptr);
         std::vector<std::shared_ptr<socket_t>> socks(n_dev);
         for (int id = 0; id < n_dev; ++id) {
             socks[id] = get_socket(((ggml_backend_rpc_device_context *) reg_ctx->devices[id]->context)->endpoint);
@@ -1265,7 +1277,7 @@ static void ggml_backend_rpc_split_buffer_init_tensor(ggml_backend_buffer_t buff
         // Allocate each device's split buffer concurrently -- per-id (disjoint) writes to
         // extra->buffer_ctx[id]/rows[id]; sockets pre-fetched + HELD so the weak_ptr cache
         // can't churn under the workers (see the split upload). RPC_SERIAL_UPLOAD=1 reverts.
-        static const bool                      serial_alloc = getenv("RPC_SERIAL_UPLOAD") != nullptr;
+        static const bool                      serial_alloc = (!rpc_opt_enabled() || getenv("RPC_SERIAL_UPLOAD") != nullptr);
         const int                              n_dev        = ggml_backend_rpc_get_device_count();
         std::vector<std::shared_ptr<socket_t>> socks(n_dev);
         for (int id = 0; id < n_dev; ++id) {
@@ -1435,7 +1447,7 @@ static void ggml_backend_rpc_split_buffer_set_tensor(ggml_backend_buffer_t buffe
     // workers race get_socket() and let the cached sockets churn (close/reopen)
     // concurrently, which drops the peer connections and deadlocks the next
     // all-reduce. RPC_SERIAL_UPLOAD=1 forces the old one-at-a-time path.
-    static const bool                      serial_upload = getenv("RPC_SERIAL_UPLOAD") != nullptr;
+    static const bool                      serial_upload = (!rpc_opt_enabled() || getenv("RPC_SERIAL_UPLOAD") != nullptr);
     const int                              n_dev         = ggml_backend_rpc_get_device_count();
     std::vector<std::shared_ptr<socket_t>> socks(n_dev);
     for (int id = 0; id < n_dev; ++id) {
@@ -1448,7 +1460,7 @@ static void ggml_backend_rpc_split_buffer_set_tensor(ggml_backend_buffer_t buffe
     // it already has it on disk from a previous run. On a HIT the server loads it from
     // its cache and we skip the network upload; on a MISS we upload via SET_TENSOR_CACHE
     // so the server persists it for next time. RPC_NO_WEIGHT_CACHE disables the cache.
-    static const bool weight_cache = (getenv("RPC_NO_WEIGHT_CACHE") == nullptr);
+    static const bool weight_cache = rpc_opt_enabled() && (getenv("RPC_NO_WEIGHT_CACHE") == nullptr);
 
     // Given a contiguous slice, either skip it (server cache hit) or upload it.
     auto cache_or_upload = [&](int id, const rpc_tensor & rt, const uint8_t * slice, size_t slice_size) {
@@ -1582,7 +1594,7 @@ static void ggml_backend_rpc_split_buffer_get_tensor(ggml_backend_buffer_t buffe
     // shared state is the atomic counter. Pre-fetch + HOLD the sockets on the main
     // thread so the weak_ptr cache can't churn under the workers (see the split
     // upload). RPC_SERIAL_UPLOAD=1 reverts to one-at-a-time.
-    static const bool                      serial_download = getenv("RPC_SERIAL_UPLOAD") != nullptr;
+    static const bool                      serial_download = (!rpc_opt_enabled() || getenv("RPC_SERIAL_UPLOAD") != nullptr);
     const int                              n_dev           = ggml_backend_rpc_get_device_count();
     std::vector<std::shared_ptr<socket_t>> socks(n_dev);
     for (int id = 0; id < n_dev; ++id) {
@@ -2705,7 +2717,9 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         // positions every token.) RPC_DBG_GHASH logs the view_offs-inclusive probe hash;
         // RPC_DBG_DIFFCACHE logs hit/miss + patch counts. All default off.
         static const bool                            dbg_ghash      = getenv("RPC_DBG_GHASH") != nullptr;
-        static const bool                            use_diff_cache = getenv("RPC_GRAPH_CACHE") != nullptr;
+        // Under the master gate the diff cache is ON by default (optimized); RPC_NO_OPT
+        // turns it off (baseline ships the full graph every token).
+        static const bool                            use_diff_cache = rpc_opt_enabled();
         static const bool                            dbg_diffcache  = getenv("RPC_DBG_DIFFCACHE") != nullptr;
         static std::unordered_map<uint64_t, uint8_t> graph_cache;  // topology hash (excl. view_offs) -> server graph_number
         // server graph_number -> [segment][device] -> rpc_tensor array we last shipped, so a
@@ -2917,6 +2931,10 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                                                     std::vector<std::vector<rpc_tensor>>(batch_dev_count));
                 sent = &last_sent[this_graph_number];
             }
+            // Master gate (== rpc_opt_enabled()): also controls graph-send BATCHING. opt -> build
+            // all segments then one GRAPH_COMPUTE_BATCH/device; baseline -> send each segment
+            // immediately as its own RPC_CMD_GRAPH_COMPUTE (~n_segments x n_devices round-trips).
+            const bool opt = use_diff_cache;
             // Compute the computation graph for the current split and synchronize results
             for (size_t count_split = 0; count_split < sync_splits.size(); count_split++) {
                 // GGML_LOG_INFO("\n------------split-------------\n");
@@ -2982,16 +3000,31 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                                          sizeof(uint32_t) + n_tensors * sizeof(rpc_tensor));
                         *in_graph_number = this_graph_number;
 
-                        // accumulate this segment into the device's batch (one send below)
-                        uint32_t seg_len = (uint32_t) input.size();
-                        size_t   base    = dev_batch[id].size();
-                        dev_batch[id].resize(base + sizeof(uint32_t) + seg_len);
-                        memcpy(dev_batch[id].data() + base, &seg_len, sizeof(uint32_t));
-                        memcpy(dev_batch[id].data() + base + sizeof(uint32_t), input.data(), seg_len);
-
-                        // diff cache: keep this segment's array for next token's patch diff
-                        if (sent) {
-                            (*sent)[count_split][id] = std::move(tensors);
+                        if (opt) {
+                            // accumulate this segment into the device's batch (one send below)
+                            uint32_t seg_len = (uint32_t) input.size();
+                            size_t   base    = dev_batch[id].size();
+                            dev_batch[id].resize(base + sizeof(uint32_t) + seg_len);
+                            memcpy(dev_batch[id].data() + base, &seg_len, sizeof(uint32_t));
+                            memcpy(dev_batch[id].data() + base + sizeof(uint32_t), input.data(), seg_len);
+                            // diff cache: keep this segment's array for next token's patch diff
+                            if (sent) {
+                                (*sent)[count_split][id] = std::move(tensors);
+                            }
+                        } else {
+                            // BASELINE: send this segment now as its own (acked) RPC_CMD_GRAPH_COMPUTE
+                            auto dev_ctx = (ggml_backend_rpc_device_context *) reg_ctx->devices[id]->context;
+                            auto sock    = get_socket(dev_ctx->endpoint);
+                            rpc_msg_graph_compute_rsp response;
+                            auto                      _t_gs  = std::chrono::steady_clock::now();
+                            bool                      status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(),
+                                                                            input.size(), &response, sizeof(response));
+                            g_graph_send_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                   std::chrono::steady_clock::now() - _t_gs).count();
+                            GGML_ASSERT(status);
+                            if (response.result != GGML_STATUS_SUCCESS) {
+                                fprintf(stderr, "RPC graph compute failed with status %d\n", response.result);
+                            }
                         }
                     });
                 }
@@ -3004,8 +3037,9 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                 }
             }
 
-            // send each device's full batch in ONE round-trip (concurrent across devices)
-            {
+            // OPTIMIZED: send each device's full batch in ONE round-trip (concurrent across
+            // devices). BASELINE already sent each segment above, so nothing to do here.
+            if (opt) {
                 std::vector<std::thread> send_threads;
                 for (int id = 0; id < batch_dev_count; ++id) {
                     send_threads.emplace_back([&, id]() {
@@ -3411,13 +3445,17 @@ all_reduce_block::all_reduce_block(ggml_tensor * tensor, int op, int device_coun
     //set initialized flag
     initialized = true;
 
-    // capture this server's own partial into its device-id slot; the fold sums all slots
-    // in ascending id order once every server's partial has arrived (deterministic).
-    reduce_nbytes = ggml_nbytes(tensor);
-    self_id       = device_id;
-    slots.assign(num_of_servers, {});
-    slots[device_id].resize(reduce_nbytes);
-    ggml_backend_tensor_get(tensor, slots[device_id].data(), 0, reduce_nbytes);
+    // OPTIMIZED: capture this server's own partial into its device-id slot; the fold sums all
+    // slots in ascending id order once every server's partial has arrived (deterministic).
+    // BASELINE (RPC_NO_OPT): no slots -- `tensor` already holds P_self and add() accumulates
+    // peers into it in arrival order (nondeterministic at N>=3, the pre-optimization behavior).
+    if (rpc_opt_enabled()) {
+        reduce_nbytes = ggml_nbytes(tensor);
+        self_id       = device_id;
+        slots.assign(num_of_servers, {});
+        slots[device_id].resize(reduce_nbytes);
+        ggml_backend_tensor_get(tensor, slots[device_id].data(), 0, reduce_nbytes);
+    }
     arrived = 1;
 
     //add any buffered data (no need as this is constructor, the first time to be called)
@@ -3476,13 +3514,15 @@ bool all_reduce_block::block_init(ggml_tensor * tensor, int op, int device_count
     //set initialized flag
     initialized = true;
 
-    // capture this server's own partial into its device-id slot (see ctor); arrived starts
-    // at 1 (self). Peers fill their slots via add(); the fold runs once all have arrived.
-    reduce_nbytes = ggml_nbytes(tensor);
-    self_id       = device_id;
-    slots.assign(num_of_servers, {});
-    slots[device_id].resize(reduce_nbytes);
-    ggml_backend_tensor_get(tensor, slots[device_id].data(), 0, reduce_nbytes);
+    // OPTIMIZED: capture self's partial into its device-id slot (see ctor). BASELINE: skip --
+    // `tensor` holds P_self and add() folds peers in arrival order. arrived starts at 1 (self).
+    if (rpc_opt_enabled()) {
+        reduce_nbytes = ggml_nbytes(tensor);
+        self_id       = device_id;
+        slots.assign(num_of_servers, {});
+        slots[device_id].resize(reduce_nbytes);
+        ggml_backend_tensor_get(tensor, slots[device_id].data(), 0, reduce_nbytes);
+    }
     arrived = 1;
 
     //apply any partials that arrived early for THIS sequence (token); leave others buffered
@@ -3513,8 +3553,30 @@ bool all_reduce_block::add(std::vector<uint8_t> & input, uint8_t src_id) {
     // GGML_LOG_INFO("all_reduce_block add called\n");
     std::lock_guard<std::mutex> lock(add_mutex);
 
-    // Store this peer's partial in its device-id slot (don't sum yet). Counting only the
-    // first arrival per source keeps arrived correct even if a duplicate slips through.
+    if (!rpc_opt_enabled()) {
+        // BASELINE: arrival-order fold -- add this peer's partial into `tensor` immediately
+        // (tensor += add_tensor). FP sum order = arrival order => nondeterministic at N>=3.
+        // This is the pre-optimization behavior.
+        ggml_backend_tensor_set(add_tensor, input.data(), 0, input.size());
+        ggml_status result = ggml_backend_graph_compute(backend, graph);
+        if (result != GGML_STATUS_SUCCESS) {
+            GGML_LOG_INFO("graph_compute failed\n");
+        }
+        arrived++;
+        if (arrived >= num_of_servers) {
+            {
+                std::lock_guard<std::mutex> wlock(wait_mutex);
+                is_completed = true;
+                initialized  = false;
+            }
+            cv.notify_all();
+        }
+        GGML_UNUSED(src_id);
+        return is_completed;
+    }
+
+    // OPTIMIZED: store this peer's partial in its device-id slot (don't sum yet). Counting
+    // only the first arrival per source keeps arrived correct even if a duplicate slips in.
     if (src_id < slots.size()) {
         if (slots[src_id].empty()) {
             arrived++;
@@ -3832,7 +3894,7 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
 // Keyed by a content hash the client computes. Dir: $RPC_WEIGHT_CACHE_DIR, else
 // $HOME/.cache/llama-rpc-weights. Disable entirely with RPC_NO_WEIGHT_CACHE.
 static bool rpc_weight_cache_enabled() {
-    static const bool on = (getenv("RPC_NO_WEIGHT_CACHE") == nullptr);
+    static const bool on = rpc_opt_enabled() && (getenv("RPC_NO_WEIGHT_CACHE") == nullptr);
     return on;
 }
 
@@ -4526,31 +4588,35 @@ bool rpc_server::do_computation(const rpc_msg_do_computation_req & request) {
     }
     GGML_LOG_INFO("found graph number %d, doing computation\n", graph_number);
 
-    // 1B: resolve the peer sockets ONCE per token (they're kept alive in peer_socks_held),
-    // instead of re-walking the map + locking weak_ptrs inside each of the ~44 reduces.
-    // Re-dial only an already-expired one here.
+    const bool opt = rpc_opt_enabled();
+
+    // 1B (optimized only): resolve the peer sockets ONCE per token (they're kept alive in
+    // peer_socks_held), instead of re-walking the map + locking weak_ptrs inside each of the
+    // ~44 reduces. The baseline path re-resolves per reduce below. Re-dial an expired one.
     std::vector<std::shared_ptr<socket_t>> peer_socks;
     std::vector<std::string>               peer_names;
-    for (auto & sock_weak : sockets_connectto) {
-        auto sock = sock_weak.second.lock();
-        if (!sock) {
-            std::string host;
-            int         port;
-            std::string endpoint = sock_weak.first;
-            if (!parse_endpoint(endpoint, host, port)) {
-                GGML_LOG_INFO("unable to parse endpoint %s", endpoint.c_str());
+    if (opt) {
+        for (auto & sock_weak : sockets_connectto) {
+            auto sock = sock_weak.second.lock();
+            if (!sock) {
+                std::string host;
+                int         port;
+                std::string endpoint = sock_weak.first;
+                if (!parse_endpoint(endpoint, host, port)) {
+                    GGML_LOG_INFO("unable to parse endpoint %s", endpoint.c_str());
+                }
+                sock                        = socket_connect(host.c_str(), port);
+                sockets_connectto[endpoint] = sock;  // existing key -> no rehash, safe mid-iteration
             }
-            sock                        = socket_connect(host.c_str(), port);
-            sockets_connectto[endpoint] = sock;  // existing key -> no rehash, safe mid-iteration
-        }
-        if (sock) {
-            peer_socks.push_back(sock);
-            peer_names.push_back(sock_weak.first);
+            if (sock) {
+                peer_socks.push_back(sock);
+                peer_names.push_back(sock_weak.first);
+            }
         }
     }
 
     // 1C: reuse one partial buffer across the ~44 reduces (grows as needed; no per-reduce
-    // allocation or zero-fill -- every byte is overwritten before it's sent).
+    // allocation -- every byte is overwritten before it's sent).
     std::vector<uint8_t> add_data;
 
     graph_info * info = it->second->head;
@@ -4615,10 +4681,10 @@ bool rpc_server::do_computation(const rpc_msg_do_computation_req & request) {
             }
             block_mutex.unlock();
 
-            // broadcast this partial to all peers CONCURRENTLY and FIRE-AND-FORGET, using the
-            // peer sockets resolved once above. threads only read add_data/peer_socks (alive
-            // until the join below).
-            {
+            // broadcast this partial to all peers.
+            if (opt) {
+                // OPTIMIZED: CONCURRENT + FIRE-AND-FORGET (one thread per peer, sockets resolved
+                // once above, no ack). threads only read add_data/peer_socks (alive until join).
                 std::vector<std::thread> bcast;
                 for (size_t k = 0; k < peer_socks.size(); ++k) {
                     bcast.emplace_back([&, k]() {
@@ -4631,6 +4697,27 @@ bool rpc_server::do_computation(const rpc_msg_do_computation_req & request) {
                 for (auto & t : bcast) {
                     if (t.joinable()) {
                         t.join();
+                    }
+                }
+            } else {
+                // BASELINE: SERIAL + ACKED (send_rpc_cmd waits a round-trip per peer), peer
+                // sockets re-resolved per reduce. This is the pre-optimization behavior; the
+                // matching server ALL_REDUCE handler replies in baseline mode too.
+                for (auto & sock_weak : sockets_connectto) {
+                    auto sock = sock_weak.second.lock();
+                    if (!sock) {
+                        std::string host;
+                        int         port;
+                        std::string endpoint = sock_weak.first;
+                        if (!parse_endpoint(endpoint, host, port)) {
+                            GGML_LOG_INFO("unable to parse endpoint %s", endpoint.c_str());
+                        }
+                        sock                        = socket_connect(host.c_str(), port);
+                        sockets_connectto[endpoint] = sock;
+                    }
+                    if (sock &&
+                        !send_rpc_cmd(sock, RPC_CMD_ALL_REDUCE, add_data.data(), add_data.size(), nullptr, 0)) {
+                        GGML_LOG_INFO("failed to send all_reduce command to %s\n", sock_weak.first.c_str());
                     }
                 }
             }
@@ -5055,15 +5142,19 @@ static void rpc_serve_client(rpc_server & server, sockfd_t sockfd, size_t free_m
                 }
             case RPC_CMD_ALL_REDUCE:
                 {
-                    // Fire-and-forget: the peer sent this with send_rpc_cmd_oneway and is NOT
-                    // waiting for a reply, so do NOT send one (an unread ack would pile up in
-                    // the peer's recv buffer). The partial is buffered by seq; a lost peer is
-                    // caught by the receiver's all-reduce timeout, not by an ack here.
+                    // Optimized: fire-and-forget -- the peer used send_rpc_cmd_oneway and is NOT
+                    // waiting for a reply, so don't send one (an unread ack would pile up in the
+                    // peer's recv buffer). Baseline (RPC_NO_OPT): the peer used the acked
+                    // send_rpc_cmd, so we MUST reply. Both sides read the same gate, so they
+                    // agree -- the env var must be set consistently across all rpc-servers.
                     std::vector<uint8_t> input;
                     if (!recv_msg(sockfd, input)) {
                         return;
                     }
                     if (!server.all_reduce(input)) {
+                        return;
+                    }
+                    if (!rpc_opt_enabled() && !send_msg(sockfd, nullptr, 0)) {
                         return;
                     }
                     break;
