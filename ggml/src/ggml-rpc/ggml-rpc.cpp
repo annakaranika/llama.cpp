@@ -661,7 +661,8 @@ static void * rpc_get_base_cached(ggml_backend_rpc_buffer_context * ctx) {
     GGML_ASSERT(status);
     p = reinterpret_cast<void *>(response.base_ptr);
     ctx->base_ptr.store(p, std::memory_order_release);
-    if (getenv("RPC_DBG_GETBASE")) {
+    static const bool dbg_getbase = getenv("RPC_DBG_GETBASE") != nullptr;
+    if (dbg_getbase) {
         GGML_LOG_INFO("[GETBASE] ctx=%p remote_ptr=0x%llx -> base=%p (fd=%d)\n", (void *) ctx,
                       (unsigned long long) ctx->remote_ptr, p, ctx->sock ? ctx->sock->fd : -1);
     }
@@ -3241,17 +3242,26 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                         // same topology => same count/order; guard defensively against drift
                         size_t n = std::min(tensors.size(), prev.size());
 
-                        // (#5) data-only trim (RPC_DIFF_DATA_TRIM, off by default): ~86% of patches
-                        // change ONLY an intermediate's data pointer (allocator churn). The server's
-                        // stored data for a plain intermediate is its buffer base (allocated once,
-                        // same address every token), so a data-only change is a no-op there and can
-                        // be skipped. KEEP (never skip) anything whose server-side data must track the
-                        // client: views, view-sources, the segment output node, and result_output.
-                        // WARNING: EXPERIMENTAL + UNSAFE. Localhost N=4 shows it corrupts decode
+                        // A patch carries a tensor whose server-applied value-fields changed (NOT
+                        // the pointer wiring id/src/view_src/buffer/name, which always differ).
+                        // data_only_out (optional) reports a pure data-pointer change.
+                        auto changed_fields = [](const rpc_tensor & a, const rpc_tensor & b, bool * data_only_out) {
+                            bool data_changed  = a.data != b.data;
+                            bool other_changed = a.view_offs != b.view_offs || a.flags != b.flags ||
+                                                 memcmp(a.ne, b.ne, sizeof(a.ne)) != 0 ||
+                                                 memcmp(a.nb, b.nb, sizeof(a.nb)) != 0 ||
+                                                 memcmp(a.op_params, b.op_params, sizeof(a.op_params)) != 0;
+                            if (data_only_out) { *data_only_out = data_changed && !other_changed; }
+                            return data_changed || other_changed;
+                        };
+
+                        // (#5) data-only trim and (#3 Phase-0) patch classification are both opt-in.
+                        // When both are off (the default) take the fast path -- no helper containers,
+                        // no per-tensor gate checks, just the plain diff.
+                        // (#5) WARNING: EXPERIMENTAL + UNSAFE. Localhost N=4 shows it corrupts decode
                         // ("Athensensens..."): ggml-alloc REUSES buffer slots, so suppressing a
                         // data-only change leaves the server's pointer stale and a later tensor
-                        // aliases that slot. Making it safe needs global slot-liveness analysis
-                        // (which tensors other segments still read). Kept off; do NOT enable.
+                        // aliases that slot. Needs global slot-liveness analysis. Do NOT enable.
                         static const bool data_trim = []() {
                             const bool on = rpc_opt_enabled() && getenv("RPC_DIFF_DATA_TRIM") != nullptr;
                             if (on) {
@@ -3260,39 +3270,62 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                             }
                             return on;
                         }();
-                        std::unordered_set<uint64_t> viewsrc_ids;
-                        uint64_t                     out_id = 0;
-                        if (data_trim) {
-                            for (const auto & t : tensors) {
-                                if (t.view_src) {
-                                    viewsrc_ids.insert(t.view_src);
+                        static const bool dbg_patch = getenv("RPC_DBG_PATCH") != nullptr;
+
+                        if (!data_trim && !dbg_patch) {
+                            for (size_t i = 0; i < n; i++) {
+                                if (changed_fields(tensors[i], prev[i], nullptr)) {
+                                    rpc_view_patch p;
+                                    p.idx = (uint32_t) i;
+                                    p.t   = tensors[i];
+                                    patches.push_back(p);
                                 }
                             }
-                            out_id = reinterpret_cast<uint64_t>(cgraph->nodes[high]);
-                        }
-                        for (size_t i = 0; i < n; i++) {
-                            const rpc_tensor & a = tensors[i];
-                            const rpc_tensor & b = prev[i];
-                            // compare only the value-fields the server re-applies (NOT the
-                            // pointer wiring id/src/view_src/buffer/name, which always differ)
-                            bool data_changed  = a.data != b.data;
-                            bool other_changed = a.view_offs != b.view_offs || a.flags != b.flags ||
-                                                 memcmp(a.ne, b.ne, sizeof(a.ne)) != 0 ||
-                                                 memcmp(a.nb, b.nb, sizeof(a.nb)) != 0 ||
-                                                 memcmp(a.op_params, b.op_params, sizeof(a.op_params)) != 0;
-                            bool changed = data_changed || other_changed;
-                            if (changed && data_trim && data_changed && !other_changed) {
-                                bool keep = a.view_src != 0 || viewsrc_ids.count(a.id) != 0 ||
-                                            a.id == out_id || strncmp(a.name, "result", 6) == 0;
-                                if (!keep) {
-                                    changed = false;  // data-only churn on a plain intermediate: skip
+                        } else {
+                            // instrumented / experimental path (helpers built only here)
+                            std::unordered_set<uint64_t> viewsrc_ids;  // (#5) keep-set: view-sources
+                            uint64_t                     out_id = 0;
+                            if (data_trim) {
+                                for (const auto & t : tensors) {
+                                    if (t.view_src) { viewsrc_ids.insert(t.view_src); }
+                                }
+                                out_id = reinterpret_cast<uint64_t>(cgraph->nodes[high]);
+                            }
+                            int         c_pos_only = 0, c_data_only = 0, c_mixed = 0;
+                            std::string data_sample;
+                            for (size_t i = 0; i < n; i++) {
+                                const rpc_tensor & a = tensors[i];
+                                const rpc_tensor & b = prev[i];
+                                bool               data_only = false;
+                                bool               changed   = changed_fields(a, b, &data_only);
+                                if (dbg_patch && changed) {
+                                    const bool dc = a.data != b.data;
+                                    if (data_only)  { c_data_only++; }
+                                    else if (dc)    { c_mixed++; }
+                                    else            { c_pos_only++; }
+                                    if (dc && (int) data_sample.size() < 240) {
+                                        char buf[96];
+                                        snprintf(buf, sizeof(buf), "[%zu]%s 0x%llx->0x%llx ", i, a.name,
+                                                 (unsigned long long) b.data, (unsigned long long) a.data);
+                                        data_sample += buf;
+                                    }
+                                }
+                                if (changed && data_trim && data_only) {  // (#5) skip plain-intermediate churn
+                                    bool keep = a.view_src != 0 || viewsrc_ids.count(a.id) != 0 ||
+                                                a.id == out_id || strncmp(a.name, "result", 6) == 0;
+                                    if (!keep) { changed = false; }
+                                }
+                                if (changed) {
+                                    rpc_view_patch p;
+                                    p.idx = (uint32_t) i;
+                                    p.t   = a;
+                                    patches.push_back(p);
                                 }
                             }
-                            if (changed) {
-                                rpc_view_patch p;
-                                p.idx = (uint32_t) i;
-                                p.t   = a;
-                                patches.push_back(p);
+                            if (dbg_patch && id == 0) {
+                                GGML_LOG_INFO("[PATCH] gnum=%u seg=%zu n=%zu pos_only=%d data_only=%d mixed=%d | %s\n",
+                                              this_graph_number, s, patches.size(), c_pos_only, c_data_only,
+                                              c_mixed, data_sample.c_str());
                             }
                         }
                         total_patches += (int) patches.size();

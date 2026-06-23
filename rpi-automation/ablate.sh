@@ -71,12 +71,16 @@ run_profile() { # $1 = name, $2 = env string ; echoes "prefill_tps|decode_tps|ou
     local best_dec="" best_pre="" out=""
     for ((r=1; r<=REPEAT; r++)); do
         restart_servers "$env_str" || { echo "ERR|ERR|server-restart-failed"; return; }
-        local err; err="$($SSH "$COORD" "cd ~/llama.cpp && env $env_str $CLI_BIN -m $MODEL --rpc $RPC_CSV \
-            -ngl 23 -sm row -ts 1,1,1,1 -no-cnv -p '$PROMPT' -n $N --temp 0 2>&1 >/tmp/abl_out.txt; cat /tmp/abl_out.txt" 2>/dev/null)"
+        # stdout (generation) -> abl_out.txt ; stderr (perf+debug) -> abl_err.txt. Pull the two
+        # perf lines and the clean generation back separated by a marker so debug noise can't leak.
+        local cap; cap="$($SSH "$COORD" "cd ~/llama.cpp && env $env_str $CLI_BIN -m $MODEL --rpc $RPC_CSV \
+            -ngl 23 -sm row -ts 1,1,1,1 -no-cnv -p '$PROMPT' -n $N --temp 0 2>/tmp/abl_err.txt >/tmp/abl_out.txt; \
+            grep -E 'prompt eval time|:[[:space:]]*eval time' /tmp/abl_err.txt; echo '##OUT##'; tr '\n' ' ' </tmp/abl_out.txt" 2>/dev/null)"
+        local perf="${cap%%##OUT##*}" gen="${cap#*##OUT##}"
         local pre dec
-        pre="$(printf '%s\n' "$err" | awk -F'[(,]' '/prompt eval time/{for(i=1;i<=NF;i++) if($i~/tokens per second/){gsub(/[^0-9.]/,"",$i); print $i}}' | head -1)"
-        dec="$(printf '%s\n' "$err" | awk -F'[(,]' '/eval time/ && !/prompt/{for(i=1;i<=NF;i++) if($i~/tokens per second/){gsub(/[^0-9.]/,"",$i); print $i}}' | head -1)"
-        out="$(printf '%s\n' "$err" | grep -v 'llama_\|ggml_\|main:\|build:\|system_info\|sampler\|perf\|load_\|print_info\|warning\|^$' | tr '\n' ' ' | sed 's/  */ /g' | cut -c1-70)"
+        pre="$(printf '%s\n' "$perf" | awk -F'[(,]' '/prompt eval time/{for(i=1;i<=NF;i++) if($i~/tokens per second/){gsub(/[^0-9.]/,"",$i); print $i}}' | head -1)"
+        dec="$(printf '%s\n' "$perf" | awk -F'[(,]' '/eval time/ && !/prompt/{for(i=1;i<=NF;i++) if($i~/tokens per second/){gsub(/[^0-9.]/,"",$i); print $i}}' | head -1)"
+        out="$(printf '%s' "$gen" | sed 's/^ *//; s/  */ /g' | cut -c1-66)"
         # keep the best (highest) decode t/s across repeats
         if [ -n "$dec" ] && { [ -z "$best_dec" ] || awk "BEGIN{exit !($dec>$best_dec)}"; }; then best_dec="$dec"; best_pre="$pre"; fi
     done
