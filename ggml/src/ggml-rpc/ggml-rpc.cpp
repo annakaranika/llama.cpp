@@ -64,6 +64,13 @@ inline static void ggml_vec_add_f32(const int n, float * z, const float * x, con
 // cross-platform socket
 struct socket_t {
     sockfd_t fd;
+    // Serializes a whole request/response (or a one-way send) on this socket. send_rpc_cmd
+    // does 3 sends + 2 recvs on one fd and is NOT atomic, so two threads issuing RPCs on the
+    // SAME socket (e.g. the first forward's threaded graph-send calling BUFFER_GET_BASE while
+    // the threaded weight-upload tail still runs SET_TENSOR) interleave their bytes and one
+    // call reads ANOTHER call's response -> a buffer caches the WRONG base -> the intermittent
+    // warmup deserialize OOB. This is a socket byte-stream race (syscalls), invisible to TSan.
+    std::mutex io_mtx;
 
     socket_t(sockfd_t fd) : fd(fd) {}
 
@@ -124,6 +131,7 @@ enum rpc_cmd {
     RPC_CMD_SET_TENSOR_CACHE,   // set_tensor that ALSO persists the slice to the on-disk weight cache
     RPC_CMD_GRAPH_COMPUTE_BATCH, // all of a token's segment-graphs in ONE round-trip (vs one RPC per segment)
     RPC_CMD_PATCH_VIEWS,         // diff cache: patch only the per-token-changed tensors of an already-stored graph
+    RPC_CMD_AR_RESULT,           // tree all-reduce: root -> non-roots, the final folded result (seq|name|f32 data)
     RPC_CMD_COUNT,
 };
 
@@ -281,7 +289,9 @@ struct ggml_backend_rpc_context {
 
 struct ggml_backend_rpc_buffer_context {
     std::shared_ptr<socket_t> sock;
-    void *                    base_ptr;
+    // atomic so the lock-free fast path in get_base (read) doesn't data-race the cache store
+    // (which happens under g_get_base_mutex). acquire/release pair the read with that store.
+    std::atomic<void *>       base_ptr;
     uint64_t                  remote_ptr;
 };
 
@@ -510,6 +520,9 @@ static bool send_rpc_cmd(const std::shared_ptr<socket_t> & sock, enum rpc_cmd cm
         GGML_LOG_INFO("[send_rpc_cmd] NULL socket for cmd %d\n", (int) cmd);
         return false;
     }
+    // hold the socket for the WHOLE exchange so a concurrent RPC on the same fd can't
+    // interleave its bytes and cross responses (see socket_t::io_mtx).
+    std::lock_guard<std::mutex> io_lock(sock->io_mtx);
     uint8_t cmd_byte = cmd;
     if (!send_data(sock->fd, &cmd_byte, sizeof(cmd_byte))) {
         GGML_LOG_INFO("Failed to send command byte %d\n", cmd_byte);
@@ -565,6 +578,8 @@ static bool send_rpc_cmd_oneway(const std::shared_ptr<socket_t> & sock, enum rpc
     if (input_size > 0) {
         memcpy(framed.data() + sizeof(cmd_byte) + sizeof(input_size), input, input_size);
     }
+    // one framed write, but still serialize vs other senders on this fd (see socket_t::io_mtx)
+    std::lock_guard<std::mutex> io_lock(sock->io_mtx);
     return send_data(sock->fd, framed.data(), framed.size());
 }
 
@@ -617,31 +632,48 @@ static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     delete ctx;
 }
 
-static void * ggml_backend_rpc_buffer_get_base(ggml_backend_buffer_t buffer) {
-    ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *) buffer->context;
-    if (ctx->base_ptr != nullptr) {
-        return ctx->base_ptr;
+// BUFFER_GET_BASE is a lazy, cached RPC. The threaded buffer-alloc/upload loops call these
+// concurrently, and ctx's for one device share a socket; without serialization two in-flight
+// BUFFER_GET_BASE on the same socket interleave their responses and one ctx caches ANOTHER
+// buffer's base -> later a tensor's data points into the wrong buffer -> the intermittent
+// deserialize OOB (GGML_ASSERT(tensor->data >= buffer_start)) at warmup. Serialize the fetch
+// (double-checked, so the cached fast path stays lock-free).
+static std::mutex g_get_base_mutex;
+
+// Fetch + cache the buffer base once, under g_get_base_mutex so concurrent first-calls from
+// the threaded alloc/upload loops can't interleave BUFFER_GET_BASE responses on a shared
+// socket (which cached the WRONG buffer's base -> the intermittent deserialize OOB at warmup).
+// The fast path is a lock-free atomic acquire-load that pairs with the release-store below.
+static void * rpc_get_base_cached(ggml_backend_rpc_buffer_context * ctx) {
+    void * p = ctx->base_ptr.load(std::memory_order_acquire);
+    if (p != nullptr) {
+        return p;
+    }
+    std::lock_guard<std::mutex> lock(g_get_base_mutex);
+    p = ctx->base_ptr.load(std::memory_order_acquire);
+    if (p != nullptr) {
+        return p;
     }
     rpc_msg_buffer_get_base_req request = { ctx->remote_ptr };
     rpc_msg_buffer_get_base_rsp response;
     bool                        status =
         send_rpc_cmd(ctx->sock, RPC_CMD_BUFFER_GET_BASE, &request, sizeof(request), &response, sizeof(response));
     GGML_ASSERT(status);
-    ctx->base_ptr = reinterpret_cast<void *>(response.base_ptr);
-    return ctx->base_ptr;
+    p = reinterpret_cast<void *>(response.base_ptr);
+    ctx->base_ptr.store(p, std::memory_order_release);
+    if (getenv("RPC_DBG_GETBASE")) {
+        GGML_LOG_INFO("[GETBASE] ctx=%p remote_ptr=0x%llx -> base=%p (fd=%d)\n", (void *) ctx,
+                      (unsigned long long) ctx->remote_ptr, p, ctx->sock ? ctx->sock->fd : -1);
+    }
+    return p;
+}
+
+static void * ggml_backend_rpc_buffer_get_base(ggml_backend_buffer_t buffer) {
+    return rpc_get_base_cached((ggml_backend_rpc_buffer_context *) buffer->context);
 }
 
 static void * ggml_backend_rpc_buffer_context_get_base(ggml_backend_rpc_buffer_context * ctx) {
-    if (ctx->base_ptr != nullptr) {
-        return ctx->base_ptr;
-    }
-    rpc_msg_buffer_get_base_req request = { ctx->remote_ptr };
-    rpc_msg_buffer_get_base_rsp response;
-    bool                        status =
-        send_rpc_cmd(ctx->sock, RPC_CMD_BUFFER_GET_BASE, &request, sizeof(request), &response, sizeof(response));
-    GGML_ASSERT(status);
-    ctx->base_ptr = reinterpret_cast<void *>(response.base_ptr);
-    return ctx->base_ptr;
+    return rpc_get_base_cached(ctx);
 }
 
 static rpc_tensor serialize_tensor(const ggml_tensor * tensor) {
@@ -787,6 +819,67 @@ static bool rpc_ar_fp16() {
     return on;
 }
 
+// (#6) all-reduce partial wire format (opt-in, RPC_AR_PARTIAL=fp16|int8|f32), generalizing the
+// fp16 path: ship each f32 partial narrowed (f16 = half the bytes, int8 = a quarter + a per-
+// partial scale), convert back to f32 on receive so the fold stays f32 + id-ordered
+// (deterministic). NOT bit-identical to the f32 path (each partial is rounded/quantized) -- a
+// quality/throughput tradeoff, off by default, must be set consistently on every node. int8
+// uses symmetric per-partial scaling (scale = maxabs/127), shipped as: scale(f32) | int8[n].
+enum class rpc_ar_fmt { f32, f16, i8 };
+static rpc_ar_fmt rpc_ar_partial() {
+    static const rpc_ar_fmt fmt = []() -> rpc_ar_fmt {
+        if (!rpc_opt_enabled()) {
+            return rpc_ar_fmt::f32;
+        }
+        if (const char * p = getenv("RPC_AR_PARTIAL")) {
+            if (strcmp(p, "int8") == 0 || strcmp(p, "i8") == 0) { return rpc_ar_fmt::i8; }
+            if (strcmp(p, "fp16") == 0 || strcmp(p, "f16") == 0) { return rpc_ar_fmt::f16; }
+            if (strcmp(p, "f32") == 0 || strcmp(p, "none") == 0) { return rpc_ar_fmt::f32; }
+        }
+        return getenv("RPC_AR_FP16") != nullptr ? rpc_ar_fmt::f16 : rpc_ar_fmt::f32;  // back-compat
+    }();
+    return fmt;
+}
+// symmetric per-partial int8: returns the scale; q[i] = clamp(round(x[i]/scale), -127, 127)
+static float rpc_i8_quantize(const float * x, int8_t * q, int64_t n) {
+    float maxabs = 0.0f;
+    for (int64_t i = 0; i < n; i++) {
+        maxabs = std::max(maxabs, std::fabs(x[i]));
+    }
+    const float scale = maxabs > 0.0f ? maxabs / 127.0f : 1.0f;
+    const float inv   = 1.0f / scale;
+    for (int64_t i = 0; i < n; i++) {
+        int v = (int) lrintf(x[i] * inv);
+        q[i]  = (int8_t) std::max(-127, std::min(127, v));
+    }
+    return scale;
+}
+static void rpc_i8_dequantize(const int8_t * q, float scale, float * x, int64_t n) {
+    for (int64_t i = 0; i < n; i++) {
+        x[i] = (float) q[i] * scale;
+    }
+}
+// bytes a narrowed f32 partial of n elements occupies on the wire (f16: 2n; int8: 4 + n)
+static size_t rpc_ar_payload_bytes(rpc_ar_fmt fmt, int64_t nelem, size_t nbytes_f32) {
+    switch (fmt) {
+        case rpc_ar_fmt::f16: return (size_t) nelem * sizeof(ggml_fp16_t);
+        case rpc_ar_fmt::i8:  return sizeof(float) + (size_t) nelem * sizeof(int8_t);
+        default:              return nbytes_f32;
+    }
+}
+
+// TREE all-reduce (opt-in, RPC_AR_TREE): instead of all-to-all (every server broadcasts its
+// partial to all peers => N(N-1) transmissions/reduce), non-root servers send their partial
+// to ROOT (device 0) only; root folds all N in ascending-device-id order (REUSES the slot
+// fold, so the result is bit-identical to all-to-all) then broadcasts the single f32 result
+// to the N-1 non-roots => 2(N-1) transmissions, halving shared-medium airtime/contention.
+// Result is broadcast as f32 (exact) even under fp16 partials, so every server ends with the
+// root's identical result. Must be set consistently on all rpc-servers.
+static bool rpc_ar_tree() {
+    static const bool on = rpc_opt_enabled() && (getenv("RPC_AR_TREE") != nullptr);
+    return on;
+}
+
 static void ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
     ggml_backend_rpc_buffer_context *      ctx      = (ggml_backend_rpc_buffer_context *) buffer->context;
     ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *) buffer->buft->context;
@@ -925,7 +1018,9 @@ static void ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_t buffer, gg
                 if (extra->buffer_ctx[id] == nullptr) {
                     GGML_LOG_INFO("[%s] buffer context for device %d is null\n", __func__, id);
                 } else {
-                    if (request.tensor.buffer != extra->buffer_ctx[id]->remote_ptr) {
+                    // home device by ctx-object identity, not remote_ptr value (alias-safe)
+                    const void * home_ctx = tensor->buffer ? tensor->buffer->context : nullptr;
+                    if (home_ctx != static_cast<const void *>(extra->buffer_ctx[id])) {
                         request.tensor.buffer = extra->buffer_ctx[id]->remote_ptr;
                         // GGML_LOG_INFO("init\n");
                         request.tensor.data   = reinterpret_cast<uint64_t>(ggml_backend_rpc_buffer_context_get_base(
@@ -1145,10 +1240,18 @@ static ggml_backend_buffer_i ggml_backend_rpc_buffer_interface = {
 // grid so the producer's and consumer's slices agree. K-quants = 256, legacy
 // Q4_0/Q8_0 = 32, F16/F32 = 1. Starts at 1, raised as split weights are seen, so
 // it is correct by the time the first forward runs.
-static int64_t g_rpc_split_block = 1;
+// atomic: the threaded split-buffer alloc workers raise this concurrently (rpc_note_split_block
+// from rpc_get_{row,col}_split), and the graph-send build threads read it -- a plain int64
+// read-modify-write races and can LOSE a max update -> too-small split block -> wrong split
+// boundaries -> garbage/OOB. (Found by ThreadSanitizer.)
+static std::atomic<int64_t> g_rpc_split_block{ 1 };
 
 static inline void rpc_note_split_block(const ggml_tensor * tensor) {
-    g_rpc_split_block = std::max<int64_t>(g_rpc_split_block, ggml_blck_size(tensor->type));
+    const int64_t blk = ggml_blck_size(tensor->type);
+    int64_t       cur = g_rpc_split_block.load(std::memory_order_relaxed);
+    while (blk > cur && !g_rpc_split_block.compare_exchange_weak(cur, blk, std::memory_order_relaxed)) {
+        // cur reloaded by compare_exchange_weak on failure; retry until blk <= cur or we win
+    }
 }
 
 // Canonical per-device split boundary: device `id` gets [*low, *high) of `total`,
@@ -2147,10 +2250,11 @@ static int change_ne_and_nb(ggml_tensor * tensor, rpc_tensor & rpc_t, std::map<g
                     // Guard: only when each device gets >= one block (small/per-head
                     // views keep the fine-grained float split).
                     {
-                        const int64_t devs = ggml_backend_rpc_get_device_count();
-                        const int64_t full = src_tensor.ne[0];
-                        if (devs > 0 && full / devs >= g_rpc_split_block) {
-                            const int64_t align = std::max(rpc_get_col_rounding(tensor_splits), g_rpc_split_block);
+                        const int64_t devs  = ggml_backend_rpc_get_device_count();
+                        const int64_t full  = src_tensor.ne[0];
+                        const int64_t sblk  = g_rpc_split_block.load(std::memory_order_relaxed);
+                        if (devs > 0 && full / devs >= sblk) {
+                            const int64_t align = std::max(rpc_get_col_rounding(tensor_splits), sblk);
                             src_tensor.ne[0]    = rpc_split_count(full, align, tensor_splits, id);
                         } else {
                             src_tensor.ne[0] = split_part * full;
@@ -2317,7 +2421,9 @@ static void add_tensor_part(ggml_tensor * tensor, std::vector<rpc_tensor> & tens
                 if (src_extra->buffer_ctx[id] == nullptr) {
                     GGML_LOG_INFO("[%s] buffer context for device %d is null\n", __func__, id);
                 } else {
-                    if (src_extra->buffer_ctx[id]->remote_ptr != src_tensor.buffer) {
+                    // home device by ctx-object identity, not remote_ptr value (see add_tensor_part main branch)
+                    const void * src_home_ctx = src->buffer ? src->buffer->context : nullptr;
+                    if (src_home_ctx != static_cast<const void *>(src_extra->buffer_ctx[id])) {
                         src_tensor.buffer = src_extra->buffer_ctx[id]->remote_ptr;
                         src_tensor.data   = reinterpret_cast<uint64_t>(ggml_backend_rpc_buffer_context_get_base(
                             reinterpret_cast<ggml_backend_rpc_buffer_context *>(src_extra->buffer_ctx[id])));
@@ -2352,7 +2458,9 @@ static void add_tensor_part(ggml_tensor * tensor, std::vector<rpc_tensor> & tens
                     if (src_view_src_extra->buffer_ctx[id] == nullptr) {
                         GGML_LOG_INFO("[%s] buffer context for device %d is null\n", __func__, id);
                     } else {
-                        if (src_view_tensor.buffer != src_view_src_extra->buffer_ctx[id]->remote_ptr) {
+                        // home device by ctx-object identity, not remote_ptr value (alias-safe)
+                        const void * svs_home_ctx = src->view_src->buffer ? src->view_src->buffer->context : nullptr;
+                        if (svs_home_ctx != static_cast<const void *>(src_view_src_extra->buffer_ctx[id])) {
                             src_view_tensor.buffer = src_view_src_extra->buffer_ctx[id]->remote_ptr;
                             src_view_tensor.data = reinterpret_cast<uint64_t>(ggml_backend_rpc_buffer_context_get_base(
                                 reinterpret_cast<ggml_backend_rpc_buffer_context *>(
@@ -2377,7 +2485,16 @@ static void add_tensor_part(ggml_tensor * tensor, std::vector<rpc_tensor> & tens
     if (tensor_extra->buffer_ctx[id] == nullptr) {
         GGML_LOG_INFO("[%s] buffer context for device %d is null\n", __func__, id);
     } else {
-        if (rpc_t.buffer != tensor_extra->buffer_ctx[id]->remote_ptr) {
+        // Identify the "home" device (the buffer serialize_tensor read) by buffer-context OBJECT
+        // IDENTITY, not remote_ptr VALUE. The servers are identical Pis whose allocators hand back
+        // identical addresses, so remote_ptr collides across devices; a value compare misclassifies
+        // a non-home device as home -> it skips the remap and ships a pointer still anchored to the
+        // OTHER device's base -> the intermittent warmup deserialize OOB (data << buffer_start).
+        // Object identity is unambiguous even under aliasing. For a split buffer tensor->buffer->context
+        // is a different type/object than any buffer_ctx[id], so nothing matches and every device takes
+        // the full remap below -- which is provably the same pointer the home branch would compute.
+        const void * home_ctx = tensor->buffer ? tensor->buffer->context : nullptr;
+        if (home_ctx != static_cast<const void *>(tensor_extra->buffer_ctx[id])) {
             rpc_t.buffer = tensor_extra->buffer_ctx[id]->remote_ptr;
             rpc_t.data   = reinterpret_cast<uint64_t>(ggml_backend_rpc_buffer_context_get_base(
                 reinterpret_cast<ggml_backend_rpc_buffer_context *>(tensor_extra->buffer_ctx[id])));
@@ -2403,6 +2520,15 @@ static void add_tensor_part(ggml_tensor * tensor, std::vector<rpc_tensor> & tens
                 rpc_t.view_offs = tensor->view_offs * split_part;
             }
         }
+        static const bool dbg_getbase = getenv("RPC_DBG_GETBASE") != nullptr;
+        if (dbg_getbase && (tensor->name[0] == 'k' || tensor->name[0] == 'v')) {
+            ggml_backend_rpc_buffer_context * bc =
+                reinterpret_cast<ggml_backend_rpc_buffer_context *>(tensor_extra->buffer_ctx[id]);
+            GGML_LOG_INFO("[KVVIEW] id=%d name=%s op=%d ctx=%p remote_ptr=0x%llx base=%p data=0x%llx voff=%llu\n",
+                          id, tensor->name, (int) tensor->op, (void *) bc,
+                          (unsigned long long) bc->remote_ptr, bc->base_ptr.load(std::memory_order_relaxed),
+                          (unsigned long long) rpc_t.data, (unsigned long long) rpc_t.view_offs);
+        }
     }
 
     int checksrc = change_ne_and_nb(tensor, rpc_t, visited, id);
@@ -2419,7 +2545,9 @@ static void add_tensor_part(ggml_tensor * tensor, std::vector<rpc_tensor> & tens
         if (view_src_extra->buffer_ctx[id] == nullptr) {
             GGML_LOG_INFO("[%s] buffer context for device %d is null\n", __func__, id);
         } else {
-            if (view_tensor.buffer != view_src_extra->buffer_ctx[id]->remote_ptr) {
+            // home device by ctx-object identity, not remote_ptr value (alias-safe)
+            const void * vs_home_ctx = tensor->view_src->buffer ? tensor->view_src->buffer->context : nullptr;
+            if (vs_home_ctx != static_cast<const void *>(view_src_extra->buffer_ctx[id])) {
                 view_tensor.buffer = view_src_extra->buffer_ctx[id]->remote_ptr;
                 view_tensor.data   = reinterpret_cast<uint64_t>(ggml_backend_rpc_buffer_context_get_base(
                     reinterpret_cast<ggml_backend_rpc_buffer_context *>(view_src_extra->buffer_ctx[id])));
@@ -2580,7 +2708,9 @@ static void add_data_to_data(std::vector<uint8_t> & data, ggml_tensor * tensor, 
         size_t                 split_size = ggml_nbytes_split_col(tensor, ncols_split);
         rpc_msg_get_tensor_req request;
         request.tensor = serialize_tensor(tensor);
-        if (request.tensor.buffer != extra->buffer_ctx[id]->remote_ptr) {
+        // home device by ctx-object identity, not remote_ptr value (alias-safe)
+        const void * home_ctx = tensor->buffer ? tensor->buffer->context : nullptr;
+        if (home_ctx != static_cast<const void *>(extra->buffer_ctx[id])) {
             request.tensor.buffer = extra->buffer_ctx[id]->remote_ptr;
             request.tensor.data   = reinterpret_cast<uint64_t>(ggml_backend_rpc_buffer_context_get_base(
                 reinterpret_cast<ggml_backend_rpc_buffer_context *>(extra->buffer_ctx[id])));
@@ -3110,16 +3240,54 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                         std::vector<rpc_view_patch> patches;
                         // same topology => same count/order; guard defensively against drift
                         size_t n = std::min(tensors.size(), prev.size());
+
+                        // (#5) data-only trim (RPC_DIFF_DATA_TRIM, off by default): ~86% of patches
+                        // change ONLY an intermediate's data pointer (allocator churn). The server's
+                        // stored data for a plain intermediate is its buffer base (allocated once,
+                        // same address every token), so a data-only change is a no-op there and can
+                        // be skipped. KEEP (never skip) anything whose server-side data must track the
+                        // client: views, view-sources, the segment output node, and result_output.
+                        // WARNING: EXPERIMENTAL + UNSAFE. Localhost N=4 shows it corrupts decode
+                        // ("Athensensens..."): ggml-alloc REUSES buffer slots, so suppressing a
+                        // data-only change leaves the server's pointer stale and a later tensor
+                        // aliases that slot. Making it safe needs global slot-liveness analysis
+                        // (which tensors other segments still read). Kept off; do NOT enable.
+                        static const bool data_trim = []() {
+                            const bool on = rpc_opt_enabled() && getenv("RPC_DIFF_DATA_TRIM") != nullptr;
+                            if (on) {
+                                GGML_LOG_INFO("[RPC_DIFF_DATA_TRIM] WARNING: experimental + UNSAFE "
+                                              "(corrupts decode via ggml-alloc slot reuse)\n");
+                            }
+                            return on;
+                        }();
+                        std::unordered_set<uint64_t> viewsrc_ids;
+                        uint64_t                     out_id = 0;
+                        if (data_trim) {
+                            for (const auto & t : tensors) {
+                                if (t.view_src) {
+                                    viewsrc_ids.insert(t.view_src);
+                                }
+                            }
+                            out_id = reinterpret_cast<uint64_t>(cgraph->nodes[high]);
+                        }
                         for (size_t i = 0; i < n; i++) {
                             const rpc_tensor & a = tensors[i];
                             const rpc_tensor & b = prev[i];
                             // compare only the value-fields the server re-applies (NOT the
                             // pointer wiring id/src/view_src/buffer/name, which always differ)
-                            bool changed = a.data != b.data || a.view_offs != b.view_offs ||
-                                           a.flags != b.flags ||
-                                           memcmp(a.ne, b.ne, sizeof(a.ne)) != 0 ||
-                                           memcmp(a.nb, b.nb, sizeof(a.nb)) != 0 ||
-                                           memcmp(a.op_params, b.op_params, sizeof(a.op_params)) != 0;
+                            bool data_changed  = a.data != b.data;
+                            bool other_changed = a.view_offs != b.view_offs || a.flags != b.flags ||
+                                                 memcmp(a.ne, b.ne, sizeof(a.ne)) != 0 ||
+                                                 memcmp(a.nb, b.nb, sizeof(a.nb)) != 0 ||
+                                                 memcmp(a.op_params, b.op_params, sizeof(a.op_params)) != 0;
+                            bool changed = data_changed || other_changed;
+                            if (changed && data_trim && data_changed && !other_changed) {
+                                bool keep = a.view_src != 0 || viewsrc_ids.count(a.id) != 0 ||
+                                            a.id == out_id || strncmp(a.name, "result", 6) == 0;
+                                if (!keep) {
+                                    changed = false;  // data-only churn on a plain intermediate: skip
+                                }
+                            }
                             if (changed) {
                                 rpc_view_patch p;
                                 p.idx = (uint32_t) i;
@@ -3339,7 +3507,7 @@ class all_reduce_block {
                      uint32_t seq);
     ~all_reduce_block();
     bool block_init(ggml_tensor * tensor, int op, int device_count, ggml_backend_t backend, uint8_t device_id,
-                    uint32_t seq);
+                    uint32_t seq, bool await = false);
     bool add(std::vector<uint8_t> & input, uint8_t src_id);
 
     // Buffer a partial that arrived before we reached this all-reduce, keyed by its
@@ -3350,6 +3518,29 @@ class all_reduce_block {
     bool add_to_buffer(uint32_t seq, uint8_t src_id, const std::vector<uint8_t> & input) {
         std::lock_guard<std::mutex> lock(add_mutex);
         all_reduce_buffer[seq].push_back({ src_id, input });
+        return true;
+    }
+
+    // TREE all-reduce, NON-ROOT side. This server sent its partial to the root and now waits
+    // for the single folded result; set_result writes it into `tensor` and completes the wait.
+    // (No fold here -- the root already folded in ascending-id order, so this is bit-identical
+    // to all-to-all and the same f32 result on every server.) An early result (arrived before
+    // we block_init for this token) is buffered by seq and applied on init.
+    bool set_result(const std::vector<uint8_t> & result) {
+        std::lock_guard<std::mutex> lock(add_mutex);
+        ggml_backend_tensor_set(tensor, result.data(), 0, result.size());
+        {
+            std::lock_guard<std::mutex> wlock(wait_mutex);
+            is_completed = true;
+            initialized  = false;
+        }
+        cv.notify_all();
+        return true;
+    }
+
+    bool add_result_to_buffer(uint32_t seq, const std::vector<uint8_t> & result) {
+        std::lock_guard<std::mutex> lock(add_mutex);
+        result_buffer[seq] = result;
         return true;
     }
 
@@ -3374,13 +3565,21 @@ class all_reduce_block {
     // matches the f16-rounded copies the peers received -> the ordered fold is bit-identical
     // on every server. No-op unless RPC_AR_FP16 and the reduced tensor is f32.
     void ar_fp16_roundtrip_self() {
-        if (!rpc_ar_fp16() || tensor->type != GGML_TYPE_F32 || self_id < 0) {
+        const rpc_ar_fmt fmt = rpc_ar_partial();
+        if (fmt == rpc_ar_fmt::f32 || tensor->type != GGML_TYPE_F32 || self_id < 0) {
             return;
         }
-        int64_t                  n = (int64_t) (reduce_nbytes / sizeof(float));
-        std::vector<ggml_fp16_t> h(n);
-        ggml_fp32_to_fp16_row((const float *) slots[self_id].data(), h.data(), n);
-        ggml_fp16_to_fp32_row(h.data(), (float *) slots[self_id].data(), n);
+        int64_t n = (int64_t) (reduce_nbytes / sizeof(float));
+        float * x = (float *) slots[self_id].data();
+        if (fmt == rpc_ar_fmt::f16) {
+            std::vector<ggml_fp16_t> h(n);
+            ggml_fp32_to_fp16_row(x, h.data(), n);
+            ggml_fp16_to_fp32_row(h.data(), x, n);
+        } else {  // i8: quantize + dequantize so self matches the int8-rounded copies peers got
+            std::vector<int8_t> q(n);
+            const float         scale = rpc_i8_quantize(x, q.data(), n);
+            rpc_i8_dequantize(q.data(), scale, x, n);
+        }
     }
 
     bool                              initialized = false;    //whether the tensor to be reduced has been set
@@ -3404,6 +3603,10 @@ class all_reduce_block {
     size_t                            reduce_nbytes = 0;      //bytes per partial
     std::unordered_map<uint32_t, std::vector<std::pair<uint8_t, std::vector<uint8_t>>>>
                                       all_reduce_buffer;       //seq(token) -> (src_id, partial) that arrived before init
+    // TREE all-reduce non-root: await the root's result instead of folding. result_buffer holds
+    // a result that arrived before we reached this token's all-reduce (applied on block_init).
+    bool                              await_result = false;
+    std::unordered_map<uint32_t, std::vector<uint8_t>> result_buffer;  //seq -> root's result (early)
     uint32_t                          current_seq = 0;         //the sequence (token) this block is reducing now
     ggml_backend_t                    backend;                //backend type
     struct ggml_context *             ctx;
@@ -3495,7 +3698,7 @@ all_reduce_block::all_reduce_block(ggml_tensor * tensor, int op, int device_coun
 //when to be called:    when the server receiving all_reduce msg from other servers
 //note: only update pointer to tensor and create buffer for add if graph exists, else create the graph
 bool all_reduce_block::block_init(ggml_tensor * tensor, int op, int device_count, ggml_backend_t backend,
-                                  uint8_t device_id, uint32_t seq) {
+                                  uint8_t device_id, uint32_t seq, bool await) {
     // GGML_LOG_INFO("all_reduce_block init called\n");
     if (initialized) {
         return true;
@@ -3536,7 +3739,20 @@ bool all_reduce_block::block_init(ggml_tensor * tensor, int op, int device_count
     this->graph = graph;
 
     //set initialized flag
-    initialized = true;
+    initialized  = true;
+    await_result = await;
+
+    if (await) {
+        // TREE non-root: we sent our partial to the root and now just await its result. No
+        // self-capture / fold. Apply a result that arrived early (buffered by seq) if any.
+        auto rit = result_buffer.find(current_seq);
+        if (rit != result_buffer.end()) {
+            std::vector<uint8_t> r = std::move(rit->second);
+            result_buffer.erase(rit);
+            set_result(r);
+        }
+        return true;
+    }
 
     // OPTIMIZED: capture self's partial into its device-id slot (see ctor). BASELINE: skip --
     // `tensor` holds P_self and add() folds peers in arrival order. arrived starts at 1 (self).
@@ -3607,10 +3823,17 @@ bool all_reduce_block::add(std::vector<uint8_t> & input, uint8_t src_id) {
         if (slots[src_id].empty()) {
             arrived++;
         }
-        if (rpc_ar_fp16() && tensor->type == GGML_TYPE_F32) {
+        const rpc_ar_fmt fmt = rpc_ar_partial();
+        if (fmt != rpc_ar_fmt::f32 && tensor->type == GGML_TYPE_F32) {
             int64_t              n = (int64_t) (reduce_nbytes / sizeof(float));
             std::vector<uint8_t> f32(reduce_nbytes);
-            ggml_fp16_to_fp32_row((const ggml_fp16_t *) input.data(), (float *) f32.data(), n);
+            if (fmt == rpc_ar_fmt::f16) {  // arrived as f16 -- upcast to f32 into the slot
+                ggml_fp16_to_fp32_row((const ggml_fp16_t *) input.data(), (float *) f32.data(), n);
+            } else {  // i8: arrived as scale(f32) | int8[n] -- dequantize to f32
+                float scale;
+                memcpy(&scale, input.data(), sizeof(float));
+                rpc_i8_dequantize((const int8_t *) (input.data() + sizeof(float)), scale, (float *) f32.data(), n);
+            }
             slots[src_id] = std::move(f32);
         } else {
             slots[src_id] = input;
@@ -3741,6 +3964,7 @@ class rpc_server {
                                 rpc_msg_create_peer_connection_rsp &       response);
     void add_socket_listen(const std::shared_ptr<socket_t> & sock);
     bool all_reduce(std::vector<uint8_t> & input);
+    bool ar_result(std::vector<uint8_t> & input);  // tree all-reduce: non-root applies root's result
     bool do_computation(const rpc_msg_do_computation_req & request);
     bool patch_views(const std::vector<uint8_t> & input);
     bool load_cached(const rpc_msg_load_cached_req & request, rpc_msg_load_cached_rsp & response);
@@ -3763,6 +3987,7 @@ class rpc_server {
     // immediately and EVERY all-reduce re-dials its peers (a TCP handshake per
     // peer, per layer, per token) -- the dominant decode cost over WiFi.
     std::vector<std::shared_ptr<socket_t>>                   peer_socks_held;
+    std::vector<std::string>                                 peer_endpoints;     //device id -> endpoint (for tree all-reduce: find the root, device 0)
     std::vector<std::weak_ptr<socket_t>>                     sockets_listento;   //sockets that the server listen to
     std::mutex                                               sockets_mutex;      //mutex for adding sockets to the list
     uint8_t                                                  device_id;          //device id for current server
@@ -4652,7 +4877,7 @@ bool rpc_server::do_computation(const rpc_msg_do_computation_req & request) {
     // allocation -- every byte is overwritten before it's sent).
     std::vector<uint8_t> add_data;
     std::vector<float>   ar_fp32_tmp;  // reused f32 scratch for the fp16 partial conversion
-    const bool           ar_fp16 = rpc_ar_fp16();
+    const rpc_ar_fmt     ar_fmt_sel = rpc_ar_partial();
 
     graph_info * info = it->second->head;
     while (info) {
@@ -4689,9 +4914,9 @@ bool rpc_server::do_computation(const rpc_msg_do_computation_req & request) {
             const size_t  ar_hdr = sizeof(uint32_t) + sizeof(uint32_t) + sizeof(tensor_to_all_reduce->name);
             const size_t  nbytes = ggml_nbytes(tensor_to_all_reduce);
             const int64_t nelem  = ggml_nelements(tensor_to_all_reduce);
-            // fp16 only for f32 partials (the row-split outputs are f32); else ship raw bytes.
-            const bool    fp16   = ar_fp16 && tensor_to_all_reduce->type == GGML_TYPE_F32;
-            const size_t  payload = fp16 ? (size_t) nelem * sizeof(ggml_fp16_t) : nbytes;
+            // narrow only f32 partials (the row-split outputs are f32); else ship raw bytes.
+            const rpc_ar_fmt fmt = (tensor_to_all_reduce->type == GGML_TYPE_F32) ? ar_fmt_sel : rpc_ar_fmt::f32;
+            const size_t  payload = rpc_ar_payload_bytes(fmt, nelem, nbytes);
             add_data.resize(ar_hdr + payload);  // reused; every byte set below
             uint32_t src_id = device_id;
             uint32_t seq    = ++all_reduce_seq[tensor_name];  // Nth reduce of this name == token N
@@ -4699,10 +4924,16 @@ bool rpc_server::do_computation(const rpc_msg_do_computation_req & request) {
             memcpy(add_data.data() + sizeof(uint32_t), &src_id, sizeof(uint32_t));
             memcpy(add_data.data() + 2 * sizeof(uint32_t), tensor_to_all_reduce->name,
                    sizeof(tensor_to_all_reduce->name));
-            if (fp16) {
+            if (fmt == rpc_ar_fmt::f16) {
                 ar_fp32_tmp.resize((size_t) nelem);
                 ggml_backend_tensor_get(tensor_to_all_reduce, ar_fp32_tmp.data(), 0, nbytes);
                 ggml_fp32_to_fp16_row(ar_fp32_tmp.data(), (ggml_fp16_t *) (add_data.data() + ar_hdr), nelem);
+            } else if (fmt == rpc_ar_fmt::i8) {  // ship scale(f32) | int8[n]
+                ar_fp32_tmp.resize((size_t) nelem);
+                ggml_backend_tensor_get(tensor_to_all_reduce, ar_fp32_tmp.data(), 0, nbytes);
+                const float scale = rpc_i8_quantize(ar_fp32_tmp.data(),
+                                                    (int8_t *) (add_data.data() + ar_hdr + sizeof(float)), nelem);
+                memcpy(add_data.data() + ar_hdr, &scale, sizeof(float));
             } else {
                 ggml_backend_tensor_get(tensor_to_all_reduce, add_data.data() + ar_hdr, 0, nbytes);
             }
@@ -4711,25 +4942,75 @@ bool rpc_server::do_computation(const rpc_msg_do_computation_req & request) {
                 GGML_LOG_INFO("[ar-send] gnum=%d %s seq=%u\n", graph_number, tensor_name.c_str(), seq);
             }
 
-            //set up this server's own block for this token's reduce
+            // TREE all-reduce (opt-in): non-root servers (device_id != 0) send their partial to
+            // the root and AWAIT its folded result; the root receives + folds + broadcasts it.
+            const bool tree    = rpc_ar_tree();
+            const bool is_root = (device_id == 0);
+
+            //set up this server's own block for this token's reduce (default-ctor + block_init
+            //unifies create and re-init; a non-root in tree mode inits in await-result mode).
             block_mutex.lock();
-            auto bit = all_reduce_blocks.find(tensor_name);
-            if (bit != all_reduce_blocks.end()) {
-                bit->second->block_init(tensor_to_all_reduce, signal, device_count, backend, device_id, seq);
-            } else {
-                try {
-                    all_reduce_blocks[tensor_name] =
-                        new all_reduce_block(tensor_to_all_reduce, signal, device_count, backend, device_id, seq);
-                } catch (const std::exception & e) {
-                    GGML_LOG_INFO("[%s] error: %s\n", __func__, e.what());
-                }
+            auto               bit = all_reduce_blocks.find(tensor_name);
+            all_reduce_block * blk = (bit != all_reduce_blocks.end()) ? bit->second : nullptr;
+            if (!blk) {
+                blk                            = new all_reduce_block();
+                all_reduce_blocks[tensor_name] = blk;
             }
+            blk->block_init(tensor_to_all_reduce, signal, device_count, backend, device_id, seq, tree && !is_root);
             block_mutex.unlock();
 
-            // broadcast this partial to all peers.
-            if (opt) {
-                // OPTIMIZED: CONCURRENT + FIRE-AND-FORGET (one thread per peer, sockets resolved
-                // once above, no ack). threads only read add_data/peer_socks (alive until join).
+            if (tree && is_root) {
+                // ROOT: receive partials from non-roots (no broadcast here), fold, then send the
+                // single f32 result to the non-roots. Result is f32 (exact) even under fp16
+                // partials, so every non-root ends with the root's identical result.
+                if (!blk->wait_for_completion()) {
+                    GGML_LOG_ERROR("[%s] tree all-reduce TIMEOUT (root) for %s -- aborting graph\n", __func__,
+                                   tensor_name.c_str());
+                    return false;
+                }
+                const size_t         res_hdr = sizeof(uint32_t) + sizeof(tensor_to_all_reduce->name);
+                std::vector<uint8_t> res(res_hdr + nbytes);  // seq(4) | name | f32 result
+                memcpy(res.data(), &seq, sizeof(uint32_t));
+                memcpy(res.data() + sizeof(uint32_t), tensor_to_all_reduce->name, sizeof(tensor_to_all_reduce->name));
+                ggml_backend_tensor_get(tensor_to_all_reduce, res.data() + res_hdr, 0, nbytes);
+                std::vector<std::thread> bcast;
+                for (size_t k = 0; k < peer_socks.size(); ++k) {
+                    bcast.emplace_back([&, k]() {
+                        if (!send_rpc_cmd_oneway(peer_socks[k], RPC_CMD_AR_RESULT, res.data(), res.size())) {
+                            GGML_LOG_INFO("failed to send ar_result to %s\n", peer_names[k].c_str());
+                        }
+                    });
+                }
+                for (auto & t : bcast) {
+                    if (t.joinable()) {
+                        t.join();
+                    }
+                }
+            } else if (tree) {
+                // NON-ROOT: send our partial to the ROOT (device 0) only, then await its result.
+                std::shared_ptr<socket_t> root_sock;
+                if (!peer_endpoints.empty()) {
+                    auto rit = sockets_connectto.find(peer_endpoints[0]);
+                    if (rit != sockets_connectto.end()) {
+                        root_sock = rit->second.lock();
+                    }
+                }
+                if (!root_sock) {
+                    GGML_LOG_ERROR("[%s] tree all-reduce: no socket to root for %s -- aborting graph\n", __func__,
+                                   tensor_name.c_str());
+                    return false;
+                }
+                if (!send_rpc_cmd_oneway(root_sock, RPC_CMD_ALL_REDUCE, add_data.data(), add_data.size())) {
+                    GGML_LOG_INFO("failed to send partial to root for %s\n", tensor_name.c_str());
+                }
+                if (!blk->wait_for_completion()) {
+                    GGML_LOG_ERROR("[%s] tree all-reduce TIMEOUT (non-root) for %s -- aborting graph\n", __func__,
+                                   tensor_name.c_str());
+                    return false;
+                }
+            } else if (opt) {
+                // OPTIMIZED all-to-all: CONCURRENT + FIRE-AND-FORGET broadcast to all peers (one
+                // thread per peer, sockets resolved once above, no ack). Each node folds locally.
                 std::vector<std::thread> bcast;
                 for (size_t k = 0; k < peer_socks.size(); ++k) {
                     bcast.emplace_back([&, k]() {
@@ -4744,10 +5025,14 @@ bool rpc_server::do_computation(const rpc_msg_do_computation_req & request) {
                         t.join();
                     }
                 }
+                if (!blk->wait_for_completion()) {
+                    GGML_LOG_ERROR("[%s] all-reduce TIMEOUT for tensor %s (lost partial?) -- aborting graph\n",
+                                   __func__, tensor_name.c_str());
+                    return false;
+                }
             } else {
-                // BASELINE: SERIAL + ACKED (send_rpc_cmd waits a round-trip per peer), peer
-                // sockets re-resolved per reduce. This is the pre-optimization behavior; the
-                // matching server ALL_REDUCE handler replies in baseline mode too.
+                // BASELINE: SERIAL + ACKED broadcast to all peers (the pre-optimization path;
+                // the matching server ALL_REDUCE handler replies in baseline mode too).
                 for (auto & sock_weak : sockets_connectto) {
                     auto sock = sock_weak.second.lock();
                     if (!sock) {
@@ -4765,20 +5050,11 @@ bool rpc_server::do_computation(const rpc_msg_do_computation_req & request) {
                         GGML_LOG_INFO("failed to send all_reduce command to %s\n", sock_weak.first.c_str());
                     }
                 }
-            }
-
-            // look up the block UNDER block_mutex: the peer ALL_REDUCE handler mutates this map
-            // (find/insert) and the block under the same mutex, so the bare operator[] here was a
-            // concurrent-map-access race. The block object itself is stable for this token.
-            block_mutex.lock();
-            all_reduce_block * blk = all_reduce_blocks[tensor_name];
-            block_mutex.unlock();
-
-            //wait for the peers' partials; bounded so a lost partial can't deadlock forever
-            if (!blk->wait_for_completion()) {
-                GGML_LOG_ERROR("[%s] all-reduce TIMEOUT for tensor %s (lost partial?) -- aborting graph\n",
-                               __func__, tensor_name.c_str());
-                return false;  // clean abort instead of hanging; client run can retry
+                if (!blk->wait_for_completion()) {
+                    GGML_LOG_ERROR("[%s] all-reduce TIMEOUT for tensor %s (lost partial?) -- aborting graph\n",
+                                   __func__, tensor_name.c_str());
+                    return false;
+                }
             }
             // Reset UNDER block_mutex: block_uinit() frees add_tensor->buffer + ctx (where the
             // add graph lives), and a peer thread runs add() under block_mutex -- without this
@@ -4821,6 +5097,11 @@ bool rpc_server::create_peer_connection(const rpc_msg_create_peer_connection_req
     device_id    = request.device_id;
     device_count = request.device_count;
     peer_socks_held.clear();  // re-init: drop any previously held peer sockets
+    // device id -> endpoint map (lets the tree all-reduce find the root, device 0)
+    peer_endpoints.assign(request.device_count, std::string());
+    for (uint8_t i = 0; i < request.device_count; i++) {
+        peer_endpoints[i] = request.endpoints[i];
+    }
     // Reset stale per-session state so a NEW client run starts clean instead of
     // reusing the previous run's all-reduce blocks / stored graphs (which point at
     // the prior run's freed tensors -> the warmup "Connection closed by peer" crash
@@ -4931,6 +5212,37 @@ bool rpc_server::all_reduce(std::vector<uint8_t> & input) {
         it->second->add_to_buffer(seq, (uint8_t) src_id, tensor_data);
     }
     //else: seq <= current_seq but not the active reduce -> stale duplicate, drop
+    block_mutex.unlock();
+    return true;
+}
+
+// TREE all-reduce: a NON-ROOT received the root's folded result. Layout: seq(4) | name | data
+// (f32, no src_id -- it's the single result). Mirrors all_reduce()'s seq matching/buffering.
+bool rpc_server::ar_result(std::vector<uint8_t> & input) {
+    uint32_t seq;
+    memcpy(&seq, input.data(), sizeof(uint32_t));
+    char tensor_name_[GGML_MAX_NAME];
+    memcpy(tensor_name_, input.data() + sizeof(uint32_t), sizeof(tensor_name_));
+    size_t               data_off = sizeof(uint32_t) + sizeof(tensor_name_);
+    std::vector<uint8_t> result(input.begin() + data_off, input.end());
+    std::string          tensor_name = tensor_name_;
+
+    block_mutex.lock();
+    auto it = all_reduce_blocks.find(tensor_name);
+    if (it == all_reduce_blocks.end()) {
+        // result arrived before we set up this token's block -> buffer it by seq
+        try {
+            all_reduce_block * block = new all_reduce_block();
+            block->add_result_to_buffer(seq, result);
+            all_reduce_blocks[tensor_name] = block;
+        } catch (const std::exception & e) {
+            GGML_LOG_INFO("[%s] error: %s\n", __func__, e.what());
+        }
+    } else if (it->second->is_init() && seq == it->second->get_current_seq()) {
+        it->second->set_result(result);
+    } else if (seq > it->second->get_current_seq()) {
+        it->second->add_result_to_buffer(seq, result);
+    }
     block_mutex.unlock();
     return true;
 }
@@ -5213,6 +5525,19 @@ static void rpc_serve_client(rpc_server & server, sockfd_t sockfd, size_t free_m
                         return;
                     }
                     if (!rpc_opt_enabled() && !send_msg(sockfd, nullptr, 0)) {
+                        return;
+                    }
+                    break;
+                }
+            case RPC_CMD_AR_RESULT:
+                {
+                    // tree all-reduce: root -> non-root result. Fire-and-forget (sent via
+                    // send_rpc_cmd_oneway), so no reply.
+                    std::vector<uint8_t> input;
+                    if (!recv_msg(sockfd, input)) {
+                        return;
+                    }
+                    if (!server.ar_result(input)) {
                         return;
                     }
                     break;
