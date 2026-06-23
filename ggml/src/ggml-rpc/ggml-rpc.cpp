@@ -2861,11 +2861,20 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         // Under the master gate the diff cache is ON by default (optimized); RPC_NO_OPT
         // turns it off (baseline ships the full graph every token).
         static const bool                            use_diff_cache = rpc_opt_enabled();
+        // (#3) prefetch: predict + (later) pre-send the next token's patch during the all-reduce.
+        // Requires the diff cache. RPC_PREFETCH_DBG just logs the prediction match rate (Phase 1a).
+        static const bool                            prefetch     = use_diff_cache && getenv("RPC_PREFETCH") != nullptr;
+        static const bool                            prefetch_dbg = getenv("RPC_PREFETCH_DBG") != nullptr;
         static const bool                            dbg_diffcache  = getenv("RPC_DBG_DIFFCACHE") != nullptr;
         static std::unordered_map<uint64_t, uint8_t> graph_cache;  // topology hash (excl. view_offs) -> server graph_number
         // server graph_number -> [segment][device] -> rpc_tensor array we last shipped, so a
         // HIT can diff this token's array against it and patch only what changed.
         static std::unordered_map<uint8_t, std::vector<std::vector<std::vector<rpc_tensor>>>> last_sent;
+        // (#3 prefetch) the patch we PREDICT for the NEXT token, computed this token as
+        // current + (current - prev) per advancing field (Phase-0: constant per-tensor stride).
+        // Carried across tokens so the next token can (a) verify the prediction and (b) skip the
+        // graph-send when it holds. Sized like last_sent; only maintained when RPC_PREFETCH is set.
+        static std::unordered_map<uint8_t, std::vector<std::vector<std::vector<rpc_tensor>>>> last_pred;
 
         uint64_t struct_hash = 0;
         if (dbg_ghash) {
@@ -3071,6 +3080,10 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                 last_sent[this_graph_number].assign(n_segments,
                                                     std::vector<std::vector<rpc_tensor>>(batch_dev_count));
                 sent = &last_sent[this_graph_number];
+                if (prefetch) {  // reset stale predictions on a fresh/re-stored graph
+                    last_pred[this_graph_number].assign(n_segments,
+                                                        std::vector<std::vector<rpc_tensor>>(batch_dev_count));
+                }
             }
             // Master gate (== rpc_opt_enabled()): also controls graph-send BATCHING. opt -> build
             // all segments then one GRAPH_COMPUTE_BATCH/device; baseline -> send each segment
@@ -3220,8 +3233,10 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
             // structure. Payload per device: graph_number(1) | n_segments(4) |
             //   per segment: n_patches(4) | rpc_view_patch[n_patches]
             auto &                            sent = last_sent[this_graph_number];
+            auto *                            sent_pred = prefetch ? &last_pred[this_graph_number] : nullptr;
             std::vector<std::vector<uint8_t>> dev_patch(device_count);
             std::atomic<int>                  total_patches{ 0 };
+            std::atomic<int>                  pred_ok{ 0 }, pred_total{ 0 };
 
             std::vector<std::thread> build_threads;
             for (int id = 0; id < device_count; ++id) {
@@ -3337,6 +3352,43 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                         memcpy(out.data() + base + sizeof(uint32_t), patches.data(),
                                n_patches * sizeof(rpc_view_patch));
 
+                        // (#3 prefetch) verify last token's prediction, then synthesize this
+                        // token's prediction for the NEXT token (current + per-field stride).
+                        if (prefetch) {
+                            std::vector<rpc_tensor> & pred = (*sent_pred)[s][id];
+                            if (pred.size() == tensors.size()) {
+                                for (size_t i = 0; i < tensors.size(); i++) {
+                                    // only score tensors that actually changed (the ones a patch carries)
+                                    const rpc_tensor & a = tensors[i];
+                                    const rpc_tensor & b = prev[i];
+                                    if (a.data == b.data && a.view_offs == b.view_offs &&
+                                        memcmp(a.op_params, b.op_params, sizeof(a.op_params)) == 0) {
+                                        continue;
+                                    }
+                                    pred_total++;
+                                    if (pred[i].data == a.data && pred[i].view_offs == a.view_offs &&
+                                        memcmp(pred[i].op_params, a.op_params, sizeof(a.op_params)) == 0) {
+                                        pred_ok++;
+                                    }
+                                }
+                            }
+                            // synthesize prediction for token+1: advance each field by its stride
+                            if (prev.size() == tensors.size()) {
+                                pred.resize(tensors.size());
+                                for (size_t i = 0; i < tensors.size(); i++) {
+                                    pred[i]           = tensors[i];
+                                    pred[i].data      = tensors[i].data + (tensors[i].data - prev[i].data);
+                                    pred[i].view_offs = tensors[i].view_offs + (tensors[i].view_offs - prev[i].view_offs);
+                                    for (size_t j = 0; j < GGML_MAX_OP_PARAMS / sizeof(int32_t); j++) {
+                                        pred[i].op_params[j] =
+                                            tensors[i].op_params[j] + (tensors[i].op_params[j] - prev[i].op_params[j]);
+                                    }
+                                }
+                            } else {
+                                pred.clear();
+                            }
+                        }
+
                         prev = std::move(tensors);  // server now holds these values
                     }
                 });
@@ -3345,6 +3397,10 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                 if (t.joinable()) {
                     t.join();
                 }
+            }
+            if (prefetch_dbg && pred_total.load() > 0) {
+                GGML_LOG_INFO("[PREFETCH] gnum=%u predicted %d/%d changed tensors (%.1f%%)\n", this_graph_number,
+                              pred_ok.load(), pred_total.load(), 100.0 * pred_ok.load() / pred_total.load());
             }
 
             // send each device's patch in ONE round-trip (concurrent), timed as graph-send
