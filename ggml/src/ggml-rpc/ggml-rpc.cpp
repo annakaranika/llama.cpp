@@ -838,7 +838,7 @@ static bool rpc_ar_fp16() {
 // (deterministic). NOT bit-identical to the f32 path (each partial is rounded/quantized) -- a
 // quality/throughput tradeoff, off by default, must be set consistently on every node. int8
 // uses symmetric per-partial scaling (scale = maxabs/127), shipped as: scale(f32) | int8[n].
-enum class rpc_ar_fmt { f32, f16, i8 };
+enum class rpc_ar_fmt { f32, f16, i8, e4m3 };
 static rpc_ar_fmt rpc_ar_partial() {
     static const rpc_ar_fmt fmt = []() -> rpc_ar_fmt {
         if (!rpc_opt_enabled()) {
@@ -846,12 +846,50 @@ static rpc_ar_fmt rpc_ar_partial() {
         }
         if (const char * p = getenv("RPC_AR_PARTIAL")) {
             if (strcmp(p, "int8") == 0 || strcmp(p, "i8") == 0) { return rpc_ar_fmt::i8; }
+            if (strcmp(p, "fp8") == 0 || strcmp(p, "e4m3") == 0) { return rpc_ar_fmt::e4m3; }
             if (strcmp(p, "fp16") == 0 || strcmp(p, "f16") == 0) { return rpc_ar_fmt::f16; }
             if (strcmp(p, "f32") == 0 || strcmp(p, "none") == 0) { return rpc_ar_fmt::f32; }
         }
         return getenv("RPC_AR_FP16") != nullptr ? rpc_ar_fmt::f16 : rpc_ar_fmt::f32;  // back-compat
     }();
     return fmt;
+}
+// f32 -> OCP fp8 e4m3 (1 sign, 4 exp bias 7, 3 mantissa; max 448, no inf). Round-to-nearest-even;
+// |x|>448 -> 448; |x| below the smallest normal (2^-6) flushes to 0 (subnormals not emitted).
+static inline uint8_t rpc_f32_to_e4m3(float f) {
+    uint32_t x;
+    memcpy(&x, &f, sizeof(x));
+    const uint8_t  sign = (uint8_t) ((x >> 24) & 0x80);
+    const uint32_t absx = x & 0x7FFFFFFF;
+    if (absx >= 0x7F800000) { return (uint8_t) (sign | 0x7E); }  // inf/nan -> max finite 448
+    int32_t  e4  = (int32_t) (absx >> 23) - 127 + 7;             // target biased exponent
+    if (e4 <= 0) { return sign; }                               // underflow -> +/-0
+    uint32_t m   = absx & 0x7FFFFF;
+    uint32_t m3  = m >> 20;                                      // top 3 mantissa bits
+    uint32_t rem = m & 0xFFFFF;                                  // round-to-nearest-even on the rest
+    if (rem > 0x80000 || (rem == 0x80000 && (m3 & 1))) {
+        if (++m3 == 8) { m3 = 0; e4++; }
+    }
+    if (e4 >= 16 || (e4 == 15 && m3 >= 7)) { return (uint8_t) (sign | 0x7E); }  // overflow / NaN slot -> 448
+    return (uint8_t) (sign | (e4 << 3) | m3);
+}
+static inline float rpc_e4m3_to_f32(uint8_t v) {
+    const uint32_t sign = (uint32_t) (v & 0x80) << 24;
+    const uint32_t e4   = (v >> 3) & 0xF;
+    const uint32_t m3   = v & 0x7;
+    uint32_t       bits = sign;                                 // e4==0 => +/-0 (we never emit subnormals)
+    if (e4 != 0) {
+        bits |= ((e4 - 7 + 127) << 23) | (m3 << 20);
+    }
+    float out;
+    memcpy(&out, &bits, sizeof(out));
+    return out;
+}
+static void rpc_e4m3_quantize(const float * x, uint8_t * q, int64_t n) {
+    for (int64_t i = 0; i < n; i++) { q[i] = rpc_f32_to_e4m3(x[i]); }
+}
+static void rpc_e4m3_dequantize(const uint8_t * q, float * x, int64_t n) {
+    for (int64_t i = 0; i < n; i++) { x[i] = rpc_e4m3_to_f32(q[i]); }
 }
 // symmetric per-partial int8: returns the scale; q[i] = clamp(round(x[i]/scale), -127, 127)
 static float rpc_i8_quantize(const float * x, int8_t * q, int64_t n) {
@@ -872,12 +910,13 @@ static void rpc_i8_dequantize(const int8_t * q, float scale, float * x, int64_t 
         x[i] = (float) q[i] * scale;
     }
 }
-// bytes a narrowed f32 partial of n elements occupies on the wire (f16: 2n; int8: 4 + n)
+// bytes a narrowed f32 partial of n elements occupies on the wire (f16: 2n; int8: 4 + n; fp8: n)
 static size_t rpc_ar_payload_bytes(rpc_ar_fmt fmt, int64_t nelem, size_t nbytes_f32) {
     switch (fmt) {
-        case rpc_ar_fmt::f16: return (size_t) nelem * sizeof(ggml_fp16_t);
-        case rpc_ar_fmt::i8:  return sizeof(float) + (size_t) nelem * sizeof(int8_t);
-        default:              return nbytes_f32;
+        case rpc_ar_fmt::f16:  return (size_t) nelem * sizeof(ggml_fp16_t);
+        case rpc_ar_fmt::i8:   return sizeof(float) + (size_t) nelem * sizeof(int8_t);
+        case rpc_ar_fmt::e4m3: return (size_t) nelem * sizeof(uint8_t);
+        default:               return nbytes_f32;
     }
 }
 
@@ -3707,6 +3746,10 @@ class all_reduce_block {
             std::vector<ggml_fp16_t> h(n);
             ggml_fp32_to_fp16_row(x, h.data(), n);
             ggml_fp16_to_fp32_row(h.data(), x, n);
+        } else if (fmt == rpc_ar_fmt::e4m3) {  // fp8: round-trip self to match the fp8 copies peers got
+            std::vector<uint8_t> q(n);
+            rpc_e4m3_quantize(x, q.data(), n);
+            rpc_e4m3_dequantize(q.data(), x, n);
         } else {  // i8: quantize + dequantize so self matches the int8-rounded copies peers got
             std::vector<int8_t> q(n);
             const float         scale = rpc_i8_quantize(x, q.data(), n);
@@ -3961,6 +4004,8 @@ bool all_reduce_block::add(std::vector<uint8_t> & input, uint8_t src_id) {
             std::vector<uint8_t> f32(reduce_nbytes);
             if (fmt == rpc_ar_fmt::f16) {  // arrived as f16 -- upcast to f32 into the slot
                 ggml_fp16_to_fp32_row((const ggml_fp16_t *) input.data(), (float *) f32.data(), n);
+            } else if (fmt == rpc_ar_fmt::e4m3) {  // arrived as fp8 e4m3[n] -- dequantize to f32
+                rpc_e4m3_dequantize((const uint8_t *) input.data(), (float *) f32.data(), n);
             } else {  // i8: arrived as scale(f32) | int8[n] -- dequantize to f32
                 float scale;
                 memcpy(&scale, input.data(), sizeof(float));
@@ -5143,6 +5188,10 @@ bool rpc_server::do_computation(const rpc_msg_do_computation_req & request) {
                 ar_fp32_tmp.resize((size_t) nelem);
                 ggml_backend_tensor_get(tensor_to_all_reduce, ar_fp32_tmp.data(), 0, nbytes);
                 ggml_fp32_to_fp16_row(ar_fp32_tmp.data(), (ggml_fp16_t *) (add_data.data() + ar_hdr), nelem);
+            } else if (fmt == rpc_ar_fmt::e4m3) {  // ship fp8 e4m3[n] (1 byte/elem, no scale)
+                ar_fp32_tmp.resize((size_t) nelem);
+                ggml_backend_tensor_get(tensor_to_all_reduce, ar_fp32_tmp.data(), 0, nbytes);
+                rpc_e4m3_quantize(ar_fp32_tmp.data(), (uint8_t *) (add_data.data() + ar_hdr), nelem);
             } else if (fmt == rpc_ar_fmt::i8) {  // ship scale(f32) | int8[n]
                 ar_fp32_tmp.resize((size_t) nelem);
                 ggml_backend_tensor_get(tensor_to_all_reduce, ar_fp32_tmp.data(), 0, nbytes);
