@@ -838,13 +838,14 @@ static bool rpc_ar_fp16() {
 // (deterministic). NOT bit-identical to the f32 path (each partial is rounded/quantized) -- a
 // quality/throughput tradeoff, off by default, must be set consistently on every node. int8
 // uses symmetric per-partial scaling (scale = maxabs/127), shipped as: scale(f32) | int8[n].
-enum class rpc_ar_fmt { f32, f16, i8, e4m3 };
+enum class rpc_ar_fmt { f32, f16, i8, i8b, e4m3 };
 static rpc_ar_fmt rpc_ar_partial() {
     static const rpc_ar_fmt fmt = []() -> rpc_ar_fmt {
         if (!rpc_opt_enabled()) {
             return rpc_ar_fmt::f32;
         }
         if (const char * p = getenv("RPC_AR_PARTIAL")) {
+            if (strcmp(p, "int8b") == 0 || strcmp(p, "i8b") == 0 || strcmp(p, "q8") == 0) { return rpc_ar_fmt::i8b; }
             if (strcmp(p, "int8") == 0 || strcmp(p, "i8") == 0) { return rpc_ar_fmt::i8; }
             if (strcmp(p, "fp8") == 0 || strcmp(p, "e4m3") == 0) { return rpc_ar_fmt::e4m3; }
             if (strcmp(p, "fp16") == 0 || strcmp(p, "f16") == 0) { return rpc_ar_fmt::f16; }
@@ -910,11 +911,56 @@ static void rpc_i8_dequantize(const int8_t * q, float scale, float * x, int64_t 
         x[i] = (float) q[i] * scale;
     }
 }
+// per-block int8 (Q8_0-style, RPC_AR_PARTIAL=int8b): split the partial into blocks of 32, each
+// with its OWN f16 scale (= block-maxabs/127). Far more accurate than a single scale over the
+// whole ~2048-elem partial (each block adapts to its local magnitude) -> the usable 1-byte
+// format. Wire layout per block: ggml_fp16_t scale | int8 q[len]. ~1.06 bytes/elem.
+static const int64_t RPC_Q8_BLK = 32;
+static size_t        rpc_i8b_bytes(int64_t n) {
+    const int64_t nblk = (n + RPC_Q8_BLK - 1) / RPC_Q8_BLK;
+    return (size_t) nblk * sizeof(ggml_fp16_t) + (size_t) n * sizeof(int8_t);
+}
+static void rpc_i8b_quantize(const float * x, uint8_t * out, int64_t n) {
+    size_t off = 0;
+    for (int64_t b = 0; b < n; b += RPC_Q8_BLK) {
+        const int64_t len    = std::min<int64_t>(RPC_Q8_BLK, n - b);
+        float         maxabs = 0.0f;
+        for (int64_t i = 0; i < len; i++) {
+            maxabs = std::max(maxabs, std::fabs(x[b + i]));
+        }
+        const float scale = maxabs > 0.0f ? maxabs / 127.0f : 1.0f;
+        const float inv   = maxabs > 0.0f ? 127.0f / maxabs : 0.0f;
+        ggml_fp16_t hs;
+        ggml_fp32_to_fp16_row(&scale, &hs, 1);
+        memcpy(out + off, &hs, sizeof(hs));
+        off += sizeof(hs);
+        for (int64_t i = 0; i < len; i++) {
+            const int v = (int) lrintf(x[b + i] * inv);
+            out[off++]  = (uint8_t) (int8_t) std::max(-127, std::min(127, v));
+        }
+    }
+}
+static void rpc_i8b_dequantize(const uint8_t * in, float * x, int64_t n) {
+    size_t off = 0;
+    for (int64_t b = 0; b < n; b += RPC_Q8_BLK) {
+        const int64_t len = std::min<int64_t>(RPC_Q8_BLK, n - b);
+        ggml_fp16_t   hs;
+        memcpy(&hs, in + off, sizeof(hs));
+        off += sizeof(hs);
+        float scale;
+        ggml_fp16_to_fp32_row(&hs, &scale, 1);
+        for (int64_t i = 0; i < len; i++) {
+            const int8_t q = (int8_t) in[off++];
+            x[b + i]       = (float) q * scale;
+        }
+    }
+}
 // bytes a narrowed f32 partial of n elements occupies on the wire (f16: 2n; int8: 4 + n; fp8: n)
 static size_t rpc_ar_payload_bytes(rpc_ar_fmt fmt, int64_t nelem, size_t nbytes_f32) {
     switch (fmt) {
         case rpc_ar_fmt::f16:  return (size_t) nelem * sizeof(ggml_fp16_t);
         case rpc_ar_fmt::i8:   return sizeof(float) + (size_t) nelem * sizeof(int8_t);
+        case rpc_ar_fmt::i8b:  return rpc_i8b_bytes(nelem);
         case rpc_ar_fmt::e4m3: return (size_t) nelem * sizeof(uint8_t);
         default:               return nbytes_f32;
     }
@@ -3750,6 +3796,10 @@ class all_reduce_block {
             std::vector<uint8_t> q(n);
             rpc_e4m3_quantize(x, q.data(), n);
             rpc_e4m3_dequantize(q.data(), x, n);
+        } else if (fmt == rpc_ar_fmt::i8b) {  // per-block int8: round-trip self to match peers' copies
+            std::vector<uint8_t> q(rpc_i8b_bytes(n));
+            rpc_i8b_quantize(x, q.data(), n);
+            rpc_i8b_dequantize(q.data(), x, n);
         } else {  // i8: quantize + dequantize so self matches the int8-rounded copies peers got
             std::vector<int8_t> q(n);
             const float         scale = rpc_i8_quantize(x, q.data(), n);
@@ -4006,6 +4056,8 @@ bool all_reduce_block::add(std::vector<uint8_t> & input, uint8_t src_id) {
                 ggml_fp16_to_fp32_row((const ggml_fp16_t *) input.data(), (float *) f32.data(), n);
             } else if (fmt == rpc_ar_fmt::e4m3) {  // arrived as fp8 e4m3[n] -- dequantize to f32
                 rpc_e4m3_dequantize((const uint8_t *) input.data(), (float *) f32.data(), n);
+            } else if (fmt == rpc_ar_fmt::i8b) {  // arrived as per-block int8 -- dequantize to f32
+                rpc_i8b_dequantize((const uint8_t *) input.data(), (float *) f32.data(), n);
             } else {  // i8: arrived as scale(f32) | int8[n] -- dequantize to f32
                 float scale;
                 memcpy(&scale, input.data(), sizeof(float));
@@ -5192,6 +5244,10 @@ bool rpc_server::do_computation(const rpc_msg_do_computation_req & request) {
                 ar_fp32_tmp.resize((size_t) nelem);
                 ggml_backend_tensor_get(tensor_to_all_reduce, ar_fp32_tmp.data(), 0, nbytes);
                 rpc_e4m3_quantize(ar_fp32_tmp.data(), (uint8_t *) (add_data.data() + ar_hdr), nelem);
+            } else if (fmt == rpc_ar_fmt::i8b) {  // ship per-block int8 (f16 scale + int8 / 32-elem block)
+                ar_fp32_tmp.resize((size_t) nelem);
+                ggml_backend_tensor_get(tensor_to_all_reduce, ar_fp32_tmp.data(), 0, nbytes);
+                rpc_i8b_quantize(ar_fp32_tmp.data(), (uint8_t *) (add_data.data() + ar_hdr), nelem);
             } else if (fmt == rpc_ar_fmt::i8) {  // ship scale(f32) | int8[n]
                 ar_fp32_tmp.resize((size_t) nelem);
                 ggml_backend_tensor_get(tensor_to_all_reduce, ar_fp32_tmp.data(), 0, nbytes);
