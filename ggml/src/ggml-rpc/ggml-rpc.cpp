@@ -4934,7 +4934,10 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, rpc_msg_graph
 
     //store graph compute info
     store_graph_compute_info(graph_number, graph, ctx, signal, std::move(by_idx));
-    GGML_LOG_INFO("stored graph compute info for graph number %d\n", graph_number);
+    static const bool dbg_store = getenv("RPC_DBG_DIFFCACHE") != nullptr;  // gate per-MISS lifecycle spam
+    if (dbg_store) {
+        GGML_LOG_INFO("stored graph compute info for graph number %d\n", graph_number);
+    }
     response.result = GGML_STATUS_SUCCESS;
     return true;
 }
@@ -5156,7 +5159,10 @@ bool rpc_server::do_computation(const rpc_msg_do_computation_req & request) {
         GGML_LOG_INFO("graph number %d not found\n", graph_number);
         return false;
     }
-    GGML_LOG_INFO("found graph number %d, doing computation\n", graph_number);
+    static const bool dbg_srv = getenv("RPC_DBG_DIFFCACHE") != nullptr;  // gate per-token lifecycle spam
+    if (dbg_srv) {
+        GGML_LOG_INFO("found graph number %d, doing computation\n", graph_number);
+    }
 
     const bool opt = rpc_opt_enabled();
 
