@@ -135,6 +135,7 @@ enum rpc_cmd {
     RPC_CMD_AR_RESULT,  // tree all-reduce: root -> non-roots, the final folded result (seq|name|f32 data)
     RPC_CMD_GRAPH_COMPUTE_STORE,  // (PP diff cache) non-split: deserialize + STORE + compute inline (MISS)
     RPC_CMD_PATCH_COMPUTE,        // (PP diff cache) non-split: patch the stored graph + compute inline (HIT)
+    RPC_CMD_ADVANCE_COMPUTE,  // (PP diff cache + prefetch) non-split: advance stored graph by cached stride + compute inline (predicted HIT, no patch payload)
     RPC_CMD_COUNT,
 };
 
@@ -2843,6 +2844,7 @@ static bool rpc_tensor_changed(const rpc_tensor & a, const rpc_tensor & b) {
 struct pp_diff_state {
     std::unordered_map<uint64_t, uint8_t>                pp_cache;      // topology hash -> graph_number
     std::unordered_map<uint8_t, std::vector<rpc_tensor>> last_sent;     // graph_number -> baseline array
+    std::unordered_map<uint8_t, std::vector<rpc_tensor>> last_pred;     // (prefetch) graph_number -> predicted next-token array
     uint8_t                                              next_gnum = 0;
 };
 
@@ -3931,33 +3933,94 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         static std::unordered_map<std::string, pp_diff_state> pp_states;  // per-server (endpoint) state
         pp_diff_state &                                       st = pp_states[rpc_ctx->endpoint];
 
-        auto it  = st.pp_cache.find(hash);
-        bool hit = (it != st.pp_cache.end()) && st.last_sent.count(it->second);
+        // (prefetch) stack the next-token predictor on the PP diff cache, exactly as the TP path
+        // does: predict this token's array (constant per-field stride from the last delta) and, when
+        // the prediction holds, ship a payload-free ADVANCE_COMPUTE -- the server advances its stored
+        // graph by the cached stride + computes, zero patch bytes on the wire. DEFAULT ON with the PP
+        // diff cache; opt out with RPC_NO_PREFETCH (must match the server's srv_prefetch gate).
+        static const bool pp_prefetch  = getenv("RPC_NO_PREFETCH") == nullptr;
+        static const bool pp_pf_dbg    = getenv("RPC_PREFETCH_DBG") != nullptr;
+        auto              it           = st.pp_cache.find(hash);
+        bool              hit          = (it != st.pp_cache.end()) && st.last_sent.count(it->second);
         if (hit) {
-            // HIT: patch only the changed tensors. Payload: graph_number(1) | n_segments(4)=1 |
-            //   n_patches(4) | rpc_view_patch[n_patches]  (the layout patch_views expects).
             uint8_t                   gnum = it->second;
             std::vector<rpc_tensor> & prev = st.last_sent[gnum];
-            std::vector<rpc_view_patch> patches;
-            size_t                      n = std::min(tensors.size(), prev.size());
-            for (size_t i = 0; i < n; i++) {
-                if (rpc_tensor_changed(tensors[i], prev[i])) {
-                    rpc_view_patch p;
-                    p.idx = (uint32_t) i;
-                    p.t   = tensors[i];
-                    patches.push_back(p);
+
+            // (prefetch) verify last token's prediction against this token's real array. An ADVANCE is
+            // safe only if EVERY tensor matches, so the server's stride-advance reproduces this exact
+            // array; any mismatch -> fall back to a real patch (which also rebuilds the server stride).
+            bool advance = false;
+            if (pp_prefetch) {
+                std::vector<rpc_tensor> & pred = st.last_pred[gnum];
+                advance                        = (pred.size() == tensors.size() && !pred.empty());
+                for (size_t i = 0; advance && i < tensors.size(); i++) {
+                    const rpc_tensor & a = tensors[i];
+                    const rpc_tensor & p = pred[i];
+                    if (p.data != a.data || p.view_offs != a.view_offs || p.flags != a.flags ||
+                        memcmp(p.ne, a.ne, sizeof(a.ne)) != 0 || memcmp(p.nb, a.nb, sizeof(a.nb)) != 0 ||
+                        memcmp(p.op_params, a.op_params, sizeof(a.op_params)) != 0) {
+                        advance = false;
+                    }
                 }
             }
-            std::vector<uint8_t> payload;
-            uint32_t             n_seg = 1, n_patches = (uint32_t) patches.size();
-            payload.push_back(gnum);
-            payload.insert(payload.end(), (uint8_t *) &n_seg, (uint8_t *) &n_seg + sizeof(n_seg));
-            payload.insert(payload.end(), (uint8_t *) &n_patches, (uint8_t *) &n_patches + sizeof(n_patches));
-            payload.insert(payload.end(), (uint8_t *) patches.data(),
-                           (uint8_t *) patches.data() + (size_t) n_patches * sizeof(rpc_view_patch));
-            bool status =
-                send_rpc_cmd(sock, RPC_CMD_PATCH_COMPUTE, payload.data(), payload.size(), &response, sizeof(response));
-            GGML_ASSERT(status);
+
+            if (advance) {
+                // predicted exactly -> no patch payload; server advances by cached stride + computes
+                bool status =
+                    send_rpc_cmd(sock, RPC_CMD_ADVANCE_COMPUTE, &gnum, sizeof(gnum), &response, sizeof(response));
+                GGML_ASSERT(status);
+            } else {
+                // HIT: patch only the changed tensors. Payload: graph_number(1) | n_segments(4)=1 |
+                //   n_patches(4) | rpc_view_patch[n_patches]  (the layout patch_views expects).
+                std::vector<rpc_view_patch> patches;
+                size_t                      n = std::min(tensors.size(), prev.size());
+                for (size_t i = 0; i < n; i++) {
+                    if (rpc_tensor_changed(tensors[i], prev[i])) {
+                        rpc_view_patch p;
+                        p.idx = (uint32_t) i;
+                        p.t   = tensors[i];
+                        patches.push_back(p);
+                    }
+                }
+                std::vector<uint8_t> payload;
+                uint32_t             n_seg = 1, n_patches = (uint32_t) patches.size();
+                payload.push_back(gnum);
+                payload.insert(payload.end(), (uint8_t *) &n_seg, (uint8_t *) &n_seg + sizeof(n_seg));
+                payload.insert(payload.end(), (uint8_t *) &n_patches, (uint8_t *) &n_patches + sizeof(n_patches));
+                payload.insert(payload.end(), (uint8_t *) patches.data(),
+                               (uint8_t *) patches.data() + (size_t) n_patches * sizeof(rpc_view_patch));
+                bool status = send_rpc_cmd(sock, RPC_CMD_PATCH_COMPUTE, payload.data(), payload.size(), &response,
+                                           sizeof(response));
+                GGML_ASSERT(status);
+            }
+            if (pp_pf_dbg) {
+                GGML_LOG_INFO("[PP-PREFETCH] gnum=%u %s\n", gnum, advance ? "ADVANCE (no payload)" : "patch");
+            }
+
+            // (prefetch) synthesize the prediction for token+1: advance every field by its stride
+            // (this token - last token). Mirrors the server's graph_advance arithmetic exactly.
+            if (pp_prefetch && prev.size() == tensors.size()) {
+                std::vector<rpc_tensor> & pred = st.last_pred[gnum];
+                pred.resize(tensors.size());
+                for (size_t i = 0; i < tensors.size(); i++) {
+                    const rpc_tensor & a = tensors[i];
+                    const rpc_tensor & b = prev[i];
+                    pred[i]              = a;
+                    for (int d = 0; d < GGML_MAX_DIMS; d++) {
+                        pred[i].ne[d] = a.ne[d] + (a.ne[d] - b.ne[d]);
+                        pred[i].nb[d] = a.nb[d] + (a.nb[d] - b.nb[d]);
+                    }
+                    for (size_t j = 0; j < GGML_MAX_OP_PARAMS / sizeof(int32_t); j++) {
+                        pred[i].op_params[j] = a.op_params[j] + (a.op_params[j] - b.op_params[j]);
+                    }
+                    pred[i].flags     = a.flags + (a.flags - b.flags);
+                    pred[i].data      = a.data + (a.data - b.data);
+                    pred[i].view_offs = a.view_offs + (a.view_offs - b.view_offs);
+                }
+            } else if (pp_prefetch) {
+                st.last_pred[gnum].clear();
+            }
+
             prev = std::move(tensors);  // the server now holds these values
             return (enum ggml_status) response.result;
         }
@@ -4562,6 +4625,7 @@ class rpc_server {
     // (PP diff cache) non-split store-then-patch, computed inline (no DO_COMPUTATION / all-reduce):
     bool graph_compute_store(const std::vector<uint8_t> & input, rpc_msg_graph_compute_rsp & response);
     bool patch_compute(const std::vector<uint8_t> & input, rpc_msg_graph_compute_rsp & response);
+    bool advance_compute(uint8_t graph_number, rpc_msg_graph_compute_rsp & response);
     bool graph_advance(uint8_t graph_number);
     bool load_cached(const rpc_msg_load_cached_req & request, rpc_msg_load_cached_rsp & response);
     bool set_tensor_cache(const std::vector<uint8_t> & input);
@@ -5215,6 +5279,22 @@ bool rpc_server::patch_compute(const std::vector<uint8_t> & input, rpc_msg_graph
         return false;
     }
     auto it = graph_compute_infos.find(input[0]);
+    if (it == graph_compute_infos.end() || it->second->head == nullptr) {
+        return false;
+    }
+    response.result = ggml_backend_graph_compute(backend, it->second->head->cgraph);
+    return true;
+}
+
+// (PP diff cache + prefetch) Non-split predicted HIT: the client predicted this token's array
+// exactly, so it sent NO patch -- advance the stored graph by the per-tensor stride the last
+// PATCH_COMPUTE recorded (graph_advance), then compute inline. Mirrors patch_compute minus the
+// patch apply. The stride table is rebuilt on the next real PATCH_COMPUTE (a prediction miss).
+bool rpc_server::advance_compute(uint8_t graph_number, rpc_msg_graph_compute_rsp & response) {
+    if (!graph_advance(graph_number)) {
+        return false;
+    }
+    auto it = graph_compute_infos.find(graph_number);
     if (it == graph_compute_infos.end() || it->second->head == nullptr) {
         return false;
     }
@@ -6248,6 +6328,21 @@ static void rpc_serve_client(rpc_server & server, sockfd_t sockfd, size_t free_m
                     }
                     rpc_msg_graph_compute_rsp response;
                     if (!server.patch_compute(input, response)) {
+                        return;
+                    }
+                    if (!send_msg(sockfd, &response, sizeof(response))) {
+                        return;
+                    }
+                    break;
+                }
+            case RPC_CMD_ADVANCE_COMPUTE:  // (PP diff cache + prefetch) non-split: advance by stride + compute inline
+                {
+                    uint8_t graph_number;
+                    if (!recv_msg(sockfd, &graph_number, sizeof(graph_number))) {
+                        return;
+                    }
+                    rpc_msg_graph_compute_rsp response;
+                    if (!server.advance_compute(graph_number, response)) {
                         return;
                     }
                     if (!send_msg(sockfd, &response, sizeof(response))) {
