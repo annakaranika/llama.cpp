@@ -2487,16 +2487,16 @@ static int change_ne_and_nb(ggml_tensor * tensor, rpc_tensor & rpc_t, std::map<g
 
         case GGML_OP_PERMUTE:
             {
-                ggml_tensor * src        = tensor->src[0];
-                rpc_tensor    src_tensor = visited[tensor->src[0]];
+                // ggml_permute(a, ax0..ax3): a's dim i goes to result dim op_params[i]. Map by the
+                // AXES (op_params), not by matching ne VALUES -- ne-matching is ambiguous when two
+                // dims share a size (e.g. head_dim == n_tokens at -ub == head_dim), and the buggy
+                // last-match-wins gave q-0 nb[0]=row-stride instead of type_size -> mul_mat aborts
+                // on multi-ubatch prefill. Axes are unambiguous and match for every n_tokens.
+                rpc_tensor      src_tensor = visited[tensor->src[0]];
+                const int32_t * axes       = (const int32_t *) tensor->op_params;
                 for (int i = 0; i < GGML_MAX_DIMS; i++) {
-                    for (int j = 0; j < GGML_MAX_DIMS; j++) {
-                        if (tensor->ne[i] == src->ne[j]) {
-                            rpc_t.ne[i] = src_tensor.ne[j];
-                            rpc_t.nb[i] = src_tensor.nb[j];
-                            continue;
-                        }
-                    }
+                    rpc_t.ne[axes[i]] = src_tensor.ne[i];
+                    rpc_t.nb[axes[i]] = src_tensor.nb[i];
                 }
             }
             break;
@@ -2754,10 +2754,17 @@ static void build_segment_tensors(const ggml_cgraph * cgraph, uint32_t low, uint
     std::map<ggml_tensor *, rpc_tensor> visited;
     for (uint32_t count = low; count <= high; count++) {
         ggml_tensor * node = cgraph->nodes[count];
-        if (!ggml_is_empty(node) && node->src[0] != nullptr &&
+        if (node->src[0] != nullptr && node->src[0]->buffer != nullptr &&
             ggml_backend_buft_is_rpc_split(node->src[0]->buffer->buft) &&
             (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID)) {
-            // This node is eligible for RPC splitting
+            // This node's src0 (weight) lives in a per-device SPLIT buffer, so it must be
+            // split-serialized to match the half-size remote buffer -- regardless of whether the
+            // node itself is empty. On the LAST ubatch of a multi-ubatch prefill, n_outputs pruning
+            // makes the final layer's matmul empty (0 tokens); the old !ggml_is_empty(node) guard
+            // dropped it to the non-split path, which shipped the FULL weight into the half buffer ->
+            // deserialize OOB (GGML_ASSERT data+size <= buffer_end). An empty node still serializes
+            // fine through the split path (change_ne_and_nb carries the 0 dim through) and the server
+            // skips its compute, so splitting src0 is always correct.
             ggml_tensor_extra_rpc * node_extra = (ggml_tensor_extra_rpc *) node->src[0]->extra;
             add_tensor_part(node, tensors, visited, node_extra->split_dim, id);
         } else {
@@ -4878,6 +4885,13 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
     GGML_PRINT_DEBUG("[%s] buffer: %p, data: %p, offset: %" PRIu64 ", size: %zu\n", __func__, (void *) tensor->buffer,
                      tensor->data, offset, size);
 
+    // A zero-size set (empty tensor from n_outputs pruning) has nothing to write and may carry a
+    // null/empty buffer that would trip the bounds check below; treat it as a no-op.
+    if (size == 0) {
+        ggml_free(ctx);
+        return true;
+    }
+
     // sanitize tensor->data
     {
         const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
@@ -4946,6 +4960,15 @@ bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<
     GGML_PRINT_DEBUG("[%s] buffer: %p, data: %p, offset: %" PRIu64 ", size: %" PRIu64 "\n", __func__,
                      (void *) tensor->buffer, tensor->data, request.offset, request.size);
 
+    // A zero-size gather (e.g. an n_outputs==0 ubatch's empty result_output, ne[1]==0) has nothing
+    // to read; its tensor may legitimately have a null/empty buffer (p0==p1==0) which would otherwise
+    // trip the bounds check below. Return an empty response -- the client asserts data.size() ==
+    // ggml_nbytes(tensor) == 0, so this matches.
+    if (request.size == 0) {
+        ggml_free(ctx);
+        return true;
+    }
+
     // sanitize tensor->data
     {
         const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
@@ -4953,6 +4976,14 @@ bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<
 
         if (request.tensor.data + request.offset < p0 || request.tensor.data + request.offset >= p1 ||
             request.size > (p1 - request.tensor.data - request.offset)) {
+            GGML_LOG_ERROR("[%s] OOB name='%s' op=%d ne=[%lld,%lld,%lld,%lld] data=0x%llx offset=%llu size=%llu "
+                           "view_offs=%llu p0=0x%llx p1=0x%llx\n",
+                           __func__, request.tensor.name, (int) request.tensor.op,
+                           (long long) request.tensor.ne[0], (long long) request.tensor.ne[1],
+                           (long long) request.tensor.ne[2], (long long) request.tensor.ne[3],
+                           (unsigned long long) request.tensor.data, (unsigned long long) request.offset,
+                           (unsigned long long) request.size, (unsigned long long) request.tensor.view_offs,
+                           (unsigned long long) p0, (unsigned long long) p1);
             GGML_ABORT("[%s] tensor->data out of bounds\n", __func__);
         }
     }
