@@ -304,6 +304,11 @@ struct ggml_tensor_extra_rpc {
     //maybe we don't need to store the rows
     std::pair<int64_t, int64_t>              rows[RPC_MAX_DEVICES];
     int                                      split_dim = -1;
+    // (activation pool) gallocr byte offset of this tensor within its compute buffer. When a
+    // replicated activation lives in a shared per-device pool buffer (RPC_POOL), the server
+    // address is pool_base + data_off (the pool reuses one buffer for all activations via gallocr's
+    // already-computed reuse plan, instead of one server buffer per activation). 0 for non-pooled.
+    uint64_t                                 data_off = 0;
 };
 
 static bool rpc_opt_enabled();  // fwd decl (defined below) -- persist rides the default optimized path
@@ -320,6 +325,19 @@ static const bool g_persist_buffers = rpc_opt_enabled() && getenv("RPC_NO_PERSIS
 static std::mutex g_persist_mtx;
 static std::map<std::pair<const void *, int>, std::pair<ggml_backend_rpc_buffer_context *, size_t>> g_persist_buf;
 static std::unordered_set<const void *>                                                             g_persist_ctxs;
+
+// (activation pool, RPC_POOL opt-in) Cross-layer sub-allocation. Persist (above) still allocates ONE
+// server buffer per activation (~1500/token) -- fine for SPEED (reused across tokens) but each device
+// then holds EVERY layer's activations at once (~18 GB for a long prefill), because the per-tensor
+// alloc bypasses gallocr's cross-layer reuse. gallocr already computed a reuse plan: the compute
+// buffer's size is the PEAK (~280 MB) and each tensor's gallocr offset (in tensor->data) reuses space
+// across non-overlapping tensors. So: allocate ONE pool per (compute buffer, device) sized at the
+// gallocr peak, and point every replicated activation at pool_base + its gallocr offset (extra->
+// data_off). Cuts each replicated device from the all-layer SUM to the peak (~64x). Pool is reused
+// across tokens (resized only if the buffer grows) and freed when the compute buffer is freed.
+static const bool g_act_pool_on = rpc_opt_enabled() && getenv("RPC_POOL") != nullptr;
+static std::mutex g_act_pool_mtx;
+static std::map<std::pair<const void *, int>, std::pair<ggml_backend_rpc_buffer_context *, size_t>> g_act_pool;
 
 //split context
 struct ggml_backend_rpc_split_buffer_type_context {
@@ -648,6 +666,20 @@ static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     rpc_msg_free_buffer_req           request = { ctx->remote_ptr };
     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_FREE_BUFFER, &request, sizeof(request), nullptr, 0);
     GGML_ASSERT(status);
+    // (activation pool) release this compute buffer's per-device pools (other devices).
+    if (g_act_pool_on) {
+        std::lock_guard<std::mutex> lock(g_act_pool_mtx);
+        for (auto it = g_act_pool.begin(); it != g_act_pool.end();) {
+            if (it->first.first == (const void *) buffer) {
+                rpc_msg_free_buffer_req freq = { it->second.first->remote_ptr };
+                send_rpc_cmd(it->second.first->sock, RPC_CMD_FREE_BUFFER, &freq, sizeof(freq), nullptr, 0);
+                delete it->second.first;
+                it = g_act_pool.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
     delete ctx;
 }
 
@@ -1038,6 +1070,34 @@ static bool rpc_ar_tree() {
     return on;
 }
 
+// (activation pool) get-or-create the per-device pool buffer for a compute `buffer`, sized >= `size`.
+// One pool per (compute buffer, device); reused across tokens, grown (free + realloc) if needed.
+static ggml_backend_rpc_buffer_context * rpc_get_act_pool(const void * buffer, int id, size_t size,
+                                                          const std::shared_ptr<socket_t> & sock) {
+    std::lock_guard<std::mutex> lock(g_act_pool_mtx);
+    auto                        key = std::make_pair(buffer, id);
+    auto                        it  = g_act_pool.find(key);
+    if (it != g_act_pool.end()) {
+        if (it->second.second >= size) {
+            return it->second.first;
+        }
+        rpc_msg_free_buffer_req freq = { it->second.first->remote_ptr };
+        send_rpc_cmd(it->second.first->sock, RPC_CMD_FREE_BUFFER, &freq, sizeof(freq), nullptr, 0);
+        delete it->second.first;
+        g_act_pool.erase(it);
+    }
+    rpc_msg_alloc_buffer_req req = { size };
+    rpc_msg_alloc_buffer_rsp rsp;
+    bool status = send_rpc_cmd(sock, RPC_CMD_ALLOC_BUFFER, &req, sizeof(req), &rsp, sizeof(rsp));
+    GGML_ASSERT(status);
+    if (rsp.remote_ptr == 0) {
+        return nullptr;
+    }
+    auto * ctx      = new ggml_backend_rpc_buffer_context{ sock, nullptr, rsp.remote_ptr };
+    g_act_pool[key] = { ctx, size };
+    return ctx;
+}
+
 static void ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
     ggml_backend_rpc_buffer_context *      ctx      = (ggml_backend_rpc_buffer_context *) buffer->context;
     ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *) buffer->buft->context;
@@ -1061,6 +1121,12 @@ static void ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_t buffer, gg
                 extra = (ggml_tensor_extra_rpc *) tensor->src[1]->extra;
             } else {
                 extra = new ggml_tensor_extra_rpc();
+            }
+
+            // (activation pool) record gallocr's byte offset of this tensor within the compute buffer
+            // (tensor->data is base+offset; views/cache keep their own buffer so they're skipped).
+            if (g_act_pool_on && !found && !cache) {
+                extra->data_off = (uint64_t) tensor->data - (uint64_t) ggml_backend_rpc_buffer_context_get_base(ctx);
             }
 
             //allocate buffer on other servers
@@ -1098,6 +1164,14 @@ static void ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_t buffer, gg
                     if (dev_ctx->endpoint ==
                         buft_ctx->endpoint) {  //for the main device, we already have the buffer context
                         extra->buffer_ctx[id] = ctx;
+                        extra->rows[id]       = { 0, tensor->ne[0] };
+                        return;
+                    }
+                    // (activation pool) replicated activations share ONE per-device pool buffer at
+                    // gallocr offsets instead of one buffer each -> all-layer working set drops to the
+                    // gallocr peak. cache tensors keep their own buffer (not gallocr-managed the same).
+                    if (g_act_pool_on && !cache) {
+                        extra->buffer_ctx[id] = rpc_get_act_pool((const void *) buffer, id, buffer->size, socks[id]);
                         extra->rows[id]       = { 0, tensor->ne[0] };
                         return;
                     }
@@ -1212,7 +1286,9 @@ static void ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_t buffer, gg
                         request.tensor.buffer = extra->buffer_ctx[id]->remote_ptr;
                         // GGML_LOG_INFO("init\n");
                         request.tensor.data   = reinterpret_cast<uint64_t>(ggml_backend_rpc_buffer_context_get_base(
-                            reinterpret_cast<ggml_backend_rpc_buffer_context *>(extra->buffer_ctx[id])));
+                                                  reinterpret_cast<ggml_backend_rpc_buffer_context *>(
+                                                      extra->buffer_ctx[id]))) +
+                                              extra->data_off;  // (activation pool) sub-allocated offset
                     }
                 }
 
@@ -1293,8 +1369,9 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
                 GGML_LOG_INFO("[%s] buffer context for device %d is null\n", __func__, id);
             } else {
                 rpc_tensor2.buffer = extra->buffer_ctx[id]->remote_ptr;
-                rpc_tensor2.data = reinterpret_cast<uint64_t>(ggml_backend_rpc_buffer_context_get_base(
-                    reinterpret_cast<ggml_backend_rpc_buffer_context *>(extra->buffer_ctx[id])));
+                rpc_tensor2.data   = reinterpret_cast<uint64_t>(ggml_backend_rpc_buffer_context_get_base(
+                                       reinterpret_cast<ggml_backend_rpc_buffer_context *>(extra->buffer_ctx[id]))) +
+                                   extra->data_off;  // (activation pool) sub-allocated offset
             }
             memcpy(input_.data(), &rpc_tensor2, sizeof(rpc_tensor));
             memcpy(input_.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
@@ -1378,7 +1455,8 @@ static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, con
                 request.src.buffer = src_extra->buffer_ctx[id]->remote_ptr;
                 // GGML_LOG_INFO("cpy\n");
                 request.src.data   = reinterpret_cast<uint64_t>(ggml_backend_rpc_buffer_context_get_base(
-                    reinterpret_cast<ggml_backend_rpc_buffer_context *>(src_extra->buffer_ctx[id])));
+                                       reinterpret_cast<ggml_backend_rpc_buffer_context *>(src_extra->buffer_ctx[id]))) +
+                                   src_extra->data_off;  // (activation pool) sub-allocated offset
             }
 
             if (dst_extra->buffer_ctx[id] == nullptr) {
@@ -1387,7 +1465,8 @@ static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, con
                 request.dst.buffer = dst_extra->buffer_ctx[id]->remote_ptr;
                 // GGML_LOG_INFO("cpy\n");
                 request.dst.data   = reinterpret_cast<uint64_t>(ggml_backend_rpc_buffer_context_get_base(
-                    reinterpret_cast<ggml_backend_rpc_buffer_context *>(dst_extra->buffer_ctx[id])));
+                                       reinterpret_cast<ggml_backend_rpc_buffer_context *>(dst_extra->buffer_ctx[id]))) +
+                                   dst_extra->data_off;  // (activation pool) sub-allocated offset
             }
 
             rpc_msg_copy_tensor_rsp response;
@@ -2624,7 +2703,9 @@ static void add_tensor_part(ggml_tensor * tensor, std::vector<rpc_tensor> & tens
                     if (src_home_ctx != static_cast<const void *>(src_extra->buffer_ctx[id])) {
                         src_tensor.buffer = src_extra->buffer_ctx[id]->remote_ptr;
                         src_tensor.data   = reinterpret_cast<uint64_t>(ggml_backend_rpc_buffer_context_get_base(
-                            reinterpret_cast<ggml_backend_rpc_buffer_context *>(src_extra->buffer_ctx[id])));
+                                              reinterpret_cast<ggml_backend_rpc_buffer_context *>(
+                                                  src_extra->buffer_ctx[id]))) +
+                                          src_extra->data_off;  // (activation pool) sub-allocated offset
                         if (src->op == GGML_OP_VIEW || src->op == GGML_OP_CPY) {
                             uint64_t offset = src->view_offs;
                             if (strncmp(src->name, "k", 1) == 0) {
@@ -2661,8 +2742,9 @@ static void add_tensor_part(ggml_tensor * tensor, std::vector<rpc_tensor> & tens
                         if (svs_home_ctx != static_cast<const void *>(src_view_src_extra->buffer_ctx[id])) {
                             src_view_tensor.buffer = src_view_src_extra->buffer_ctx[id]->remote_ptr;
                             src_view_tensor.data = reinterpret_cast<uint64_t>(ggml_backend_rpc_buffer_context_get_base(
-                                reinterpret_cast<ggml_backend_rpc_buffer_context *>(
-                                    src_view_src_extra->buffer_ctx[id])));
+                                                       reinterpret_cast<ggml_backend_rpc_buffer_context *>(
+                                                           src_view_src_extra->buffer_ctx[id]))) +
+                                                   src_view_src_extra->data_off;  // (activation pool)
                         }
                     }
                     tensors.push_back(src_view_tensor);
@@ -2695,7 +2777,8 @@ static void add_tensor_part(ggml_tensor * tensor, std::vector<rpc_tensor> & tens
         if (home_ctx != static_cast<const void *>(tensor_extra->buffer_ctx[id])) {
             rpc_t.buffer = tensor_extra->buffer_ctx[id]->remote_ptr;
             rpc_t.data   = reinterpret_cast<uint64_t>(ggml_backend_rpc_buffer_context_get_base(
-                reinterpret_cast<ggml_backend_rpc_buffer_context *>(tensor_extra->buffer_ctx[id])));
+                               reinterpret_cast<ggml_backend_rpc_buffer_context *>(tensor_extra->buffer_ctx[id]))) +
+                         tensor_extra->data_off;  // (activation pool) sub-allocated offset
             if (tensor->op == GGML_OP_VIEW || tensor->op == GGML_OP_CPY) {
                 uint64_t offset = tensor->view_offs;
                 if (strncmp(tensor->name, "k", 1) == 0) {
@@ -2748,7 +2831,9 @@ static void add_tensor_part(ggml_tensor * tensor, std::vector<rpc_tensor> & tens
             if (vs_home_ctx != static_cast<const void *>(view_src_extra->buffer_ctx[id])) {
                 view_tensor.buffer = view_src_extra->buffer_ctx[id]->remote_ptr;
                 view_tensor.data   = reinterpret_cast<uint64_t>(ggml_backend_rpc_buffer_context_get_base(
-                    reinterpret_cast<ggml_backend_rpc_buffer_context *>(view_src_extra->buffer_ctx[id])));
+                                         reinterpret_cast<ggml_backend_rpc_buffer_context *>(
+                                             view_src_extra->buffer_ctx[id]))) +
+                                     view_src_extra->data_off;  // (activation pool) sub-allocated offset
             }
         }
         visited[tensor->view_src] = view_tensor;
@@ -2952,7 +3037,8 @@ static void add_data_to_data(std::vector<uint8_t> & data, ggml_tensor * tensor, 
         if (home_ctx != static_cast<const void *>(extra->buffer_ctx[id])) {
             request.tensor.buffer = extra->buffer_ctx[id]->remote_ptr;
             request.tensor.data   = reinterpret_cast<uint64_t>(ggml_backend_rpc_buffer_context_get_base(
-                reinterpret_cast<ggml_backend_rpc_buffer_context *>(extra->buffer_ctx[id])));
+                                      reinterpret_cast<ggml_backend_rpc_buffer_context *>(extra->buffer_ctx[id]))) +
+                                  extra->data_off;  // (activation pool) sub-allocated offset
         }
         for (uint32_t i = 0; i < GGML_MAX_DIMS; i++) {
             if (i == 0) {
@@ -3011,7 +3097,8 @@ static void add_data_to_data(std::vector<uint8_t> & data, ggml_tensor * tensor, 
         if (!same_dev) {
             tensor_cpy->buffer = ggml_backend_buffer_init(buft, ggml_backend_rpc_buffer_interface,
                                                           extra->buffer_ctx[id], tensor->buffer->size);
-            tensor_cpy->data   = ggml_backend_rpc_buffer_context_get_base(extra->buffer_ctx[id]);
+            tensor_cpy->data   = (void *) ((uint64_t) ggml_backend_rpc_buffer_context_get_base(extra->buffer_ctx[id]) +
+                                           extra->data_off);  // (activation pool) sub-allocated offset
         } else {
             tensor_cpy->buffer = tensor->buffer;
             tensor_cpy->data   = tensor->data;
