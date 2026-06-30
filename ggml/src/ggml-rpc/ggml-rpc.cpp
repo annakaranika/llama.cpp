@@ -2418,12 +2418,17 @@ static int change_ne_and_nb(ggml_tensor * tensor, rpc_tensor & rpc_t, std::map<g
                         rpc_t.nb[1] = rpc_t.nb[3];
                     }
                     if (strncmp(tensor->name, "v", 1) == 0) {
-                        float split_part = (id == ggml_backend_rpc_get_device_count() - 1) ?
-                                               (1 - tensor_splits[id]) :
-                                               (tensor_splits[id + 1] - tensor_splits[id]);
-                        rpc_t.nb[1]      = rpc_t.nb[1] * split_part;
-                        rpc_t.nb[2]      = rpc_t.nb[1] * rpc_t.ne[1];
-                        rpc_t.nb[3]      = rpc_t.nb[2] * rpc_t.ne[2];
+                        // Head-split the transposed V cache. The full cache_v_l is channel-major
+                        // ([n_embd_v channels] x [n_ctx positions], each channel's positions
+                        // contiguous), so each device's flat 1/N slice is naturally its head's
+                        // channels x the FULL n_ctx. Keep the full per-channel stride nb[1]; do NOT
+                        // scale it by the head fraction. The old `nb[1] *= split_part` reinterpreted
+                        // the slice as [all channels] x [n_ctx/N positions], so for n_kv > n_ctx/N the
+                        // per-position read/write overflowed into the next channel -> garbage at long
+                        // sequences (threshold n_ctx/N; worse as N grows). Applied to BOTH this read
+                        // view (v-N) and the write view (v_cache_view) so the stored layout agrees.
+                        rpc_t.nb[2] = rpc_t.nb[1] * rpc_t.ne[1];
+                        rpc_t.nb[3] = rpc_t.nb[2] * rpc_t.ne[2];
                     }
 
                 } else {
@@ -2474,12 +2479,17 @@ static int change_ne_and_nb(ggml_tensor * tensor, rpc_tensor & rpc_t, std::map<g
                         GGML_LOG_INFO("error view");
                     }
                     if (strncmp(tensor->name, "v", 1) == 0) {
-                        float split_part = (id == ggml_backend_rpc_get_device_count() - 1) ?
-                                               (1 - tensor_splits[id]) :
-                                               (tensor_splits[id + 1] - tensor_splits[id]);
-                        rpc_t.nb[1]      = rpc_t.nb[1] * split_part;
-                        rpc_t.nb[2]      = rpc_t.nb[1] * rpc_t.ne[1];
-                        rpc_t.nb[3]      = rpc_t.nb[2] * rpc_t.ne[2];
+                        // Head-split the transposed V cache. The full cache_v_l is channel-major
+                        // ([n_embd_v channels] x [n_ctx positions], each channel's positions
+                        // contiguous), so each device's flat 1/N slice is naturally its head's
+                        // channels x the FULL n_ctx. Keep the full per-channel stride nb[1]; do NOT
+                        // scale it by the head fraction. The old `nb[1] *= split_part` reinterpreted
+                        // the slice as [all channels] x [n_ctx/N positions], so for n_kv > n_ctx/N the
+                        // per-position read/write overflowed into the next channel -> garbage at long
+                        // sequences (threshold n_ctx/N; worse as N grows). Applied to BOTH this read
+                        // view (v-N) and the write view (v_cache_view) so the stored layout agrees.
+                        rpc_t.nb[2] = rpc_t.nb[1] * rpc_t.ne[1];
+                        rpc_t.nb[3] = rpc_t.nb[2] * rpc_t.ne[2];
                     }
                     return 0;
                 }
