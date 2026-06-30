@@ -8,9 +8,9 @@
 #include <sys/stat.h>  // mkdir, for the on-disk weight cache
 
 #include <algorithm>
-#include <chrono>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cinttypes>
 #include <condition_variable>
 #include <cstddef>
@@ -63,7 +63,7 @@ inline static void ggml_vec_add_f32(const int n, float * z, const float * x, con
 
 // cross-platform socket
 struct socket_t {
-    sockfd_t fd;
+    sockfd_t   fd;
     // Serializes a whole request/response (or a one-way send) on this socket. send_rpc_cmd
     // does 3 sends + 2 recvs on one fd and is NOT atomic, so two threads issuing RPCs on the
     // SAME socket (e.g. the first forward's threaded graph-send calling BUFFER_GET_BASE while
@@ -127,12 +127,14 @@ enum rpc_cmd {
     RPC_CMD_CREATE_PEER_CONNECTION,
     RPC_CMD_ALL_REDUCE,
     RPC_CMD_DO_COMPUTATION,
-    RPC_CMD_LOAD_CACHED,        // "do you have this slice cached? if so load it into the buffer" (skip upload)
-    RPC_CMD_SET_TENSOR_CACHE,   // set_tensor that ALSO persists the slice to the on-disk weight cache
-    RPC_CMD_GRAPH_COMPUTE_BATCH, // all of a token's segment-graphs in ONE round-trip (vs one RPC per segment)
-    RPC_CMD_PATCH_VIEWS,         // diff cache: patch only the per-token-changed tensors of an already-stored graph
-    RPC_CMD_GRAPH_ADVANCE,       // (#3 prefetch=eliminate) advance the last-patched tensors by their cached stride (no payload bytes)
-    RPC_CMD_AR_RESULT,           // tree all-reduce: root -> non-roots, the final folded result (seq|name|f32 data)
+    RPC_CMD_LOAD_CACHED,          // "do you have this slice cached? if so load it into the buffer" (skip upload)
+    RPC_CMD_SET_TENSOR_CACHE,     // set_tensor that ALSO persists the slice to the on-disk weight cache
+    RPC_CMD_GRAPH_COMPUTE_BATCH,  // all of a token's segment-graphs in ONE round-trip (vs one RPC per segment)
+    RPC_CMD_PATCH_VIEWS,          // diff cache: patch only the per-token-changed tensors of an already-stored graph
+    RPC_CMD_GRAPH_ADVANCE,  // (#3 prefetch=eliminate) advance the last-patched tensors by their cached stride (no payload bytes)
+    RPC_CMD_AR_RESULT,  // tree all-reduce: root -> non-roots, the final folded result (seq|name|f32 data)
+    RPC_CMD_GRAPH_COMPUTE_STORE,  // (PP diff cache) non-split: deserialize + STORE + compute inline (MISS)
+    RPC_CMD_PATCH_COMPUTE,        // (PP diff cache) non-split: patch the stored graph + compute inline (HIT)
     RPC_CMD_COUNT,
 };
 
@@ -302,6 +304,21 @@ struct ggml_tensor_extra_rpc {
     std::pair<int64_t, int64_t>              rows[RPC_MAX_DEVICES];
     int                                      split_dim = -1;
 };
+
+static bool rpc_opt_enabled();  // fwd decl (defined below) -- persist rides the default optimized path
+// (#3d) reuse a split tensor's server buffer ACROSS tokens (DEFAULT ON; opt out: RPC_NO_PERSIST_BUFFERS)
+// instead of re-allocating one per token. init_tensor currently does a per-tensor RPC_CMD_ALLOC_BUFFER for
+// every activation every token (~1500/token), and each fresh remote_ptr then needs a get_base RPC
+// (~1500/token) -- ~3000 WiFi round-trips/token, the dominant decode-build cost. The cgraph reuses
+// pool addresses each token, so the same (tensor-ptr, device) recurs with the same size = same
+// logical tensor = safe to reuse its buffer (and the reused ctx keeps its cached base, killing the
+// get_base storm too). Persisted ctxs outlive the per-token extras; the per-token free path skips
+// them (cache owns them) and they're released when replaced (size change) or at process exit
+// (bounded by the unique-tensor set).
+static const bool g_persist_buffers = rpc_opt_enabled() && getenv("RPC_NO_PERSIST_BUFFERS") == nullptr;
+static std::mutex g_persist_mtx;
+static std::map<std::pair<const void *, int>, std::pair<ggml_backend_rpc_buffer_context *, size_t>> g_persist_buf;
+static std::unordered_set<const void *>                                                             g_persist_ctxs;
 
 //split context
 struct ggml_backend_rpc_split_buffer_type_context {
@@ -524,7 +541,7 @@ static bool send_rpc_cmd(const std::shared_ptr<socket_t> & sock, enum rpc_cmd cm
     // hold the socket for the WHOLE exchange so a concurrent RPC on the same fd can't
     // interleave its bytes and cross responses (see socket_t::io_mtx).
     std::lock_guard<std::mutex> io_lock(sock->io_mtx);
-    uint8_t cmd_byte = cmd;
+    uint8_t                     cmd_byte = cmd;
     if (!send_data(sock->fd, &cmd_byte, sizeof(cmd_byte))) {
         GGML_LOG_INFO("Failed to send command byte %d\n", cmd_byte);
         return false;
@@ -715,6 +732,17 @@ struct ggml_backend_rpc_split_buffer_context {
             auto * ctx_item = extra->buffer_ctx;
             for (int i = 0; i < RPC_MAX_DEVICES; ++i) {
                 if (ctx_item[i]) {
+                    // (#3d) a persisted buffer is owned by g_persist_buf and shared across this and
+                    // future tokens' extras -- don't free or delete it here (would be a use-after-
+                    // free next token); the cache releases it on size-change or at exit.
+                    bool persisted = false;
+                    if (g_persist_buffers) {
+                        std::lock_guard<std::mutex> lock(g_persist_mtx);
+                        persisted = g_persist_ctxs.count(ctx_item[i]) != 0;
+                    }
+                    if (persisted) {
+                        continue;
+                    }
                     rpc_msg_free_buffer_req request = { ctx_item[i]->remote_ptr };
                     bool                    status =
                         send_rpc_cmd(ctx_item[i]->sock, RPC_CMD_FREE_BUFFER, &request, sizeof(request), nullptr, 0);
@@ -818,17 +846,8 @@ static bool rpc_opt_enabled() {
 // DO_COMPUTATION response on the shared fd). TCP reliable+ordered => the patch is applied before
 // compute (same guarantee the all-reduce fire-and-forget broadcast already relies on).
 static bool rpc_graph_oneway() {
-    static const bool on = rpc_opt_enabled() && getenv("RPC_GRAPH_ONEWAY") != nullptr;
-    return on;
-}
-
-// fp16 all-reduce partials (opt-in, RPC_AR_FP16): ship each 8KB f32 partial as f16 (half the
-// bytes / airtime on the shared cell), upcast back to f32 on receive so the fold stays f32 +
-// id-ordered (deterministic). Output is NOT bit-identical to the f32-partial path (each
-// partial is f16-rounded) -- a quality/throughput tradeoff -- so it's a separate opt-in on
-// top of the optimized path, NOT part of the default. Must be set consistently on all nodes.
-static bool rpc_ar_fp16() {
-    static const bool on = rpc_opt_enabled() && (getenv("RPC_AR_FP16") != nullptr);
+    // DEFAULT ON under the optimized path; opt out with RPC_NO_GRAPH_ONEWAY (byte-identical either way).
+    static const bool on = rpc_opt_enabled() && getenv("RPC_NO_GRAPH_ONEWAY") == nullptr;
     return on;
 }
 
@@ -839,22 +858,34 @@ static bool rpc_ar_fp16() {
 // quality/throughput tradeoff, off by default, must be set consistently on every node. int8
 // uses symmetric per-partial scaling (scale = maxabs/127), shipped as: scale(f32) | int8[n].
 enum class rpc_ar_fmt { f32, f16, i8, i8b, e4m3 };
+
 static rpc_ar_fmt rpc_ar_partial() {
     static const rpc_ar_fmt fmt = []() -> rpc_ar_fmt {
         if (!rpc_opt_enabled()) {
             return rpc_ar_fmt::f32;
         }
         if (const char * p = getenv("RPC_AR_PARTIAL")) {
-            if (strcmp(p, "int8b") == 0 || strcmp(p, "i8b") == 0 || strcmp(p, "q8") == 0) { return rpc_ar_fmt::i8b; }
-            if (strcmp(p, "int8") == 0 || strcmp(p, "i8") == 0) { return rpc_ar_fmt::i8; }
-            if (strcmp(p, "fp8") == 0 || strcmp(p, "e4m3") == 0) { return rpc_ar_fmt::e4m3; }
-            if (strcmp(p, "fp16") == 0 || strcmp(p, "f16") == 0) { return rpc_ar_fmt::f16; }
-            if (strcmp(p, "f32") == 0 || strcmp(p, "none") == 0) { return rpc_ar_fmt::f32; }
+            if (strcmp(p, "int8b") == 0 || strcmp(p, "i8b") == 0 || strcmp(p, "q8") == 0) {
+                return rpc_ar_fmt::i8b;
+            }
+            if (strcmp(p, "int8") == 0 || strcmp(p, "i8") == 0) {
+                return rpc_ar_fmt::i8;
+            }
+            if (strcmp(p, "fp8") == 0 || strcmp(p, "e4m3") == 0) {
+                return rpc_ar_fmt::e4m3;
+            }
+            if (strcmp(p, "fp16") == 0 || strcmp(p, "f16") == 0) {
+                return rpc_ar_fmt::f16;
+            }
+            if (strcmp(p, "f32") == 0 || strcmp(p, "none") == 0) {
+                return rpc_ar_fmt::f32;
+            }
         }
         return getenv("RPC_AR_FP16") != nullptr ? rpc_ar_fmt::f16 : rpc_ar_fmt::f32;  // back-compat
     }();
     return fmt;
 }
+
 // f32 -> OCP fp8 e4m3 (1 sign, 4 exp bias 7, 3 mantissa; max 448, no inf). Round-to-nearest-even;
 // |x|>448 -> 448; |x| below the smallest normal (2^-6) flushes to 0 (subnormals not emitted).
 static inline uint8_t rpc_f32_to_e4m3(float f) {
@@ -862,23 +893,33 @@ static inline uint8_t rpc_f32_to_e4m3(float f) {
     memcpy(&x, &f, sizeof(x));
     const uint8_t  sign = (uint8_t) ((x >> 24) & 0x80);
     const uint32_t absx = x & 0x7FFFFFFF;
-    if (absx >= 0x7F800000) { return (uint8_t) (sign | 0x7E); }  // inf/nan -> max finite 448
-    int32_t  e4  = (int32_t) (absx >> 23) - 127 + 7;             // target biased exponent
-    if (e4 <= 0) { return sign; }                               // underflow -> +/-0
+    if (absx >= 0x7F800000) {
+        return (uint8_t) (sign | 0x7E);
+    }  // inf/nan -> max finite 448
+    int32_t e4 = (int32_t) (absx >> 23) - 127 + 7;  // target biased exponent
+    if (e4 <= 0) {
+        return sign;
+    }  // underflow -> +/-0
     uint32_t m   = absx & 0x7FFFFF;
-    uint32_t m3  = m >> 20;                                      // top 3 mantissa bits
-    uint32_t rem = m & 0xFFFFF;                                  // round-to-nearest-even on the rest
+    uint32_t m3  = m >> 20;      // top 3 mantissa bits
+    uint32_t rem = m & 0xFFFFF;  // round-to-nearest-even on the rest
     if (rem > 0x80000 || (rem == 0x80000 && (m3 & 1))) {
-        if (++m3 == 8) { m3 = 0; e4++; }
+        if (++m3 == 8) {
+            m3 = 0;
+            e4++;
+        }
     }
-    if (e4 >= 16 || (e4 == 15 && m3 >= 7)) { return (uint8_t) (sign | 0x7E); }  // overflow / NaN slot -> 448
+    if (e4 >= 16 || (e4 == 15 && m3 >= 7)) {
+        return (uint8_t) (sign | 0x7E);
+    }  // overflow / NaN slot -> 448
     return (uint8_t) (sign | (e4 << 3) | m3);
 }
+
 static inline float rpc_e4m3_to_f32(uint8_t v) {
     const uint32_t sign = (uint32_t) (v & 0x80) << 24;
     const uint32_t e4   = (v >> 3) & 0xF;
     const uint32_t m3   = v & 0x7;
-    uint32_t       bits = sign;                                 // e4==0 => +/-0 (we never emit subnormals)
+    uint32_t       bits = sign;  // e4==0 => +/-0 (we never emit subnormals)
     if (e4 != 0) {
         bits |= ((e4 - 7 + 127) << 23) | (m3 << 20);
     }
@@ -886,12 +927,19 @@ static inline float rpc_e4m3_to_f32(uint8_t v) {
     memcpy(&out, &bits, sizeof(out));
     return out;
 }
+
 static void rpc_e4m3_quantize(const float * x, uint8_t * q, int64_t n) {
-    for (int64_t i = 0; i < n; i++) { q[i] = rpc_f32_to_e4m3(x[i]); }
+    for (int64_t i = 0; i < n; i++) {
+        q[i] = rpc_f32_to_e4m3(x[i]);
+    }
 }
+
 static void rpc_e4m3_dequantize(const uint8_t * q, float * x, int64_t n) {
-    for (int64_t i = 0; i < n; i++) { x[i] = rpc_e4m3_to_f32(q[i]); }
+    for (int64_t i = 0; i < n; i++) {
+        x[i] = rpc_e4m3_to_f32(q[i]);
+    }
 }
+
 // symmetric per-partial int8: returns the scale; q[i] = clamp(round(x[i]/scale), -127, 127)
 static float rpc_i8_quantize(const float * x, int8_t * q, int64_t n) {
     float maxabs = 0.0f;
@@ -906,20 +954,24 @@ static float rpc_i8_quantize(const float * x, int8_t * q, int64_t n) {
     }
     return scale;
 }
+
 static void rpc_i8_dequantize(const int8_t * q, float scale, float * x, int64_t n) {
     for (int64_t i = 0; i < n; i++) {
         x[i] = (float) q[i] * scale;
     }
 }
+
 // per-block int8 (Q8_0-style, RPC_AR_PARTIAL=int8b): split the partial into blocks of 32, each
 // with its OWN f16 scale (= block-maxabs/127). Far more accurate than a single scale over the
 // whole ~2048-elem partial (each block adapts to its local magnitude) -> the usable 1-byte
 // format. Wire layout per block: ggml_fp16_t scale | int8 q[len]. ~1.06 bytes/elem.
 static const int64_t RPC_Q8_BLK = 32;
-static size_t        rpc_i8b_bytes(int64_t n) {
+
+static size_t rpc_i8b_bytes(int64_t n) {
     const int64_t nblk = (n + RPC_Q8_BLK - 1) / RPC_Q8_BLK;
     return (size_t) nblk * sizeof(ggml_fp16_t) + (size_t) n * sizeof(int8_t);
 }
+
 static void rpc_i8b_quantize(const float * x, uint8_t * out, int64_t n) {
     size_t off = 0;
     for (int64_t b = 0; b < n; b += RPC_Q8_BLK) {
@@ -940,6 +992,7 @@ static void rpc_i8b_quantize(const float * x, uint8_t * out, int64_t n) {
         }
     }
 }
+
 static void rpc_i8b_dequantize(const uint8_t * in, float * x, int64_t n) {
     size_t off = 0;
     for (int64_t b = 0; b < n; b += RPC_Q8_BLK) {
@@ -955,14 +1008,20 @@ static void rpc_i8b_dequantize(const uint8_t * in, float * x, int64_t n) {
         }
     }
 }
+
 // bytes a narrowed f32 partial of n elements occupies on the wire (f16: 2n; int8: 4 + n; fp8: n)
 static size_t rpc_ar_payload_bytes(rpc_ar_fmt fmt, int64_t nelem, size_t nbytes_f32) {
     switch (fmt) {
-        case rpc_ar_fmt::f16:  return (size_t) nelem * sizeof(ggml_fp16_t);
-        case rpc_ar_fmt::i8:   return sizeof(float) + (size_t) nelem * sizeof(int8_t);
-        case rpc_ar_fmt::i8b:  return rpc_i8b_bytes(nelem);
-        case rpc_ar_fmt::e4m3: return (size_t) nelem * sizeof(uint8_t);
-        default:               return nbytes_f32;
+        case rpc_ar_fmt::f16:
+            return (size_t) nelem * sizeof(ggml_fp16_t);
+        case rpc_ar_fmt::i8:
+            return sizeof(float) + (size_t) nelem * sizeof(int8_t);
+        case rpc_ar_fmt::i8b:
+            return rpc_i8b_bytes(nelem);
+        case rpc_ar_fmt::e4m3:
+            return (size_t) nelem * sizeof(uint8_t);
+        default:
+            return nbytes_f32;
     }
 }
 
@@ -1010,8 +1069,8 @@ static void ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_t buffer, gg
             // (On alloc failure we set buffer_ctx[id]=nullptr -- which downstream already
             //  null-checks -- instead of `delete extra`, which under threading would
             //  double-free and was a use-after-free even serially via `tensor->extra=extra`.)
-            static const bool                      serial_alloc = (!rpc_opt_enabled() || getenv("RPC_SERIAL_UPLOAD") != nullptr);
-            const int                              n_dev        = ggml_backend_rpc_get_device_count();
+            static const bool serial_alloc = (!rpc_opt_enabled() || getenv("RPC_SERIAL_UPLOAD") != nullptr);
+            const int         n_dev        = ggml_backend_rpc_get_device_count();
             std::vector<std::shared_ptr<socket_t>> socks(n_dev);
             for (int id = 0; id < n_dev; ++id) {
                 socks[id] = get_socket(((ggml_backend_rpc_device_context *) reg_ctx->devices[id]->context)->endpoint);
@@ -1041,13 +1100,43 @@ static void ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_t buffer, gg
                         extra->rows[id]       = { 0, tensor->ne[0] };
                         return;
                     }
+                    // (#3d) persist: reuse this (tensor,id)'s server buffer from a prior token if
+                    // the size still matches -> skip the ALLOC_BUFFER RPC (and the later get_base,
+                    // since the reused ctx keeps its cached base). A size change frees + replaces it.
+                    if (g_persist_buffers) {
+                        std::lock_guard<std::mutex> lock(g_persist_mtx);
+                        auto                        pkey = std::make_pair((const void *) tensor, id);
+                        auto                        pit  = g_persist_buf.find(pkey);
+                        if (pit != g_persist_buf.end()) {
+                            if (pit->second.second == size) {
+                                extra->buffer_ctx[id] = pit->second.first;
+                                extra->rows[id]       = { 0, tensor->ne[0] };
+                                return;  // reuse -- no ALLOC_BUFFER round-trip
+                            }
+                            rpc_msg_free_buffer_req freq = { pit->second.first->remote_ptr };
+                            send_rpc_cmd(pit->second.first->sock, RPC_CMD_FREE_BUFFER, &freq, sizeof(freq), nullptr, 0);
+                            g_persist_ctxs.erase(pit->second.first);
+                            delete pit->second.first;
+                            g_persist_buf.erase(pit);
+                        }
+                    }
                     bool status = send_rpc_cmd(socks[id], RPC_CMD_ALLOC_BUFFER, &request, sizeof(request), &response,
                                                                    sizeof(response));
                     GGML_ASSERT(status);
+                    static const bool dbg_alloc = getenv("RPC_DBG_ALLOC") != nullptr;
+                    if (dbg_alloc && id == 0) {
+                        GGML_LOG_INFO("[ALLOC] init_tensor name=%s op=%d size=%zu remote_ptr=0x%llx\n", tensor->name,
+                                      (int) tensor->op, size, (unsigned long long) response.remote_ptr);
+                    }
                     if (response.remote_ptr != 0) {
-                        extra->buffer_ctx[id] =
-                            new ggml_backend_rpc_buffer_context{ socks[id], nullptr, response.remote_ptr };
-                        extra->rows[id] = { 0, tensor->ne[0] };
+                        auto * nctx           = new ggml_backend_rpc_buffer_context{ socks[id], nullptr, response.remote_ptr };
+                        extra->buffer_ctx[id] = nctx;
+                        extra->rows[id]       = { 0, tensor->ne[0] };
+                        if (g_persist_buffers) {
+                            std::lock_guard<std::mutex> lock(g_persist_mtx);
+                            g_persist_buf[std::make_pair((const void *) tensor, id)] = { nctx, size };
+                            g_persist_ctxs.insert(nctx);
+                        }
                     } else {
                         GGML_LOG_INFO("[%s] failed to allocate buffer for device %d\n", __func__, id);
                         extra->buffer_ctx[id] = nullptr;
@@ -1176,13 +1265,13 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
 
     // if split, we need to set the tensor on all other devices
     if (split && multi_cpy) {
-        ggml_tensor_extra_rpc *                extra         = (ggml_tensor_extra_rpc *) tensor->extra;
-        const int                              n_dev         = ggml_backend_rpc_get_device_count();
+        ggml_tensor_extra_rpc * extra         = (ggml_tensor_extra_rpc *) tensor->extra;
+        const int               n_dev         = ggml_backend_rpc_get_device_count();
         // Upload the replicated copy to every other device concurrently. Pre-fetch
         // and HOLD the sockets on the main thread first (the worker threads must
         // not race get_socket / let the weak_ptr-cached sockets churn -- see the
         // split upload). RPC_SERIAL_UPLOAD=1 reverts to one-at-a-time.
-        static const bool                      serial_upload = (!rpc_opt_enabled() || getenv("RPC_SERIAL_UPLOAD") != nullptr);
+        static const bool       serial_upload = (!rpc_opt_enabled() || getenv("RPC_SERIAL_UPLOAD") != nullptr);
         std::vector<std::shared_ptr<socket_t>> socks(n_dev);
         for (int id = 0; id < n_dev; ++id) {
             socks[id] = get_socket(((ggml_backend_rpc_device_context *) reg_ctx->devices[id]->context)->endpoint);
@@ -1488,8 +1577,8 @@ static void ggml_backend_rpc_split_buffer_init_tensor(ggml_backend_buffer_t buff
         // Allocate each device's split buffer concurrently -- per-id (disjoint) writes to
         // extra->buffer_ctx[id]/rows[id]; sockets pre-fetched + HELD so the weak_ptr cache
         // can't churn under the workers (see the split upload). RPC_SERIAL_UPLOAD=1 reverts.
-        static const bool                      serial_alloc = (!rpc_opt_enabled() || getenv("RPC_SERIAL_UPLOAD") != nullptr);
-        const int                              n_dev        = ggml_backend_rpc_get_device_count();
+        static const bool serial_alloc = (!rpc_opt_enabled() || getenv("RPC_SERIAL_UPLOAD") != nullptr);
+        const int         n_dev        = ggml_backend_rpc_get_device_count();
         std::vector<std::shared_ptr<socket_t>> socks(n_dev);
         for (int id = 0; id < n_dev; ++id) {
             socks[id] = get_socket(((ggml_backend_rpc_device_context *) reg_ctx->devices[id]->context)->endpoint);
@@ -1658,8 +1747,8 @@ static void ggml_backend_rpc_split_buffer_set_tensor(ggml_backend_buffer_t buffe
     // workers race get_socket() and let the cached sockets churn (close/reopen)
     // concurrently, which drops the peer connections and deadlocks the next
     // all-reduce. RPC_SERIAL_UPLOAD=1 forces the old one-at-a-time path.
-    static const bool                      serial_upload = (!rpc_opt_enabled() || getenv("RPC_SERIAL_UPLOAD") != nullptr);
-    const int                              n_dev         = ggml_backend_rpc_get_device_count();
+    static const bool serial_upload = (!rpc_opt_enabled() || getenv("RPC_SERIAL_UPLOAD") != nullptr);
+    const int         n_dev         = ggml_backend_rpc_get_device_count();
     std::vector<std::shared_ptr<socket_t>> socks(n_dev);
     for (int id = 0; id < n_dev; ++id) {
         auto dev_ctx = (ggml_backend_rpc_device_context *) reg_ctx->devices[id]->context;
@@ -1805,8 +1894,8 @@ static void ggml_backend_rpc_split_buffer_get_tensor(ggml_backend_buffer_t buffe
     // shared state is the atomic counter. Pre-fetch + HOLD the sockets on the main
     // thread so the weak_ptr cache can't churn under the workers (see the split
     // upload). RPC_SERIAL_UPLOAD=1 reverts to one-at-a-time.
-    static const bool                      serial_download = (!rpc_opt_enabled() || getenv("RPC_SERIAL_UPLOAD") != nullptr);
-    const int                              n_dev           = ggml_backend_rpc_get_device_count();
+    static const bool serial_download = (!rpc_opt_enabled() || getenv("RPC_SERIAL_UPLOAD") != nullptr);
+    const int         n_dev           = ggml_backend_rpc_get_device_count();
     std::vector<std::shared_ptr<socket_t>> socks(n_dev);
     for (int id = 0; id < n_dev; ++id) {
         socks[id] = get_socket(((ggml_backend_rpc_device_context *) reg_ctx->devices[id]->context)->endpoint);
@@ -2348,9 +2437,9 @@ static int change_ne_and_nb(ggml_tensor * tensor, rpc_tensor & rpc_t, std::map<g
                     // Guard: only when each device gets >= one block (small/per-head
                     // views keep the fine-grained float split).
                     {
-                        const int64_t devs  = ggml_backend_rpc_get_device_count();
-                        const int64_t full  = src_tensor.ne[0];
-                        const int64_t sblk  = g_rpc_split_block.load(std::memory_order_relaxed);
+                        const int64_t devs = ggml_backend_rpc_get_device_count();
+                        const int64_t full = src_tensor.ne[0];
+                        const int64_t sblk = g_rpc_split_block.load(std::memory_order_relaxed);
                         if (devs > 0 && full / devs >= sblk) {
                             const int64_t align = std::max(rpc_get_col_rounding(tensor_splits), sblk);
                             src_tensor.ne[0]    = rpc_split_count(full, align, tensor_splits, id);
@@ -2622,10 +2711,10 @@ static void add_tensor_part(ggml_tensor * tensor, std::vector<rpc_tensor> & tens
         if (dbg_getbase && (tensor->name[0] == 'k' || tensor->name[0] == 'v')) {
             ggml_backend_rpc_buffer_context * bc =
                 reinterpret_cast<ggml_backend_rpc_buffer_context *>(tensor_extra->buffer_ctx[id]);
-            GGML_LOG_INFO("[KVVIEW] id=%d name=%s op=%d ctx=%p remote_ptr=0x%llx base=%p data=0x%llx voff=%llu\n",
-                          id, tensor->name, (int) tensor->op, (void *) bc,
-                          (unsigned long long) bc->remote_ptr, bc->base_ptr.load(std::memory_order_relaxed),
-                          (unsigned long long) rpc_t.data, (unsigned long long) rpc_t.view_offs);
+            GGML_LOG_INFO("[KVVIEW] id=%d name=%s op=%d ctx=%p remote_ptr=0x%llx base=%p data=0x%llx voff=%llu\n", id,
+                          tensor->name, (int) tensor->op, (void *) bc, (unsigned long long) bc->remote_ptr,
+                          bc->base_ptr.load(std::memory_order_relaxed), (unsigned long long) rpc_t.data,
+                          (unsigned long long) rpc_t.view_offs);
         }
     }
 
@@ -2678,44 +2767,77 @@ static void build_segment_tensors(const ggml_cgraph * cgraph, uint32_t low, uint
     }
 }
 
-static void serialize_graph(const ggml_cgraph * cgraph, std::vector<uint8_t> & output) {
-    uint32_t                          n_nodes = cgraph->n_nodes;
+// Build the client's rpc_tensor array for a graph (in the order the server's by_idx mirrors). The
+// PP diff cache diffs this array token-to-token; serialize_graph then ships it (MISS) or the diff.
+static std::vector<rpc_tensor> build_graph_tensors(const ggml_cgraph * cgraph) {
     std::vector<rpc_tensor>           tensors;
     std::unordered_set<ggml_tensor *> visited;
-    // GGML_LOG_INFO("begin serialize graph, n_nodes = %d\n",n_nodes);
-    for (uint32_t i = 0; i < n_nodes; i++) {
-        // ggml_tensor * node = cgraph->nodes[i];
-        // GGML_LOG_INFO("\ni = %d\n", i);
-        // GGML_LOG_INFO("\ntensor %s ne0 :%ld ne1: %ld ne2: %ld ne3: %ld nb0: %ld nb1: %ld nb2: %ld nb3: %ld ",
-        //             node->name,node->ne[0],node->ne[1],node->ne[2],node->ne[3],node->nb[0],node->nb[1],node->nb[2],node->nb[3]);
-        // GGML_LOG_INFO("Operation: %d\n",node->op);
-        // for(int i=0;i<GGML_MAX_SRC;i++){
-        //     ggml_tensor* src=node->src[i];
-        //     if(src){
-        //         GGML_LOG_INFO("src %d %s ne0 :%ld ne1: %ld ne2: %ld ne3: %ld nb0: %ld nb1: %ld nb2: %ld nb3: %ld \n",
-        //                         i,src->name,src->ne[0],src->ne[1],src->ne[2],src->ne[3],src->nb[0],src->nb[1],src->nb[2],src->nb[3]);
-        //     }
-        // }
+    for (uint32_t i = 0; i < (uint32_t) cgraph->n_nodes; i++) {
         add_tensor(cgraph->nodes[i], tensors, visited);
-        // GGML_LOG_INFO("\nadd\n");
     }
-    // GGML_LOG_INFO("finish add tensor in graph\n");
-    // serialization format:
-    // | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
+    return tensors;
+}
+
+// serialization format: | n_nodes(4) | nodes(n_nodes*8) | n_tensors(4) | tensors(n_tensors*rpc_tensor) |
+static void serialize_graph_from_tensors(const ggml_cgraph * cgraph, const std::vector<rpc_tensor> & tensors,
+                                         std::vector<uint8_t> & output) {
+    uint32_t n_nodes     = cgraph->n_nodes;
     uint32_t n_tensors   = tensors.size();
-    int      output_size = sizeof(uint32_t) + (n_nodes * sizeof(uint64_t)) + sizeof(uint32_t) +
-                      (n_tensors * sizeof(rpc_tensor));  //+sizeof(bool);
+    size_t   output_size = sizeof(uint32_t) + ((size_t) n_nodes * sizeof(uint64_t)) + sizeof(uint32_t) +
+                         ((size_t) n_tensors * sizeof(rpc_tensor));
     output.resize(output_size, 0);
     memcpy(output.data(), &n_nodes, sizeof(n_nodes));
     for (uint32_t i = 0; i < n_nodes; i++) {
         memcpy(output.data() + sizeof(n_nodes) + (i * sizeof(uint64_t)), &cgraph->nodes[i], sizeof(uint64_t));
     }
-    uint32_t * out_ntensors = (uint32_t *) (output.data() + sizeof(n_nodes) + (n_nodes * sizeof(uint64_t)));
+    uint32_t * out_ntensors = (uint32_t *) (output.data() + sizeof(n_nodes) + ((size_t) n_nodes * sizeof(uint64_t)));
     *out_ntensors           = n_tensors;
     rpc_tensor * out_tensors =
-        (rpc_tensor *) (output.data() + sizeof(n_nodes) + (n_nodes * sizeof(uint64_t)) + sizeof(uint32_t));
-    memcpy(out_tensors, tensors.data(), n_tensors * sizeof(rpc_tensor));
+        (rpc_tensor *) (output.data() + sizeof(n_nodes) + ((size_t) n_nodes * sizeof(uint64_t)) + sizeof(uint32_t));
+    memcpy(out_tensors, tensors.data(), (size_t) n_tensors * sizeof(rpc_tensor));
 }
+
+static void serialize_graph(const ggml_cgraph * cgraph, std::vector<uint8_t> & output) {
+    serialize_graph_from_tensors(cgraph, build_graph_tensors(cgraph), output);
+}
+
+// (PP diff cache) topology hash over a graph's nodes -- excludes the per-token-varying view_offs/
+// data/op_params, so a structurally-identical decode graph keys to the same stored graph. ne/nb ARE
+// hashed, so a KV-padding-boundary shape change re-MISSes (re-ships). Mirrors the split-path hash.
+static uint64_t rpc_graph_topo_hash(const ggml_cgraph * cgraph) {
+    uint64_t h   = 1469598103934665603ULL;
+    auto     mix = [&](const void * p, size_t n) {
+        const uint8_t * b = (const uint8_t *) p;
+        for (size_t i = 0; i < n; i++) {
+            h ^= b[i];
+            h *= 1099511628211ULL;
+        }
+    };
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        ggml_tensor * nd = cgraph->nodes[i];
+        mix(&nd->op, sizeof(nd->op));
+        mix(&nd->type, sizeof(nd->type));
+        mix(nd->ne, sizeof(nd->ne));
+        mix(nd->nb, sizeof(nd->nb));
+        mix(nd->name, sizeof(nd->name));
+    }
+    return h;
+}
+
+// did an rpc_tensor's server-applied value-fields change vs last token? (NOT the pointer wiring)
+static bool rpc_tensor_changed(const rpc_tensor & a, const rpc_tensor & b) {
+    return a.data != b.data || a.view_offs != b.view_offs || a.flags != b.flags ||
+           memcmp(a.ne, b.ne, sizeof(a.ne)) != 0 || memcmp(a.nb, b.nb, sizeof(a.nb)) != 0 ||
+           memcmp(a.op_params, b.op_params, sizeof(a.op_params)) != 0;
+}
+
+// (PP diff cache) per-server client state: topology -> graph_number, and each graph_number's last-
+// sent baseline (to diff against). Keyed by endpoint because layer-distributed PP has many servers.
+struct pp_diff_state {
+    std::unordered_map<uint64_t, uint8_t>                pp_cache;      // topology hash -> graph_number
+    std::unordered_map<uint8_t, std::vector<rpc_tensor>> last_sent;     // graph_number -> baseline array
+    uint8_t                                              next_gnum = 0;
+};
 
 static void ggml_compute_forward_add_f32(struct ggml_tensor * dst, void * dst_data, void * src0_data,
                                          void * src1_data) {
@@ -2805,7 +2927,7 @@ static void add_data_to_data(std::vector<uint8_t> & data, ggml_tensor * tensor, 
         }
         size_t                 split_size = ggml_nbytes_split_col(tensor, ncols_split);
         rpc_msg_get_tensor_req request;
-        request.tensor = serialize_tensor(tensor);
+        request.tensor        = serialize_tensor(tensor);
         // home device by ctx-object identity, not remote_ptr value (alias-safe)
         const void * home_ctx = tensor->buffer ? tensor->buffer->context : nullptr;
         if (home_ctx != static_cast<const void *>(extra->buffer_ctx[id])) {
@@ -2927,6 +3049,12 @@ static void add_data_to_data(std::vector<uint8_t> & data, ggml_tensor * tensor, 
 static std::atomic<long long> g_graph_send_ns{ 0 };
 static std::atomic<long long> g_do_comp_ns{ 0 };
 static std::atomic<int>       g_compute_tokens{ 0 };
+// per-token client-side phase WALL breakdown (RPC_DBG_TIMING): where the decode token actually goes
+static std::atomic<long long> g_build_ns{ 0 };  // HIT build phase wall (build_segment_tensors + diff + prefetch-verify)
+static std::atomic<long long> g_send_ns{ 0 };   // graph-send phase wall (PATCH/ADVANCE; ~0 with oneway)
+static std::atomic<long long> g_compute_ns{ 0 };  // DO_COMPUTATION phase wall (all-reduce + result-gather)
+static std::atomic<long long> g_gather_ns{ 0 };   // result-gather (add_data_to_data) sum across devices
+static std::atomic<long long> g_bst_ns{ 0 };      // build_segment_tensors only (summed over device threads; wall ~ /N)
 
 static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     // GGML_LOG_INFO("graph compute for cgraph %x\n", (uint64_t) cgraph);
@@ -2954,16 +3082,31 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         // stale-KV-position graph -> garbage; the diff cache fixes that by patching the
         // positions every token.) RPC_DBG_GHASH logs the view_offs-inclusive probe hash;
         // RPC_DBG_DIFFCACHE logs hit/miss + patch counts. All default off.
-        static const bool                            dbg_ghash      = getenv("RPC_DBG_GHASH") != nullptr;
+        static const bool dbg_ghash      = getenv("RPC_DBG_GHASH") != nullptr;
         // Under the master gate the diff cache is ON by default (optimized); RPC_NO_OPT
         // turns it off (baseline ships the full graph every token).
-        static const bool                            use_diff_cache = rpc_opt_enabled();
-        // (#3) prefetch: predict + (later) pre-send the next token's patch during the all-reduce.
-        // Requires the diff cache. RPC_PREFETCH_DBG just logs the prediction match rate (Phase 1a).
-        static const bool                            prefetch     = use_diff_cache && getenv("RPC_PREFETCH") != nullptr;
-        static const bool                            prefetch_dbg = getenv("RPC_PREFETCH_DBG") != nullptr;
-        static const bool                            dbg_diffcache  = getenv("RPC_DBG_DIFFCACHE") != nullptr;
-        static std::unordered_map<uint64_t, uint8_t> graph_cache;  // topology hash (excl. view_offs) -> server graph_number
+        static const bool use_diff_cache = rpc_opt_enabled();
+        // (#3) prefetch: predict the next-token patch + ship a 1-byte GRAPH_ADVANCE when it holds.
+        // DEFAULT ON with the diff cache; opt out with RPC_NO_PREFETCH. RPC_PREFETCH_DBG logs the
+        // prediction match rate (needs RPC_PERSIST_BUFFERS for the prediction to actually hold).
+        static const bool prefetch       = use_diff_cache && getenv("RPC_NO_PREFETCH") == nullptr;
+        static const bool prefetch_dbg   = getenv("RPC_PREFETCH_DBG") != nullptr;
+        // (#3b) skip the per-token client REBUILD. Once the predictor has held for a few tokens the
+        // verify-rebuild is redundant: advance the client's prev/pred arithmetically (cheap, no
+        // cgraph walk) and send ADVANCE blindly -- the server advances its stored graph by the same
+        // cached stride a verified ADVANCE would have. Re-verify (full rebuild) every
+        // RPC_SKIP_VERIFY_PERIOD tokens (0 = never until a MISS) and always at the deterministic
+        // MISS boundary. Requires RPC_PREFETCH. Biggest decode lever: the rebuild is ~3.4 s/tok of
+        // coordinator CPU, far above the all-reduce.
+        static const bool skip_build     = prefetch && getenv("RPC_PREFETCH_SKIP_BUILD") != nullptr;
+        static const int  skip_verify_period = []() {
+            const char * e = getenv("RPC_SKIP_VERIFY_PERIOD");
+            return e ? atoi(e) : 32;
+        }();
+        static const int  skip_warmup    = 3;  // consecutive fully-verified ADVANCE tokens before skipping
+        static const bool dbg_diffcache  = getenv("RPC_DBG_DIFFCACHE") != nullptr;
+        static std::unordered_map<uint64_t, uint8_t>
+            graph_cache;  // topology hash (excl. view_offs) -> server graph_number
         // server graph_number -> [segment][device] -> rpc_tensor array we last shipped, so a
         // HIT can diff this token's array against it and patch only what changed.
         static std::unordered_map<uint8_t, std::vector<std::vector<std::vector<rpc_tensor>>>> last_sent;
@@ -2972,6 +3115,10 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         // Carried across tokens so the next token can (a) verify the prediction and (b) skip the
         // graph-send when it holds. Sized like last_sent; only maintained when RPC_PREFETCH is set.
         static std::unordered_map<uint8_t, std::vector<std::vector<std::vector<rpc_tensor>>>> last_pred;
+        // (#3b skip-build) state: consecutive fully-verified ADVANCE tokens, and tokens since the
+        // last full rebuild (re-verify). Reset on any MISS (boundary), where the graph is rebuilt.
+        static int skip_consec_ok    = 0;
+        static int skip_since_verify = 0;
 
         uint64_t struct_hash = 0;
         if (dbg_ghash) {
@@ -2988,7 +3135,7 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                 mix(&nd->op, sizeof(nd->op));
                 mix(&nd->type, sizeof(nd->type));
                 mix(nd->ne, sizeof(nd->ne));
-                mix(nd->nb, sizeof(nd->nb));            // strides
+                mix(nd->nb, sizeof(nd->nb));                 // strides
                 mix(&nd->view_offs, sizeof(nd->view_offs));  // KV-cache write position advances per token
                 mix(nd->name, sizeof(nd->name));
             }
@@ -3025,7 +3172,7 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                 }
             }
             static std::unordered_map<uint64_t, std::vector<std::array<uint64_t, 7>>> prevf;  // per-node field snapshot
-            auto & pf = prevf[topo];
+            auto &                                                                    pf = prevf[topo];
             if ((int) pf.size() == cgraph->n_nodes) {
                 int dvo = 0;
                 int dne = 0;
@@ -3050,14 +3197,19 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                         dnm++;
                     }
                 }
-                GGML_LOG_INFO("[rpc-diff] n_nodes=%d view_offs=%d ne=%d nb=%d op_params=%d name=%d\n",
-                              cgraph->n_nodes, dvo, dne, dnb, dop, dnm);
+                GGML_LOG_INFO("[rpc-diff] n_nodes=%d view_offs=%d ne=%d nb=%d op_params=%d name=%d\n", cgraph->n_nodes,
+                              dvo, dne, dnb, dop, dnm);
             }
             pf.resize(cgraph->n_nodes);
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * nd = cgraph->nodes[i];
-                pf[i] = { (uint64_t) nd->view_offs, fnv(nd->ne, sizeof(nd->ne)), fnv(nd->nb, sizeof(nd->nb)),
-                          fnv(nd->op_params, sizeof(nd->op_params)), fnv(nd->name, sizeof(nd->name)), 0, 0 };
+                pf[i]            = { (uint64_t) nd->view_offs,
+                                     fnv(nd->ne, sizeof(nd->ne)),
+                                     fnv(nd->nb, sizeof(nd->nb)),
+                                     fnv(nd->op_params, sizeof(nd->op_params)),
+                                     fnv(nd->name, sizeof(nd->name)),
+                                     0,
+                                     0 };
             }
         }
 
@@ -3144,18 +3296,22 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
             }
             change_split = sync_splits[sync_splits.size() - 2];
         }
+
         uint32_t n_segments = (uint32_t) sync_splits.size();
 
         if (dbg_diffcache) {
             static int hits   = 0;
             static int misses = 0;
             cache_hit ? ++hits : ++misses;
-            GGML_LOG_INFO("[rpc-diffcache] %s gnum=%d segs=%u (hits=%d misses=%d)\n",
-                          cache_hit ? "HIT " : "MISS", this_graph_number, n_segments, hits, misses);
+            GGML_LOG_INFO("[rpc-diffcache] %s gnum=%d segs=%u (hits=%d misses=%d)\n", cache_hit ? "HIT " : "MISS",
+                          this_graph_number, n_segments, hits, misses);
         }
 
         // MISS: ship the graph structure to the servers (a cache HIT patches instead).
         if (!cache_hit) {
+            // (#3b) boundary: the topology changed -> any skip streak is invalid; re-establish.
+            skip_consec_ok    = 0;
+            skip_since_verify = 0;
             // BATCHED graph-send: build every segment per device, then send ONE
             // GRAPH_COMPUTE_BATCH per device below (was one RPC per segment*device ~=
             // 176 sequential round-trips/token; the graph-send is round-trip-bound, so
@@ -3174,8 +3330,7 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
             // same-topology token can diff against it and patch only what changed.
             std::vector<std::vector<std::vector<rpc_tensor>>> * sent = nullptr;
             if (use_diff_cache) {
-                last_sent[this_graph_number].assign(n_segments,
-                                                    std::vector<std::vector<rpc_tensor>>(batch_dev_count));
+                last_sent[this_graph_number].assign(n_segments, std::vector<std::vector<rpc_tensor>>(batch_dev_count));
                 sent = &last_sent[this_graph_number];
                 if (prefetch) {  // reset stale predictions on a fresh/re-stored graph
                     last_pred[this_graph_number].assign(n_segments,
@@ -3214,8 +3369,8 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                         //input format: signal(1 byte) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t)) |
                         //              n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) | graph_number (1 byte)
                         uint32_t n_tensors  = tensors.size();
-                        int      input_size = sizeof(uint8_t) + sizeof(uint32_t) + n_nodes * sizeof(uint64_t) +
-                                         sizeof(uint32_t) + n_tensors * sizeof(rpc_tensor) + sizeof(uint8_t);
+                        int      input_size = sizeof(uint8_t) + sizeof(uint32_t) + (n_nodes * sizeof(uint64_t)) +
+                                         sizeof(uint32_t) + (n_tensors * sizeof(rpc_tensor)) + sizeof(uint8_t);
                         input.resize(input_size, 0);
 
                         //add a signal value to indicate the type of all-reduce at the beginning of the input
@@ -3231,25 +3386,25 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                         memcpy(input.data() + sizeof(uint8_t), &n_nodes, sizeof(n_nodes));
                         for (uint32_t i = 0; i < n_nodes; i++) {
                             // Copy each node pointer (as uint64_t) into the input buffer for serialization
-                            memcpy(input.data() + sizeof(uint8_t) + sizeof(n_nodes) + i * sizeof(uint64_t),
+                            memcpy(input.data() + sizeof(uint8_t) + sizeof(n_nodes) + (i * sizeof(uint64_t)),
                                    &cgraph->nodes[count_nodes_low + i], sizeof(uint64_t));
                         }
 
                         // Append number of tensors
                         uint32_t * in_ntensors = (uint32_t *) (input.data() + sizeof(uint8_t) + sizeof(n_nodes) +
-                                                               n_nodes * sizeof(uint64_t));
+                                                               (n_nodes * sizeof(uint64_t)));
                         *in_ntensors           = n_tensors;
 
                         // Copy tensor metadata
                         rpc_tensor * in_tensors = (rpc_tensor *) (input.data() + sizeof(uint8_t) + sizeof(n_nodes) +
-                                                                  n_nodes * sizeof(uint64_t) + sizeof(uint32_t));
+                                                                  (n_nodes * sizeof(uint64_t)) + sizeof(uint32_t));
                         memcpy(in_tensors, tensors.data(), n_tensors * sizeof(rpc_tensor));
 
                         // denote which graph number this is, and info for graph that servers need to know
-                        uint8_t * in_graph_number =
-                            (uint8_t *) (input.data() + sizeof(uint8_t) + sizeof(n_nodes) + n_nodes * sizeof(uint64_t) +
-                                         sizeof(uint32_t) + n_tensors * sizeof(rpc_tensor));
-                        *in_graph_number = this_graph_number;
+                        uint8_t * in_graph_number = (uint8_t *) (input.data() + sizeof(uint8_t) + sizeof(n_nodes) +
+                                                                 (n_nodes * sizeof(uint64_t)) + sizeof(uint32_t) +
+                                                                 (n_tensors * sizeof(rpc_tensor)));
+                        *in_graph_number          = this_graph_number;
 
                         if (opt) {
                             // accumulate this segment into the device's batch (one send below)
@@ -3264,14 +3419,15 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                             }
                         } else {
                             // BASELINE: send this segment now as its own (acked) RPC_CMD_GRAPH_COMPUTE
-                            auto dev_ctx = (ggml_backend_rpc_device_context *) reg_ctx->devices[id]->context;
-                            auto sock    = get_socket(dev_ctx->endpoint);
+                            auto * dev_ctx = (ggml_backend_rpc_device_context *) reg_ctx->devices[id]->context;
+                            auto   sock    = get_socket(dev_ctx->endpoint);
                             rpc_msg_graph_compute_rsp response;
-                            auto                      _t_gs  = std::chrono::steady_clock::now();
-                            bool                      status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(),
-                                                                            input.size(), &response, sizeof(response));
+                            auto                      _t_gs = std::chrono::steady_clock::now();
+                            bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size(),
+                                                       &response, sizeof(response));
                             g_graph_send_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                   std::chrono::steady_clock::now() - _t_gs).count();
+                                                   std::chrono::steady_clock::now() - _t_gs)
+                                                   .count();
                             GGML_ASSERT(status);
                             if (response.result != GGML_STATUS_SUCCESS) {
                                 fprintf(stderr, "RPC graph compute failed with status %d\n", response.result);
@@ -3292,17 +3448,18 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
             // devices). BASELINE already sent each segment above, so nothing to do here.
             if (opt) {
                 std::vector<std::thread> send_threads;
+                send_threads.reserve(batch_dev_count);
                 for (int id = 0; id < batch_dev_count; ++id) {
                     send_threads.emplace_back([&, id]() {
-                        auto dev_ctx = (ggml_backend_rpc_device_context *) reg_ctx->devices[id]->context;
-                        auto sock    = get_socket(dev_ctx->endpoint);
+                        auto * dev_ctx = (ggml_backend_rpc_device_context *) reg_ctx->devices[id]->context;
+                        auto   sock    = get_socket(dev_ctx->endpoint);
                         rpc_msg_graph_compute_rsp response;
-                        auto                      _t_gs  = std::chrono::steady_clock::now();
-                        bool                      status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE_BATCH,
-                                                                        dev_batch[id].data(), dev_batch[id].size(),
-                                                                        &response, sizeof(response));
+                        auto                      _t_gs = std::chrono::steady_clock::now();
+                        bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE_BATCH, dev_batch[id].data(),
+                                                   dev_batch[id].size(), &response, sizeof(response));
                         g_graph_send_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                               std::chrono::steady_clock::now() - _t_gs).count();
+                                               std::chrono::steady_clock::now() - _t_gs)
+                                               .count();
                         GGML_ASSERT(status);
                         if (response.result != GGML_STATUS_SUCCESS) {
                             fprintf(stderr, "RPC graph compute (batch) failed with status %d\n", response.result);
@@ -3329,31 +3486,75 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
             // stored graph in place, skipping the re-deserialize of the whole ~1000-tensor
             // structure. Payload per device: graph_number(1) | n_segments(4) |
             //   per segment: n_patches(4) | rpc_view_patch[n_patches]
-            auto &                            sent = last_sent[this_graph_number];
+            auto &                            sent      = last_sent[this_graph_number];
             auto *                            sent_pred = prefetch ? &last_pred[this_graph_number] : nullptr;
             std::vector<std::vector<uint8_t>> dev_patch(device_count);
-            std::vector<char>                 dev_advance(device_count, prefetch ? 1 : 0);  // (#3) per-device: send ADVANCE not a patch
-            std::atomic<int>                  total_patches{ 0 };
-            std::atomic<int>                  pred_ok{ 0 }, pred_total{ 0 };
+            std::vector<char> dev_advance(device_count, prefetch ? 1 : 0);  // (#3) per-device: send ADVANCE not a patch
+            std::atomic<int>  total_patches{ 0 };
+            std::atomic<int>  pred_ok{ 0 }, pred_total{ 0 };
 
+            // (#3b) decide whether to SKIP the rebuild this token: enabled, warmed up, not due for
+            // a periodic re-verify, and every device's prediction is established (advanceable).
+            bool do_skip = skip_build && sent_pred && skip_consec_ok >= skip_warmup &&
+                           (skip_verify_period <= 0 || skip_since_verify < skip_verify_period);
+            for (int id = 0; do_skip && id < device_count; ++id) {
+                for (uint32_t s = 0; s < n_segments; ++s) {
+                    const auto & prev = sent[s][id];
+                    const auto & pred = (*sent_pred)[s][id];
+                    if (pred.empty() || pred.size() != prev.size()) { do_skip = false; break; }
+                }
+            }
+
+            auto                     _t_build = std::chrono::steady_clock::now();
             std::vector<std::thread> build_threads;
             for (int id = 0; id < device_count; ++id) {
                 build_threads.emplace_back([&, id]() {
+                    // (#3b skip-build) steady state: advance prev/pred arithmetically (no cgraph
+                    // walk, no diff) and leave dev_advance[id]=1 so the send ships a 1-byte ADVANCE.
+                    // The server advances its stored graph by the same cached stride -> identical
+                    // result to a verified ADVANCE, but ~3.4 s/tok of coordinator CPU is skipped.
+                    if (do_skip) {
+                        for (uint32_t s = 0; s < n_segments; ++s) {
+                            std::vector<rpc_tensor> & prev = sent[s][id];
+                            std::vector<rpc_tensor> & pred = (*sent_pred)[s][id];
+                            for (size_t i = 0; i < prev.size(); i++) {
+                                rpc_tensor old_pred = pred[i];
+                                rpc_tensor np        = pred[i];  // next pred = pred + (pred - prev)
+                                for (int d = 0; d < GGML_MAX_DIMS; d++) {
+                                    np.ne[d] = pred[i].ne[d] + (pred[i].ne[d] - prev[i].ne[d]);
+                                    np.nb[d] = pred[i].nb[d] + (pred[i].nb[d] - prev[i].nb[d]);
+                                }
+                                for (size_t j = 0; j < GGML_MAX_OP_PARAMS / sizeof(int32_t); j++) {
+                                    np.op_params[j] =
+                                        pred[i].op_params[j] + (pred[i].op_params[j] - prev[i].op_params[j]);
+                                }
+                                np.flags     = pred[i].flags + (pred[i].flags - prev[i].flags);
+                                np.data      = pred[i].data + (pred[i].data - prev[i].data);
+                                np.view_offs = pred[i].view_offs + (pred[i].view_offs - prev[i].view_offs);
+                                prev[i]      = old_pred;  // server now holds the previously-predicted values
+                                pred[i]      = np;
+                            }
+                        }
+                        return;
+                    }
                     std::vector<uint8_t> & out = dev_patch[id];
                     out.resize(sizeof(uint8_t) + sizeof(uint32_t));
                     out[0] = this_graph_number;
                     memcpy(out.data() + sizeof(uint8_t), &n_segments, sizeof(n_segments));
 
                     for (size_t s = 0; s < sync_splits.size(); s++) {
-                        uint32_t                  low  = sync_splits[s].nodes_split.first;
-                        uint32_t                  high = sync_splits[s].nodes_split.second;
-                        std::vector<rpc_tensor>   tensors;
+                        uint32_t                low  = sync_splits[s].nodes_split.first;
+                        uint32_t                high = sync_splits[s].nodes_split.second;
+                        std::vector<rpc_tensor> tensors;
+                        auto _t_bst = std::chrono::steady_clock::now();
                         build_segment_tensors(cgraph, low, high, id, tensors);
+                        g_bst_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        std::chrono::steady_clock::now() - _t_bst).count();
 
-                        std::vector<rpc_tensor> & prev = sent[s][id];
+                        std::vector<rpc_tensor> &   prev = sent[s][id];
                         std::vector<rpc_view_patch> patches;
                         // same topology => same count/order; guard defensively against drift
-                        size_t n = std::min(tensors.size(), prev.size());
+                        size_t                      n = std::min(tensors.size(), prev.size());
 
                         // A patch carries a tensor whose server-applied value-fields changed (NOT
                         // the pointer wiring id/src/view_src/buffer/name, which always differ).
@@ -3364,7 +3565,9 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                                                  memcmp(a.ne, b.ne, sizeof(a.ne)) != 0 ||
                                                  memcmp(a.nb, b.nb, sizeof(a.nb)) != 0 ||
                                                  memcmp(a.op_params, b.op_params, sizeof(a.op_params)) != 0;
-                            if (data_only_out) { *data_only_out = data_changed && !other_changed; }
+                            if (data_only_out) {
+                                *data_only_out = data_changed && !other_changed;
+                            }
                             return data_changed || other_changed;
                         };
 
@@ -3378,15 +3581,24 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                         static const bool data_trim = []() {
                             const bool on = rpc_opt_enabled() && getenv("RPC_DIFF_DATA_TRIM") != nullptr;
                             if (on) {
-                                GGML_LOG_INFO("[RPC_DIFF_DATA_TRIM] WARNING: experimental + UNSAFE "
-                                              "(corrupts decode via ggml-alloc slot reuse)\n");
+                                GGML_LOG_INFO(
+                                    "[RPC_DIFF_DATA_TRIM] WARNING: experimental + UNSAFE "
+                                    "(corrupts decode via ggml-alloc slot reuse)\n");
                             }
                             return on;
                         }();
                         static const bool dbg_patch = getenv("RPC_DBG_PATCH") != nullptr;
 
                         if (!data_trim && !dbg_patch) {
+                            // (diag) cgraph pointer stability across tokens: if tensors[i].id (the
+                            // ggml_tensor*) matches last token's, an incremental refresh can map
+                            // cached[i]->node directly; else it must be position-based.
+                            static const bool dbg_idstab = getenv("RPC_DBG_IDSTAB") != nullptr;
+                            int               id_same = 0, id_diff = 0;
                             for (size_t i = 0; i < n; i++) {
+                                if (dbg_idstab) {
+                                    (tensors[i].id == prev[i].id) ? id_same++ : id_diff++;
+                                }
                                 if (changed_fields(tensors[i], prev[i], nullptr)) {
                                     rpc_view_patch p;
                                     p.idx = (uint32_t) i;
@@ -3394,28 +3606,38 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                                     patches.push_back(p);
                                 }
                             }
+                            if (dbg_idstab && id == 0) {
+                                GGML_LOG_INFO("[IDSTAB] gnum=%u seg=%zu n=%zu id_same=%d id_diff=%d\n",
+                                              this_graph_number, s, n, id_same, id_diff);
+                            }
                         } else {
                             // instrumented / experimental path (helpers built only here)
                             std::unordered_set<uint64_t> viewsrc_ids;  // (#5) keep-set: view-sources
                             uint64_t                     out_id = 0;
                             if (data_trim) {
                                 for (const auto & t : tensors) {
-                                    if (t.view_src) { viewsrc_ids.insert(t.view_src); }
+                                    if (t.view_src) {
+                                        viewsrc_ids.insert(t.view_src);
+                                    }
                                 }
                                 out_id = reinterpret_cast<uint64_t>(cgraph->nodes[high]);
                             }
                             int         c_pos_only = 0, c_data_only = 0, c_mixed = 0;
                             std::string data_sample;
                             for (size_t i = 0; i < n; i++) {
-                                const rpc_tensor & a = tensors[i];
-                                const rpc_tensor & b = prev[i];
+                                const rpc_tensor & a         = tensors[i];
+                                const rpc_tensor & b         = prev[i];
                                 bool               data_only = false;
                                 bool               changed   = changed_fields(a, b, &data_only);
                                 if (dbg_patch && changed) {
                                     const bool dc = a.data != b.data;
-                                    if (data_only)  { c_data_only++; }
-                                    else if (dc)    { c_mixed++; }
-                                    else            { c_pos_only++; }
+                                    if (data_only) {
+                                        c_data_only++;
+                                    } else if (dc) {
+                                        c_mixed++;
+                                    } else {
+                                        c_pos_only++;
+                                    }
                                     if (dc && (int) data_sample.size() < 240) {
                                         char buf[96];
                                         snprintf(buf, sizeof(buf), "[%zu]%s 0x%llx->0x%llx ", i, a.name,
@@ -3424,9 +3646,11 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                                     }
                                 }
                                 if (changed && data_trim && data_only) {  // (#5) skip plain-intermediate churn
-                                    bool keep = a.view_src != 0 || viewsrc_ids.count(a.id) != 0 ||
-                                                a.id == out_id || strncmp(a.name, "result", 6) == 0;
-                                    if (!keep) { changed = false; }
+                                    bool keep = a.view_src != 0 || viewsrc_ids.count(a.id) != 0 || a.id == out_id ||
+                                                strncmp(a.name, "result", 6) == 0;
+                                    if (!keep) {
+                                        changed = false;
+                                    }
                                 }
                                 if (changed) {
                                     rpc_view_patch p;
@@ -3437,8 +3661,8 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                             }
                             if (dbg_patch && id == 0) {
                                 GGML_LOG_INFO("[PATCH] gnum=%u seg=%zu n=%zu pos_only=%d data_only=%d mixed=%d | %s\n",
-                                              this_graph_number, s, patches.size(), c_pos_only, c_data_only,
-                                              c_mixed, data_sample.c_str());
+                                              this_graph_number, s, patches.size(), c_pos_only, c_data_only, c_mixed,
+                                              data_sample.c_str());
                             }
                         }
                         total_patches += (int) patches.size();
@@ -3453,42 +3677,51 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                         // (#3 prefetch) verify last token's prediction, then synthesize this
                         // token's prediction for the NEXT token (current + per-field stride).
                         if (prefetch) {
-                            std::vector<rpc_tensor> & pred = (*sent_pred)[s][id];
+                            std::vector<rpc_tensor> & pred   = (*sent_pred)[s][id];
                             // Verify last token's prediction against the real array. A GRAPH_ADVANCE
                             // is safe for this device only if EVERY tensor's advanced fields match,
                             // so the server's stride-advance reproduces this exact array (any
                             // mismatch -> fall back to a real patch this token).
-                            bool seg_ok = (pred.size() == tensors.size() && !pred.empty());
+                            bool                      seg_ok = (pred.size() == tensors.size() && !pred.empty());
                             if (seg_ok || prefetch_dbg) {
                                 for (size_t i = 0; i < tensors.size() && i < pred.size(); i++) {
                                     const rpc_tensor & a = tensors[i];
                                     const rpc_tensor & p = pred[i];
-                                    bool match = p.data == a.data && p.view_offs == a.view_offs &&
-                                                 p.flags == a.flags && memcmp(p.ne, a.ne, sizeof(a.ne)) == 0 &&
+                                    bool match = p.data == a.data && p.view_offs == a.view_offs && p.flags == a.flags &&
+                                                 memcmp(p.ne, a.ne, sizeof(a.ne)) == 0 &&
                                                  memcmp(p.nb, a.nb, sizeof(a.nb)) == 0 &&
                                                  memcmp(p.op_params, a.op_params, sizeof(a.op_params)) == 0;
                                     if (prefetch_dbg) {  // match-rate over CHANGED tensors only
-                                        const rpc_tensor & b = prev[i];
-                                        bool ch = a.data != b.data || a.view_offs != b.view_offs ||
+                                        const rpc_tensor & b  = prev[i];
+                                        bool               ch = a.data != b.data || a.view_offs != b.view_offs ||
                                                   a.flags != b.flags || memcmp(a.ne, b.ne, sizeof(a.ne)) != 0 ||
                                                   memcmp(a.nb, b.nb, sizeof(a.nb)) != 0 ||
                                                   memcmp(a.op_params, b.op_params, sizeof(a.op_params)) != 0;
-                                        if (ch) { pred_total++; if (match) { pred_ok++; } }
+                                        if (ch) {
+                                            pred_total++;
+                                            if (match) {
+                                                pred_ok++;
+                                            }
+                                        }
                                     }
                                     if (!match) {
                                         seg_ok = false;
-                                        if (!prefetch_dbg) { break; }
+                                        if (!prefetch_dbg) {
+                                            break;
+                                        }
                                     }
                                 }
                             }
-                            if (!seg_ok) { dev_advance[id] = 0; }  // any mismatch -> real patch for this device
+                            if (!seg_ok) {
+                                dev_advance[id] = 0;
+                            }  // any mismatch -> real patch for this device
                             // synthesize prediction for token+1: advance every patched field by its stride
                             if (prev.size() == tensors.size()) {
                                 pred.resize(tensors.size());
                                 for (size_t i = 0; i < tensors.size(); i++) {
                                     const rpc_tensor & a = tensors[i];
                                     const rpc_tensor & b = prev[i];
-                                    pred[i]               = a;
+                                    pred[i]              = a;
                                     for (int d = 0; d < GGML_MAX_DIMS; d++) {
                                         pred[i].ne[d] = a.ne[d] + (a.ne[d] - b.ne[d]);
                                         pred[i].nb[d] = a.nb[d] + (a.nb[d] - b.nb[d]);
@@ -3515,33 +3748,55 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                     t.join();
                 }
             }
+            g_build_ns +=
+                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - _t_build)
+                    .count();
+            // (#3b) update skip state. A skipped token just advances the re-verify clock; a real
+            // build counts toward warmup only if EVERY device verified an ADVANCE (prediction held)
+            // and resets the re-verify clock (this token IS the re-verify / re-establish).
+            if (do_skip) {
+                skip_since_verify++;
+            } else {
+                bool all_adv = prefetch;
+                for (int id = 0; id < device_count; ++id) {
+                    if (!dev_advance[id]) { all_adv = false; }
+                }
+                skip_consec_ok    = all_adv ? skip_consec_ok + 1 : 0;
+                skip_since_verify = 0;
+            }
+            if (dbg_diffcache && skip_build) {
+                GGML_LOG_INFO("[rpc-skip] gnum=%u %s (consec_ok=%d since_verify=%d)\n", this_graph_number,
+                              do_skip ? "SKIP-build (arith advance)" : "build", skip_consec_ok, skip_since_verify);
+            }
             if (prefetch_dbg && pred_total.load() > 0) {
                 GGML_LOG_INFO("[PREFETCH] gnum=%u predicted %d/%d changed tensors (%.1f%%)\n", this_graph_number,
                               pred_ok.load(), pred_total.load(), 100.0 * pred_ok.load() / pred_total.load());
             }
 
             // send each device's patch in ONE round-trip (concurrent), timed as graph-send
+            auto                     _t_send = std::chrono::steady_clock::now();
             std::vector<std::thread> send_threads;
             for (int id = 0; id < device_count; ++id) {
                 send_threads.emplace_back([&, id]() {
-                    auto dev_ctx = (ggml_backend_rpc_device_context *) reg_ctx->devices[id]->context;
-                    auto sock    = get_socket(dev_ctx->endpoint);
-                    auto _t_gs   = std::chrono::steady_clock::now();
+                    auto               dev_ctx = (ggml_backend_rpc_device_context *) reg_ctx->devices[id]->context;
+                    auto               sock    = get_socket(dev_ctx->endpoint);
+                    auto               _t_gs   = std::chrono::steady_clock::now();
                     // (#3 eliminate) advance: every changed tensor predicted exactly -> the server
                     // advances by cached stride; ship just the graph_number. else the real patch.
-                    const bool   advance = prefetch && dev_advance[id];
+                    const bool         advance = prefetch && dev_advance[id];
                     const enum rpc_cmd cmd     = advance ? RPC_CMD_GRAPH_ADVANCE : RPC_CMD_PATCH_VIEWS;
-                    const void *       payload = advance ? (const void *) &this_graph_number
-                                                         : (const void *) dev_patch[id].data();
-                    const size_t       psize   = advance ? sizeof(this_graph_number) : dev_patch[id].size();
-                    bool               status;
+                    const void *       payload =
+                        advance ? (const void *) &this_graph_number : (const void *) dev_patch[id].data();
+                    const size_t psize = advance ? sizeof(this_graph_number) : dev_patch[id].size();
+                    bool         status;
                     if (rpc_graph_oneway()) {  // fire-and-forget, pipelined before DO_COMPUTATION
                         status = send_rpc_cmd_oneway(sock, cmd, payload, psize);
                     } else {
                         status = send_rpc_cmd(sock, cmd, payload, psize, nullptr, 0);
                     }
-                    g_graph_send_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                           std::chrono::steady_clock::now() - _t_gs).count();
+                    g_graph_send_ns +=
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - _t_gs)
+                            .count();
                     GGML_ASSERT(status);
                 });
             }
@@ -3550,13 +3805,17 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                     t.join();
                 }
             }
+            g_send_ns +=
+                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - _t_send)
+                    .count();
             if (dbg_diffcache) {
-                GGML_LOG_INFO("[rpc-diffcache] patched %d tensors (across %d devices)\n",
-                              total_patches.load(), device_count);
+                GGML_LOG_INFO("[rpc-diffcache] patched %d tensors (across %d devices)\n", total_patches.load(),
+                              device_count);
             }
         }
 
         //send a commend to servers to ask them do the computation job here
+        auto                     _t_compute = std::chrono::steady_clock::now();
         std::vector<std::thread> threads;
 
         ggml_tensor *        tensor = cgraph->nodes[cgraph->n_nodes - 1];
@@ -3569,16 +3828,21 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
 
                 rpc_msg_do_computation_req compute_info;
                 compute_info.graph_number = this_graph_number;
-                auto _t_dc  = std::chrono::steady_clock::now();
+                auto _t_dc                = std::chrono::steady_clock::now();
                 bool status =
                     send_rpc_cmd(sock, RPC_CMD_DO_COMPUTATION, &compute_info, sizeof(compute_info), nullptr, 0);
-                g_do_comp_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                    std::chrono::steady_clock::now() - _t_dc).count();
+                g_do_comp_ns +=
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - _t_dc)
+                        .count();
                 GGML_ASSERT(status);
 
                 if (strcmp(tensor->name, "result_output") == 0) {
                     // GGML_LOG_INFO("getting result data from device %d\n", id);
+                    auto _t_g = std::chrono::steady_clock::now();
                     add_data_to_data(data, tensor, data_mutex, id);
+                    g_gather_ns +=
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - _t_g)
+                            .count();
                 }
             });
         }
@@ -3588,6 +3852,8 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                 thread.join();
             }
         }
+        g_compute_ns +=
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - _t_compute).count();
         // Write back data to RPC backend tensor on the client
 
         if (strcmp(tensor->name, "result_output") == 0) {
@@ -3600,33 +3866,105 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                 // real steady-state ratio. Also keep the cumulative.
                 static long long prev_gs = 0;
                 static long long prev_dc = 0;
-                long long        gs  = g_graph_send_ns.load();
-                long long        dc  = g_do_comp_ns.load();
-                long long        dgs = gs - prev_gs;
-                long long        ddc = dc - prev_dc;
-                prev_gs = gs;
-                prev_dc = dc;
-                GGML_LOG_INFO("[rpc-timing] fwd %d: this graph_send=%.3fs execute+allreduce=%.3fs (this=%.1f%%) "
-                              "| cumulative=%.1f%%\n",
-                              ++g_compute_tokens, dgs / 1e9, ddc / 1e9,
-                              100.0 * dgs / (double) (dgs + ddc + 1), 100.0 * gs / (double) (gs + dc + 1));
+                long long        gs      = g_graph_send_ns.load();
+                long long        dc      = g_do_comp_ns.load();
+                long long        dgs     = gs - prev_gs;
+                long long        ddc     = dc - prev_dc;
+                prev_gs                  = gs;
+                prev_dc                  = dc;
+                // per-token client-side phase WALL breakdown: where the decode token actually goes.
+                // build = client CPU (build_segment_tensors + diff + verify); send = graph-send
+                // (PATCH/ADVANCE); compute = DO_COMPUTATION phase wall (all-reduce + gather);
+                // gather = result-gather (GET_TENSOR + sum, summed across devices, wall ~ /N).
+                static long long prev_b = 0, prev_sw = 0, prev_cw = 0, prev_g = 0;
+                long long        b = g_build_ns.load(), sw = g_send_ns.load();
+                long long        cw = g_compute_ns.load(), gth = g_gather_ns.load();
+                long long        db = b - prev_b, dsw = sw - prev_sw, dcw = cw - prev_cw, dg = gth - prev_g;
+                static long long prev_bst = 0;
+                long long        bst  = g_bst_ns.load();
+                long long        dbst = bst - prev_bst;
+                prev_bst = bst;
+                prev_b  = b;
+                prev_sw = sw;
+                prev_cw = cw;
+                prev_g  = gth;
+                GGML_LOG_INFO(
+                    "[rpc-timing] fwd %d: this graph_send=%.3fs execute+allreduce=%.3fs (this=%.1f%%) "
+                    "| cumulative=%.1f%%\n",
+                    ++g_compute_tokens, dgs / 1e9, ddc / 1e9, 100.0 * dgs / (double) (dgs + ddc + 1),
+                    100.0 * gs / (double) (gs + dc + 1));
+                GGML_LOG_INFO(
+                    "[rpc-phase]  fwd %d: build=%.3fs (build_seg_tensors~%.3fs) send=%.3fs compute_wall=%.3fs "
+                    "gather=%.3fs (all-reduce~%.3fs) [build is client CPU; *_seg/gather are /N wall]\n",
+                    g_compute_tokens.load(), db / 1e9, dbst / (double) device_count / 1e9, dsw / 1e9, dcw / 1e9,
+                    dg / 1e9, (dcw - dg / (double) device_count) / 1e9);
             }
         }
         return GGML_STATUS_SUCCESS;
     } else {
-        // Non-split (single device / no -sm row): always compute the graph
-        // inline on the server and return its status -- the stock llama.cpp RPC
-        // behavior. The graph_splits cache + DO_COMPUTATION path is only valid
-        // for the tensor-parallel store-then-execute flow above (the server
-        // stores graphs there); in non-split mode the server never stores, so a
-        // cached DO_COMPUTATION would have nothing to run.
-        std::vector<uint8_t> input;
-        serialize_graph(cgraph, input);
+        // Non-split (single device / no -sm row / pipeline layer-distribution). Stock llama.cpp
+        // RPC re-serializes + re-ships + re-deserializes the WHOLE graph every token. The PP diff
+        // cache (opt-in RPC_PP_DIFF) ships it ONCE per topology, then per-token patches only the
+        // changed tensors of the server's stored graph -- killing PP's dominant per-token cost.
         rpc_msg_graph_compute_rsp response;
         auto                      sock = get_socket(rpc_ctx->endpoint);
-        bool                      status =
-            send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size(), &response, sizeof(response));
+
+        static const bool pp_diff = rpc_opt_enabled() && getenv("RPC_PP_DIFF") != nullptr;
+        if (!pp_diff) {
+            std::vector<uint8_t> input;
+            serialize_graph(cgraph, input);
+            bool status =
+                send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size(), &response, sizeof(response));
+            GGML_ASSERT(status);
+            return (enum ggml_status) response.result;
+        }
+
+        std::vector<rpc_tensor> tensors = build_graph_tensors(cgraph);
+        uint64_t                hash    = rpc_graph_topo_hash(cgraph);
+        static std::unordered_map<std::string, pp_diff_state> pp_states;  // per-server (endpoint) state
+        pp_diff_state &                                       st = pp_states[rpc_ctx->endpoint];
+
+        auto it  = st.pp_cache.find(hash);
+        bool hit = (it != st.pp_cache.end()) && st.last_sent.count(it->second);
+        if (hit) {
+            // HIT: patch only the changed tensors. Payload: graph_number(1) | n_segments(4)=1 |
+            //   n_patches(4) | rpc_view_patch[n_patches]  (the layout patch_views expects).
+            uint8_t                   gnum = it->second;
+            std::vector<rpc_tensor> & prev = st.last_sent[gnum];
+            std::vector<rpc_view_patch> patches;
+            size_t                      n = std::min(tensors.size(), prev.size());
+            for (size_t i = 0; i < n; i++) {
+                if (rpc_tensor_changed(tensors[i], prev[i])) {
+                    rpc_view_patch p;
+                    p.idx = (uint32_t) i;
+                    p.t   = tensors[i];
+                    patches.push_back(p);
+                }
+            }
+            std::vector<uint8_t> payload;
+            uint32_t             n_seg = 1, n_patches = (uint32_t) patches.size();
+            payload.push_back(gnum);
+            payload.insert(payload.end(), (uint8_t *) &n_seg, (uint8_t *) &n_seg + sizeof(n_seg));
+            payload.insert(payload.end(), (uint8_t *) &n_patches, (uint8_t *) &n_patches + sizeof(n_patches));
+            payload.insert(payload.end(), (uint8_t *) patches.data(),
+                           (uint8_t *) patches.data() + (size_t) n_patches * sizeof(rpc_view_patch));
+            bool status =
+                send_rpc_cmd(sock, RPC_CMD_PATCH_COMPUTE, payload.data(), payload.size(), &response, sizeof(response));
+            GGML_ASSERT(status);
+            prev = std::move(tensors);  // the server now holds these values
+            return (enum ggml_status) response.result;
+        }
+
+        // MISS: ship the full graph + a fresh graph_number; the server stores + computes it.
+        uint8_t              gnum = st.next_gnum++;
+        std::vector<uint8_t> input;
+        serialize_graph_from_tensors(cgraph, tensors, input);
+        input.push_back(gnum);  // trailing graph_number
+        bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE_STORE, input.data(), input.size(), &response,
+                                   sizeof(response));
         GGML_ASSERT(status);
+        st.pp_cache[hash]   = gnum;
+        st.last_sent[gnum]  = std::move(tensors);
         return (enum ggml_status) response.result;
     }
 }
@@ -3778,9 +4116,10 @@ class all_reduce_block {
     bool wait_for_completion();
 
   private:
-    // fp16 partials: round-trip this server's own partial (slot self_id) through f16 so it
-    // matches the f16-rounded copies the peers received -> the ordered fold is bit-identical
-    // on every server. No-op unless RPC_AR_FP16 and the reduced tensor is f32.
+    // reduced-precision partials (RPC_AR_PARTIAL): round-trip this server's own partial (slot
+    // self_id) through the chosen wire format so it matches the rounded copies the peers received
+    // -> the ordered fold is bit-identical on every server. No-op when RPC_AR_PARTIAL=f32 (or the
+    // reduced tensor isn't f32).
     void ar_fp16_roundtrip_self() {
         const rpc_ar_fmt fmt = rpc_ar_partial();
         if (fmt == rpc_ar_fmt::f32 || tensor->type != GGML_TYPE_F32 || self_id < 0) {
@@ -3823,18 +4162,18 @@ class all_reduce_block {
     // in ascending device-id order (== ascending contraction-K-slice order == what a single
     // device's contiguous-K matmul reduction does), independent of network arrival order.
     // Without this the F32 sum order races on arrival and N>=3 output varies run-to-run.
-    std::vector<std::vector<uint8_t>> slots;                  //slots[d] = device d's partial bytes
-    int                               self_id       = -1;     //this server's device id (its own slot)
-    size_t                            reduce_nbytes = 0;      //bytes per partial
+    std::vector<std::vector<uint8_t>> slots;               //slots[d] = device d's partial bytes
+    int                               self_id       = -1;  //this server's device id (its own slot)
+    size_t                            reduce_nbytes = 0;   //bytes per partial
     std::unordered_map<uint32_t, std::vector<std::pair<uint8_t, std::vector<uint8_t>>>>
-                                      all_reduce_buffer;       //seq(token) -> (src_id, partial) that arrived before init
+         all_reduce_buffer;                                //seq(token) -> (src_id, partial) that arrived before init
     // TREE all-reduce non-root: await the root's result instead of folding. result_buffer holds
     // a result that arrived before we reached this token's all-reduce (applied on block_init).
-    bool                              await_result = false;
+    bool await_result = false;
     std::unordered_map<uint32_t, std::vector<uint8_t>> result_buffer;  //seq -> root's result (early)
-    uint32_t                          current_seq = 0;         //the sequence (token) this block is reducing now
-    ggml_backend_t                    backend;                //backend type
-    struct ggml_context *             ctx;
+    uint32_t              current_seq = 0;                             //the sequence (token) this block is reducing now
+    ggml_backend_t        backend;                                     //backend type
+    struct ggml_context * ctx;
 };
 
 bool all_reduce_block::wait_for_completion() {
@@ -3855,7 +4194,7 @@ all_reduce_block::all_reduce_block(ggml_tensor * tensor, int op, int device_coun
     num_of_servers(device_count),
     backend(backend) {
     // GGML_LOG_INFO("all_reduce_block called\n");
-    current_seq = seq;  // first all-reduce of this tensor on this server -> token `seq`
+    current_seq  = seq;  // first all-reduce of this tensor on this server -> token `seq`
     //set tensor to be reduced
     this->tensor = tensor;
 
@@ -4052,13 +4391,13 @@ bool all_reduce_block::add(std::vector<uint8_t> & input, uint8_t src_id) {
         if (fmt != rpc_ar_fmt::f32 && tensor->type == GGML_TYPE_F32) {
             int64_t              n = (int64_t) (reduce_nbytes / sizeof(float));
             std::vector<uint8_t> f32(reduce_nbytes);
-            if (fmt == rpc_ar_fmt::f16) {  // arrived as f16 -- upcast to f32 into the slot
+            if (fmt == rpc_ar_fmt::f16) {          // arrived as f16 -- upcast to f32 into the slot
                 ggml_fp16_to_fp32_row((const ggml_fp16_t *) input.data(), (float *) f32.data(), n);
             } else if (fmt == rpc_ar_fmt::e4m3) {  // arrived as fp8 e4m3[n] -- dequantize to f32
                 rpc_e4m3_dequantize((const uint8_t *) input.data(), (float *) f32.data(), n);
-            } else if (fmt == rpc_ar_fmt::i8b) {  // arrived as per-block int8 -- dequantize to f32
+            } else if (fmt == rpc_ar_fmt::i8b) {   // arrived as per-block int8 -- dequantize to f32
                 rpc_i8b_dequantize((const uint8_t *) input.data(), (float *) f32.data(), n);
-            } else {  // i8: arrived as scale(f32) | int8[n] -- dequantize to f32
+            } else {                               // i8: arrived as scale(f32) | int8[n] -- dequantize to f32
                 float scale;
                 memcpy(&scale, input.data(), sizeof(float));
                 rpc_i8_dequantize((const int8_t *) (input.data() + sizeof(float)), scale, (float *) f32.data(), n);
@@ -4116,11 +4455,11 @@ struct tensor_stride {
 };
 
 struct graph_info {
-    uint8_t        graph_number;
-    ggml_cgraph *  cgraph;
-    ggml_context * ctx;
-    uint8_t        signal;
-    graph_info *   next = nullptr;
+    uint8_t                    graph_number;
+    ggml_cgraph *              cgraph;
+    ggml_context *             ctx;
+    uint8_t                    signal;
+    graph_info *               next = nullptr;
     // Diff cache: the ggml_tensor created for the i-th rpc_tensor the client sent for
     // this segment (same index the client patches by). Lets RPC_CMD_PATCH_VIEWS update
     // a stored tensor's view_offs/data in place without re-deserializing the graph.
@@ -4213,6 +4552,9 @@ class rpc_server {
     bool ar_result(std::vector<uint8_t> & input);  // tree all-reduce: non-root applies root's result
     bool do_computation(const rpc_msg_do_computation_req & request);
     bool patch_views(const std::vector<uint8_t> & input);
+    // (PP diff cache) non-split store-then-patch, computed inline (no DO_COMPUTATION / all-reduce):
+    bool graph_compute_store(const std::vector<uint8_t> & input, rpc_msg_graph_compute_rsp & response);
+    bool patch_compute(const std::vector<uint8_t> & input, rpc_msg_graph_compute_rsp & response);
     bool graph_advance(uint8_t graph_number);
     bool load_cached(const rpc_msg_load_cached_req & request, rpc_msg_load_cached_rsp & response);
     bool set_tensor_cache(const std::vector<uint8_t> & input);
@@ -4234,15 +4576,15 @@ class rpc_server {
     // immediately and EVERY all-reduce re-dials its peers (a TCP handshake per
     // peer, per layer, per token) -- the dominant decode cost over WiFi.
     std::vector<std::shared_ptr<socket_t>>                   peer_socks_held;
-    std::vector<std::string>                                 peer_endpoints;     //device id -> endpoint (for tree all-reduce: find the root, device 0)
-    std::vector<std::weak_ptr<socket_t>>                     sockets_listento;   //sockets that the server listen to
-    std::mutex                                               sockets_mutex;      //mutex for adding sockets to the list
-    uint8_t                                                  device_id;          //device id for current server
-    uint8_t                                                  device_count;       //total num of servers
-    std::unordered_map<std::string, all_reduce_block *>      all_reduce_blocks;  //blocks for all reduce
-    std::unordered_map<std::string, uint32_t>                all_reduce_seq;     //per-tensor all-reduce sequence (token)
-    std::mutex                                               block_mutex;        //mutex for adding or checking blocks
-    std::unordered_map<uint8_t, graph_compute_info *> graph_compute_infos;  // map graph_number to graph_compute_info
+    std::vector<std::string> peer_endpoints;  //device id -> endpoint (for tree all-reduce: find the root, device 0)
+    std::vector<std::weak_ptr<socket_t>>                sockets_listento;     //sockets that the server listen to
+    std::mutex                                          sockets_mutex;        //mutex for adding sockets to the list
+    uint8_t                                             device_id;            //device id for current server
+    uint8_t                                             device_count;         //total num of servers
+    std::unordered_map<std::string, all_reduce_block *> all_reduce_blocks;    //blocks for all reduce
+    std::unordered_map<std::string, uint32_t>           all_reduce_seq;       //per-tensor all-reduce sequence (token)
+    std::mutex                                          block_mutex;          //mutex for adding or checking blocks
+    std::unordered_map<uint8_t, graph_compute_info *>   graph_compute_infos;  // map graph_number to graph_compute_info
 };
 
 bool rpc_server::get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response) {
@@ -4362,9 +4704,9 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
         // Diagnostic for the intermittent OOB abort: dump the exact offending tensor
         // (name/op/shape/view_offs/data vs buffer bounds + how far out) before aborting,
         // so a single crash pinpoints which remapped tensor produced the bad pointer.
-        bool oob_overflow = !(tensor->data + tensor_size >= tensor->data);
-        bool oob_below    = tensor->data < buffer_start;
-        bool oob_above    = tensor->data + tensor_size > buffer_start + buffer_size;
+        bool     oob_overflow = !(tensor->data + tensor_size >= tensor->data);
+        bool     oob_below    = tensor->data < buffer_start;
+        bool     oob_above    = tensor->data + tensor_size > buffer_start + buffer_size;
         if (oob_overflow || oob_below || oob_above) {
             GGML_LOG_ERROR(
                 "[deserialize_tensor] OOB '%s' op=%d type=%d ne=[%lld,%lld,%lld,%lld] "
@@ -4775,6 +5117,80 @@ void rpc_server::store_graph_compute_info(uint8_t graph_number, ggml_cgraph * cg
     it->second->tail->by_idx = std::move(by_idx);
 }
 
+// (PP diff cache) Non-split MISS: deserialize the full graph (stock format + a trailing graph_number
+// byte), build the patch index, STORE it (replacing any prior graph under this number), and compute
+// it inline. Unlike the stock non-split graph_compute, the ctx is kept ALIVE for later PATCH_COMPUTE.
+bool rpc_server::graph_compute_store(const std::vector<uint8_t> & input, rpc_msg_graph_compute_rsp & response) {
+    if (input.size() < sizeof(uint32_t) + sizeof(uint8_t)) {
+        return false;
+    }
+    uint32_t n_nodes;
+    memcpy(&n_nodes, input.data(), sizeof(n_nodes));
+    size_t base = sizeof(uint32_t) + (size_t) n_nodes * sizeof(uint64_t);
+    if (input.size() < base + sizeof(uint32_t) + sizeof(uint8_t)) {
+        return false;
+    }
+    const uint64_t * nodes = (const uint64_t *) (input.data() + sizeof(n_nodes));
+    uint32_t         n_tensors;
+    memcpy(&n_tensors, input.data() + base, sizeof(n_tensors));
+    size_t end = base + sizeof(uint32_t) + (size_t) n_tensors * sizeof(rpc_tensor);
+    if (input.size() < end + sizeof(uint8_t)) {
+        return false;
+    }
+    const rpc_tensor * tensors      = (const rpc_tensor *) (input.data() + base + sizeof(n_tensors));
+    uint8_t            graph_number = input[end];  // trailing byte
+
+    size_t buf_size = (ggml_tensor_overhead() * (n_nodes + n_tensors)) + ggml_graph_overhead_custom(n_nodes, false);
+    struct ggml_init_params params = { buf_size, NULL, true };
+    struct ggml_context *   ctx    = ggml_init(params);
+    struct ggml_cgraph *    graph  = ggml_new_graph_custom(ctx, n_nodes, false);
+    graph->n_nodes                 = n_nodes;
+    std::unordered_map<uint64_t, const rpc_tensor *> tensor_ptrs;
+    for (uint32_t i = 0; i < n_tensors; i++) {
+        tensor_ptrs[tensors[i].id] = &tensors[i];
+    }
+    std::unordered_map<uint64_t, ggml_tensor *> tensor_map;
+    try {
+        for (uint32_t i = 0; i < n_nodes; i++) {
+            int64_t id;
+            memcpy(&id, &nodes[i], sizeof(id));
+            graph->nodes[i] = create_node(id, ctx, tensor_ptrs, tensor_map);
+        }
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("[%s] node creation failed: %s\n", __func__, e.what());
+        ggml_free(ctx);
+        return false;
+    }
+    std::vector<ggml_tensor *> by_idx(n_tensors, nullptr);
+    for (uint32_t i = 0; i < n_tensors; i++) {
+        auto mit = tensor_map.find(tensors[i].id);
+        if (mit != tensor_map.end()) {
+            by_idx[i] = mit->second;
+        }
+    }
+    auto old = graph_compute_infos.find(graph_number);  // replace any prior graph under this number
+    if (old != graph_compute_infos.end()) {
+        delete old->second;
+        graph_compute_infos.erase(old);
+    }
+    store_graph_compute_info(graph_number, graph, ctx, /*signal=*/0, std::move(by_idx));
+    response.result = ggml_backend_graph_compute(backend, graph);  // compute the just-stored graph inline
+    return true;                                                   // ctx stays alive in graph_compute_infos
+}
+
+// (PP diff cache) Non-split HIT: patch the stored graph's changed tensors (by index), compute inline.
+bool rpc_server::patch_compute(const std::vector<uint8_t> & input, rpc_msg_graph_compute_rsp & response) {
+    if (input.empty() || !patch_views(input)) {  // patch_views reads graph_number = input[0]
+        return false;
+    }
+    auto it = graph_compute_infos.find(input[0]);
+    if (it == graph_compute_infos.end() || it->second->head == nullptr) {
+        return false;
+    }
+    response.result = ggml_backend_graph_compute(backend, it->second->head->cgraph);
+    return true;
+}
+
 // Store a token's segment-graphs delivered in ONE round-trip:
 //   n_segments(4) | per segment: seg_len(4) | seg_data (exact per-segment payload).
 // Each segment is stored exactly as the per-segment GRAPH_COMPUTE path would.
@@ -5003,7 +5419,7 @@ bool rpc_server::patch_views(const std::vector<uint8_t> & input) {
         GGML_LOG_ERROR("[%s] graph number %d not found\n", __func__, graph_number);
         return false;
     }
-    graph_info * info     = it->second->head;
+    graph_info * info      = it->second->head;
     int          n_patched = 0;
     for (uint32_t s = 0; s < n_segments; s++) {
         if (off + sizeof(uint32_t) > input.size()) {
@@ -5019,8 +5435,9 @@ bool rpc_server::patch_views(const std::vector<uint8_t> & input) {
         off += (size_t) n_patches * sizeof(rpc_view_patch);
 
         // (#3 prefetch) build the stride table from this real patch so a later GRAPH_ADVANCE can
-        // reproduce the next token with no payload. Off (RPC_PREFETCH unset) = plain patch apply.
-        static const bool srv_prefetch = getenv("RPC_PREFETCH") != nullptr;
+        // reproduce the next token with no payload. DEFAULT ON (opt out RPC_NO_PREFETCH) = matches
+        // the client gate; RPC_NO_OPT or RPC_NO_PREFETCH = plain patch apply.
+        static const bool srv_prefetch = rpc_opt_enabled() && getenv("RPC_NO_PREFETCH") == nullptr;
         if (srv_prefetch && info) {  // (re)build the stride table for this segment from this patch
             info->strides.assign(info->by_idx.size(), tensor_stride{});
             info->last_patched.clear();
@@ -5065,8 +5482,8 @@ bool rpc_server::patch_views(const std::vector<uint8_t> & input) {
     }
     static const bool dbg_diffcache = getenv("RPC_DBG_DIFFCACHE") != nullptr;
     if (dbg_diffcache) {
-        GGML_LOG_INFO("[rpc-diffcache-srv] gnum=%d patched %d tensors over %u segments\n",
-                      graph_number, n_patched, n_segments);
+        GGML_LOG_INFO("[rpc-diffcache-srv] gnum=%d patched %d tensors over %u segments\n", graph_number, n_patched,
+                      n_segments);
     }
     return true;
 }
@@ -5099,9 +5516,8 @@ bool rpc_server::graph_advance(uint8_t graph_number) {
             for (size_t j = 0; j < GGML_MAX_OP_PARAMS / sizeof(int32_t); j++) {
                 t->op_params[j] = (int32_t) ((int64_t) t->op_params[j] + st.op_params[j]);
             }
-            t->flags     = (int32_t) ((int64_t) t->flags + st.flags);
-            t->data      = reinterpret_cast<void *>(
-                (uint64_t) ((int64_t) reinterpret_cast<uint64_t>(t->data) + st.data));
+            t->flags = (int32_t) ((int64_t) t->flags + st.flags);
+            t->data  = reinterpret_cast<void *>((uint64_t) ((int64_t) reinterpret_cast<uint64_t>(t->data) + st.data));
             t->view_offs = (size_t) ((int64_t) t->view_offs + st.view_offs);
             n_adv++;
         }
@@ -5229,13 +5645,13 @@ bool rpc_server::do_computation(const rpc_msg_do_computation_req & request) {
             // build this server's partial into the reused buffer: seq(4) | src_id(4) |
             // name(GGML_MAX_NAME) | data. seq tags the token (a peer running ahead is buffered
             // by seq, not misapplied); src_id lets the receiver fold partials in a fixed order.
-            const size_t  ar_hdr = sizeof(uint32_t) + sizeof(uint32_t) + sizeof(tensor_to_all_reduce->name);
-            const size_t  nbytes = ggml_nbytes(tensor_to_all_reduce);
-            const int64_t nelem  = ggml_nelements(tensor_to_all_reduce);
+            const size_t     ar_hdr  = sizeof(uint32_t) + sizeof(uint32_t) + sizeof(tensor_to_all_reduce->name);
+            const size_t     nbytes  = ggml_nbytes(tensor_to_all_reduce);
+            const int64_t    nelem   = ggml_nelements(tensor_to_all_reduce);
             // narrow only f32 partials (the row-split outputs are f32); else ship raw bytes.
-            const rpc_ar_fmt fmt = (tensor_to_all_reduce->type == GGML_TYPE_F32) ? ar_fmt_sel : rpc_ar_fmt::f32;
-            const size_t  payload = rpc_ar_payload_bytes(fmt, nelem, nbytes);
-            add_data.resize(ar_hdr + payload);  // reused; every byte set below
+            const rpc_ar_fmt fmt     = (tensor_to_all_reduce->type == GGML_TYPE_F32) ? ar_fmt_sel : rpc_ar_fmt::f32;
+            const size_t     payload = rpc_ar_payload_bytes(fmt, nelem, nbytes);
+            add_data.resize(ar_hdr + payload);                // reused; every byte set below
             uint32_t src_id = device_id;
             uint32_t seq    = ++all_reduce_seq[tensor_name];  // Nth reduce of this name == token N
             memcpy(add_data.data(), &seq, sizeof(uint32_t));
@@ -5257,8 +5673,8 @@ bool rpc_server::do_computation(const rpc_msg_do_computation_req & request) {
             } else if (fmt == rpc_ar_fmt::i8) {  // ship scale(f32) | int8[n]
                 ar_fp32_tmp.resize((size_t) nelem);
                 ggml_backend_tensor_get(tensor_to_all_reduce, ar_fp32_tmp.data(), 0, nbytes);
-                const float scale = rpc_i8_quantize(ar_fp32_tmp.data(),
-                                                    (int8_t *) (add_data.data() + ar_hdr + sizeof(float)), nelem);
+                const float scale =
+                    rpc_i8_quantize(ar_fp32_tmp.data(), (int8_t *) (add_data.data() + ar_hdr + sizeof(float)), nelem);
                 memcpy(add_data.data() + ar_hdr, &scale, sizeof(float));
             } else {
                 ggml_backend_tensor_get(tensor_to_all_reduce, add_data.data() + ar_hdr, 0, nbytes);
@@ -5340,8 +5756,7 @@ bool rpc_server::do_computation(const rpc_msg_do_computation_req & request) {
                 std::vector<std::thread> bcast;
                 for (size_t k = 0; k < peer_socks.size(); ++k) {
                     bcast.emplace_back([&, k]() {
-                        if (!send_rpc_cmd_oneway(peer_socks[k], RPC_CMD_ALL_REDUCE, add_data.data(),
-                                                 add_data.size())) {
+                        if (!send_rpc_cmd_oneway(peer_socks[k], RPC_CMD_ALL_REDUCE, add_data.data(), add_data.size())) {
                             GGML_LOG_INFO("failed to send all_reduce command to %s\n", peer_names[k].c_str());
                         }
                     });
@@ -5371,8 +5786,7 @@ bool rpc_server::do_computation(const rpc_msg_do_computation_req & request) {
                         sock                        = socket_connect(host.c_str(), port);
                         sockets_connectto[endpoint] = sock;
                     }
-                    if (sock &&
-                        !send_rpc_cmd(sock, RPC_CMD_ALL_REDUCE, add_data.data(), add_data.size(), nullptr, 0)) {
+                    if (sock && !send_rpc_cmd(sock, RPC_CMD_ALL_REDUCE, add_data.data(), add_data.size(), nullptr, 0)) {
                         GGML_LOG_INFO("failed to send all_reduce command to %s\n", sock_weak.first.c_str());
                     }
                 }
@@ -5514,12 +5928,12 @@ bool rpc_server::all_reduce(std::vector<uint8_t> & input) {
 
     //check whether the matched all reduce block exists
     block_mutex.lock();
-    auto it = all_reduce_blocks.find(tensor_name);
+    auto              it     = all_reduce_blocks.find(tensor_name);
     static const bool dbg_ar = getenv("RPC_DBG_AR") != nullptr;
     if (dbg_ar) {
         GGML_LOG_INFO("[ar-recv] %s seq=%u cur=%u exists=%d init=%d\n", tensor_name.c_str(), seq,
-                      it == all_reduce_blocks.end() ? 0 : it->second->get_current_seq(),
-                      it != all_reduce_blocks.end(), it != all_reduce_blocks.end() && it->second->is_init());
+                      it == all_reduce_blocks.end() ? 0 : it->second->get_current_seq(), it != all_reduce_blocks.end(),
+                      it != all_reduce_blocks.end() && it->second->is_init());
     }
     if (it == all_reduce_blocks.end()) {
         // no block yet -> buffer this partial under its sequence until we reach it
@@ -5773,6 +6187,36 @@ static void rpc_serve_client(rpc_server & server, sockfd_t sockfd, size_t free_m
                     }
                     rpc_msg_graph_compute_rsp response;
                     if (!server.graph_compute_batch(input, response)) {
+                        return;
+                    }
+                    if (!send_msg(sockfd, &response, sizeof(response))) {
+                        return;
+                    }
+                    break;
+                }
+            case RPC_CMD_GRAPH_COMPUTE_STORE:  // (PP diff cache) non-split: deserialize + store + compute inline
+                {
+                    std::vector<uint8_t> input;
+                    if (!recv_msg(sockfd, input)) {
+                        return;
+                    }
+                    rpc_msg_graph_compute_rsp response;
+                    if (!server.graph_compute_store(input, response)) {
+                        return;
+                    }
+                    if (!send_msg(sockfd, &response, sizeof(response))) {
+                        return;
+                    }
+                    break;
+                }
+            case RPC_CMD_PATCH_COMPUTE:  // (PP diff cache) non-split: patch stored graph + compute inline
+                {
+                    std::vector<uint8_t> input;
+                    if (!recv_msg(sockfd, input)) {
+                        return;
+                    }
+                    rpc_msg_graph_compute_rsp response;
+                    if (!server.patch_compute(input, response)) {
                         return;
                     }
                     if (!send_msg(sockfd, &response, sizeof(response))) {
