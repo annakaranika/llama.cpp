@@ -1,0 +1,7 @@
+timestamp  : 20260611_163608
+op         : MUL_MAT
+threads    : 4
+ips_file   : rpi-automation/dprgnet_ips.txt
+remote_bin : ~/llama.cpp/build-rpc/bin/test-backend-ops
+local_hash : 7f78f9c4
+devices    : 16

@@ -1,0 +1,3 @@
+name,ip,status,model,cores,mem_kb,git_hash,temp_before_c,temp_after_c,clock_arm_hz,throttled,throttled_after
+rpi1,128.174.61.160,ok,"Raspberry Pi 4 Model B Rev 1.1",4,1891120,7f78f9c4,53.0,81.3,1500398464,0xe0000,0xe0000
+rpi2,128.174.61.133,ok,"Raspberry Pi 4 Model B Rev 1.1",4,1890060,7f78f9c4,48.7,81.8,1500345728,0xe0000,0xe0000

@@ -1,0 +1,19 @@
+device,model,cores,mem_gb,R_bw_GBps,q4_K_decode_gflops,q4_K_peak_gflops,q4_K_prefill512_gflops,temp_before_c,temp_after_c,throttled_after
+rpi1,Raspberry Pi 4 Model B,4,,3.503,12.79,16.99,11.26,,,
+rpi2,Raspberry Pi 4 Model B,4,,3.585,12.84,18.36,13.82,,,
+rpi3,Raspberry Pi 4 Model B Rev 1.1,4,1.94,3.583,12.9,18.49,15.3,46.7,81.3,0xe0000
+rpi4,Raspberry Pi 4 Model B Rev 1.1,4,1.94,3.586,12.88,18.42,14.04,49.1,80.8,0xe0000
+rpi5,Raspberry Pi 4 Model B Rev 1.1,4,1.94,3.582,12.9,18.18,14.6,49.1,81.8,0xe0000
+rpi6,Raspberry Pi 4 Model B Rev 1.1,4,1.94,3.613,12.87,18.4,12.62,49.6,81.8,0xe0008
+rpi7,Raspberry Pi 4 Model B Rev 1.1,4,1.94,3.536,12.68,17.97,10.73,53.5,84.2,0xe0008
+rpi8,Raspberry Pi 4 Model B Rev 1.1,4,1.94,3.603,12.86,18.48,15.76,46.7,81.3,0xe0000
+rpi9,Raspberry Pi 4 Model B Rev 1.1,4,1.94,3.603,12.83,18.64,13.13,49.1,81.8,0xe0008
+rpi13,Raspberry Pi 4 Model B Rev 1.1,4,1.94,3.585,12.93,17.88,11.97,49.6,82.7,0xe0008
+rpi15,Raspberry Pi 4 Model B Rev 1.1,4,1.94,3.569,12.87,18.52,13.73,48.2,82.3,0xe0000
+rpi16,Raspberry Pi 4 Model B Rev 1.1,4,1.94,3.591,12.75,18.76,15.38,47.7,80.3,0xe0000
+rpi17,Raspberry Pi 4 Model B Rev 1.1,4,1.94,3.559,12.82,18.5,13.11,49.6,82.7,0xe0000
+rpi19,Raspberry Pi 4 Model B Rev 1.1,4,1.94,3.593,12.81,18.89,15.84,47.7,80.8,0xe0000
+rpi20,Raspberry Pi 4 Model B Rev 1.1,4,1.94,3.599,12.91,18.49,16.95,46.7,79.8,0xe0000
+rpi22,Raspberry Pi 4 Model B Rev 1.1,4,1.94,3.597,12.86,18.33,13.83,48.2,81.8,0xe0008
+rpi24,Raspberry Pi 4 Model B Rev 1.1,4,1.94,3.606,12.86,18.79,16.89,47.2,79.3,0xe0000
+rpi25,Raspberry Pi 4 Model B Rev 1.1,4,1.94,3.607,12.86,18.63,17.35,46.2,78.8,0x80000

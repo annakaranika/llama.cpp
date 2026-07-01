@@ -1,0 +1,3 @@
+name,ip,status,model,cores,mem_kb,git_hash,temp_before_c,temp_after_c,clock_arm_hz,throttled,throttled_after
+rpi1,128.174.61.160,unreachable,"",,,,,,,,
+rpi2,128.174.61.133,unreachable,"",,,,,,,,

@@ -1,0 +1,19 @@
+name,ip,status,model,cores,mem_kb,git_hash,temp_before_c,temp_after_c,clock_arm_hz,throttled,throttled_after
+rpi1,128.174.61.160,ok,"Raspberry Pi 4 Model B Rev 1.1",4,1891120,7f78f9c4,53.0,81.3,1500398464,0x0,0xe0000
+rpi2,128.174.61.133,ok,"Raspberry Pi 4 Model B Rev 1.1",4,1890060,7f78f9c4,48.7,81.8,1500345728,0x0,0xe0000
+rpi3,128.174.61.163,ok,"Raspberry Pi 4 Model B Rev 1.1",4,1890060,7f78f9c4,46.7,81.3,1000265600,0x0,0xe0000
+rpi4,128.174.61.134,ok,"Raspberry Pi 4 Model B Rev 1.1",4,1890060,7f78f9c4,49.1,80.8,1500398464,0x0,0xe0000
+rpi5,128.174.61.164,ok,"Raspberry Pi 4 Model B Rev 1.1",4,1890060,7f78f9c4,49.1,81.8,1500345728,0x0,0xe0000
+rpi6,128.174.61.135,ok,"Raspberry Pi 4 Model B Rev 1.1",4,1890060,7f78f9c4,49.6,81.8,1500345728,0x0,0xe0008
+rpi7,128.174.61.172,ok,"Raspberry Pi 4 Model B Rev 1.1",4,1891120,7f78f9c4,53.5,84.2,1500398464,0x0,0xe0008
+rpi8,128.174.61.165,ok,"Raspberry Pi 4 Model B Rev 1.1",4,1890060,7f78f9c4,46.7,81.3,900228544,0x0,0xe0000
+rpi9,128.174.61.166,ok,"Raspberry Pi 4 Model B Rev 1.1",4,1890060,7f78f9c4,49.1,81.8,1500345728,0x0,0xe0008
+rpi13,128.174.61.131,ok,"Raspberry Pi 4 Model B Rev 1.1",4,1890060,7f78f9c4,49.6,82.7,1500398464,0x0,0xe0008
+rpi15,128.174.61.167,ok,"Raspberry Pi 4 Model B Rev 1.1",4,1890060,7f78f9c4,48.2,82.3,1500345728,0x0,0xe0000
+rpi16,128.174.61.168,ok,"Raspberry Pi 4 Model B Rev 1.1",4,1890060,7f78f9c4,47.7,80.3,1500398464,0x0,0xe0000
+rpi17,128.174.61.158,ok,"Raspberry Pi 4 Model B Rev 1.1",4,1890060,7f78f9c4,49.6,82.7,1500398464,0x0,0xe0000
+rpi19,128.174.61.169,ok,"Raspberry Pi 4 Model B Rev 1.1",4,1890060,7f78f9c4,47.7,80.8,1500345728,0x0,0xe0000
+rpi20,128.174.61.170,ok,"Raspberry Pi 4 Model B Rev 1.1",4,1890060,7f78f9c4,46.7,79.8,1500398464,0x0,0xe0000
+rpi22,128.174.61.157,ok,"Raspberry Pi 4 Model B Rev 1.1",4,1890060,7f78f9c4,48.2,81.8,1500345728,0x0,0xe0008
+rpi24,128.174.61.171,ok,"Raspberry Pi 4 Model B Rev 1.1",4,1890060,7f78f9c4,47.2,79.3,1500398464,0x0,0xe0000
+rpi25,128.174.61.156,ok,"Raspberry Pi 4 Model B Rev 1.1",4,1890060,7f78f9c4,46.2,78.8,1500345728,0x0,0x80000

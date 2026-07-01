@@ -1,0 +1,3 @@
+device,model,cores,mem_gb,R_bw_GBps,q4_0_decode_gflops,q4_0_peak_gflops,q4_0_prefill512_gflops,temp_before_c,temp_after_c,throttled_after
+rpi1,Raspberry Pi 4 Model B,4,,3.503,12.56,15.98,10.84,,,
+rpi2,Raspberry Pi 4 Model B,4,,3.585,12.57,17.57,13.37,,,
