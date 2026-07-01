@@ -4876,8 +4876,13 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
     }
 
     if (result->buffer) {
-        // require that the tensor data does not go beyond the buffer end
-        uint64_t tensor_size  = (uint64_t) ggml_nbytes(result);
+        // require that the tensor data does not go beyond the buffer end.
+        // Empty tensors (any ne==0 -- e.g. a 0-token V-cache write view on a
+        // pruned/warmup ubatch, which the split path intentionally carries through)
+        // occupy no bytes, but ggml_nbytes UNDERFLOWS for them ((ne[i]-1)*nb[i]
+        // wraps to ~2^64), tripping this OOB assert. Treat their size as 0 -- they
+        // carry no data and the server skips their compute.
+        uint64_t tensor_size  = ggml_is_empty(result) ? 0 : (uint64_t) ggml_nbytes(result);
         uint64_t buffer_start = (uint64_t) ggml_backend_buffer_get_base(result->buffer);
         uint64_t buffer_size  = (uint64_t) ggml_backend_buffer_get_size(result->buffer);
         // Diagnostic for the intermittent OOB abort: dump the exact offending tensor

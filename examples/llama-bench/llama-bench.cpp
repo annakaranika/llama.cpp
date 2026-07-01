@@ -724,6 +724,18 @@ struct cmd_params_instance {
                         exit(1);
                     }
                 }
+                // After registering all servers, create the server<->server peer
+                // connections so tensor-parallel (-sm row) all-reduce partials can cross
+                // directly between backends. llama-bench added the RPC devices but never
+                // triggered peer setup (llama-cli does this via add_rpc_devices), so every
+                // all-reduce timed out ("lost partial") on -sm row.
+                typedef void (*ggml_backend_rpc_create_peer_connection_t)();
+                ggml_backend_rpc_create_peer_connection_t create_peer_fn =
+                    (ggml_backend_rpc_create_peer_connection_t) ggml_backend_reg_get_proc_address(
+                        rpc_reg, "ggml_backend_rpc_create_peer_connection");
+                if (create_peer_fn) {
+                    create_peer_fn();
+                }
                 devices.push_back(nullptr);
                 mparams.devices = devices.data();
             }
