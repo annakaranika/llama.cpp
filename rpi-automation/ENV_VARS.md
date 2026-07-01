@@ -38,6 +38,7 @@ output appears). `ablate.sh` + `rpc_profiles.conf` apply a profile to all nodes 
 | Var | Default | Effect | Set on |
 |---|---|---|---|
 | `RPC_NO_PERSIST_BUFFERS` | **ON** by default (opt-out) | Default-on win: reuse a split tensor's server buffer **across tokens** instead of re-allocating per token. Kills ~1500 `ALLOC_BUFFER` + ~1500 `get_base` RPCs/token (the dominant ~2.2 s build cost). **HW: build 3.3 s → 0.005 s, decode 0.13 → 0.56 t/s (4.3×), byte-identical**; also stabilizes `data` ptrs so prefetch prediction recovers 15% → 100%. Stacks with int8b → 0.79 t/s (6.1×). Set `=1` to disable. Client-side. | client |
+| `RPC_NO_POOL` | **ON** by default (opt-out) | Default-on win: cross-layer sub-allocation. `-sm row` replicates every activation full-size on each non-main device; instead of one server buffer per activation (all layers held at once → ~18 GB VSZ / ~1.2 GB RSS for a ~1440-tok prefill → OOM on 1.8 GB Pis), each device uses ONE pool buffer per compute buffer at gallocr's reuse offsets = the peak working set. **HW N=4: x120 (~1440 tok) 1205 → 475 MB/server, byte-identical, went from OOM-killed to fitting**. Subsumes `RPC_NO_PERSIST_BUFFERS` for activations. Set `=1` to disable. Client-side. | client |
 | `RPC_NO_WEIGHT_CACHE` | unset (**cache ON**) | Set=1 → disable the local weight cache (re-upload weights each load). Cache is on by default when opts on. | server |
 | `RPC_WEIGHT_CACHE_DIR` | `$HOME/.cache/llama-rpc-weights` | Where the weight cache lives (auto-mkdir). | server |
 | `RPC_SERIAL_UPLOAD` | unset (**concurrent**) | Set=1 → serial (not threaded) buffer alloc/upload/download. Diagnostic; concurrent is the default when opts on. | both |
@@ -65,5 +66,5 @@ output appears). `ablate.sh` + `rpc_profiles.conf` apply a profile to all nodes 
 - **optimized** (default path, no vars): now **includes persist + prefetch + oneway** (the byte-identical
   6.1×-stack wins) — they graduated from opt-in to default-on. Just run with no env vars.
 - **+ reduced-precision all-reduce** (opt-in tradeoff): add `RPC_AR_PARTIAL=int8b` (or `fp16` exact-enough)
-- **ablation** (turn one default-on win OFF): `RPC_NO_PERSIST_BUFFERS=1` / `RPC_NO_PREFETCH=1` / `RPC_NO_GRAPH_ONEWAY=1`
+- **ablation** (turn one default-on win OFF): `RPC_NO_PERSIST_BUFFERS=1` / `RPC_NO_PREFETCH=1` / `RPC_NO_GRAPH_ONEWAY=1` / `RPC_NO_POOL=1`
 - **profiling a run**: `RPC_DBG_TIMING=1` on the client

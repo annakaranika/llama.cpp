@@ -326,7 +326,7 @@ static std::mutex g_persist_mtx;
 static std::map<std::pair<const void *, int>, std::pair<ggml_backend_rpc_buffer_context *, size_t>> g_persist_buf;
 static std::unordered_set<const void *>                                                             g_persist_ctxs;
 
-// (activation pool, RPC_POOL opt-in) Cross-layer sub-allocation. Persist (above) still allocates ONE
+// (activation pool, DEFAULT ON; opt out RPC_NO_POOL) Cross-layer sub-allocation. Persist (above) allocated ONE
 // server buffer per activation (~1500/token) -- fine for SPEED (reused across tokens) but each device
 // then holds EVERY layer's activations at once (~18 GB for a long prefill), because the per-tensor
 // alloc bypasses gallocr's cross-layer reuse. gallocr already computed a reuse plan: the compute
@@ -335,7 +335,7 @@ static std::unordered_set<const void *>                                         
 // gallocr peak, and point every replicated activation at pool_base + its gallocr offset (extra->
 // data_off). Cuts each replicated device from the all-layer SUM to the peak (~64x). Pool is reused
 // across tokens (resized only if the buffer grows) and freed when the compute buffer is freed.
-static const bool g_act_pool_on = rpc_opt_enabled() && getenv("RPC_POOL") != nullptr;
+static const bool g_act_pool_on = rpc_opt_enabled() && getenv("RPC_NO_POOL") == nullptr;
 static std::mutex g_act_pool_mtx;
 static std::map<std::pair<const void *, int>, std::pair<ggml_backend_rpc_buffer_context *, size_t>> g_act_pool;
 
