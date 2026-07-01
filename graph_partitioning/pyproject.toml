@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llm-iot-sim"
+version = "0.1.0"
+requires-python = ">=3.11"
+# Core runtime deps (keep small; make heavy/compiled ones optional)
+dependencies = [
+  "networkx>=3.2,<4",
+  "matplotlib>=3.7",
+  "numpy>=1.24",
+  "pulp>=2.8",          # ILP modelling for the Alpa intra-op policy
+  "highspy>=1.7",       # HiGHS MILP solver (native arm64/x86 wheels)
+]
+
+# Optional extras (install with: pip install -e ".[metis,dev]")
+[project.optional-dependencies]
+metis = ["PyMetis>=2024.1"]   # compiled; make optional to avoid install pain
+dev = [
+  "pytest",
+  "pylint",
+  "ruff",
+  "mypy",
+  "networkx",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["graph_partitioning*"]
+exclude = ["tests*", "docs*"]
