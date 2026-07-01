@@ -796,16 +796,22 @@ static rpc_tensor split_serialize_tensor(const ggml_tensor * tensor, const ggml_
     rpc_tensor result;
     result.id   = reinterpret_cast<uint64_t>(tensor);
     result.type = tensor->type;
-    if (extra) {
-        ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *) extra->buffer_ctx[device_id];
+    ggml_backend_rpc_buffer_context * ctx =
+        extra ? (ggml_backend_rpc_buffer_context *) extra->buffer_ctx[device_id] : nullptr;
+    if (ctx) {
         result.buffer = ctx->remote_ptr;  //use remote_ptr to find the exact buffer on the remote server
-        result.data   = reinterpret_cast<uint64_t>(
-            ggml_backend_rpc_buffer_context_get_base(reinterpret_cast<ggml_backend_rpc_buffer_context *>(ctx)));
+        result.data   = reinterpret_cast<uint64_t>(ggml_backend_rpc_buffer_context_get_base(ctx));
     } else {
+        // A tensor can reach the split buffer with no `extra`, or with no per-device
+        // buffer_ctx[device_id]. The old code logged this but then unconditionally
+        // dereferenced `extra->split_dim` below -> SIGSEGV during model load (this is
+        // the llama-bench -sm row crash). Fall through to the non-split path instead.
         result.buffer = 0;
-        GGML_LOG_INFO("Error: tensor %s has no extra info for split\n", tensor->name);
+        result.data   = 0;
+        GGML_LOG_INFO("Error: tensor %s missing %s for split; serializing non-split\n",
+                      tensor->name, extra ? "device buffer_ctx" : "extra");
     }
-    int split_dim = extra->split_dim;
+    int split_dim = extra ? extra->split_dim : -1;
     if (split_dim == 1) {
         int row_low  = extra->rows[device_id].first;
         int row_high = extra->rows[device_id].second;
@@ -840,7 +846,12 @@ static rpc_tensor split_serialize_tensor(const ggml_tensor * tensor, const ggml_
             }
         }
     } else {
-        GGML_LOG_INFO("[%s] split serialize tensor with non-split tensor %s\n", __func__, tensor->name);
+        // non-split (or extra-less) tensor: copy dimensions straight through so the
+        // remote gets a valid descriptor instead of uninitialized ne/nb.
+        for (uint32_t i = 0; i < GGML_MAX_DIMS; i++) {
+            result.ne[i] = tensor->ne[i];
+            result.nb[i] = tensor->nb[i];
+        }
     }
     result.op = tensor->op;
     for (uint32_t i = 0; i < GGML_MAX_OP_PARAMS / sizeof(int32_t); i++) {
