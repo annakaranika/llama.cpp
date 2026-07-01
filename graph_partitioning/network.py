@@ -91,6 +91,21 @@ class Network:
     # (Mac/AP) relays; on-mesh RPi coordinators are unaffected. Default False =
     # original behavior. (Does NOT reproduce the pathological n=16 saturation cliff.)
     hub_bw_share: bool = False
+    # Shared-medium airtime contention. On a single 802.11 channel only one radio
+    # transmits at a time, so the concurrent transfers within an all-reduce do NOT
+    # run in parallel — yet the ring/all-to-all base models assume they do (per-step
+    # `max` over links) and the centralized model only serializes through the leader.
+    # This lumps the shared-medium slowdown (airtime serialization + DCF backoff and
+    # collisions that grow with the number of contending stations) into a single
+    # multiplicative factor applied to the PEER-TO-PEER collective cost (ring /
+    # all-to-all), whose base model wrongly assumes the g concurrent transfers run on
+    # independent parallel links. The centralized (client-server) path already
+    # serializes every partial through the leader, so it is left unscaled.
+    #     airtime_factor(g) = g ** airtime_contention_exp     (g = # participants)
+    # 0.0 reproduces the original parallel-links behavior; ~1.0 approximates a fully
+    # serialized shared channel. Calibrated from the measured -sm row N-sweep — see
+    # graph_partitioning/tests/root/calibrate_airtime.py.
+    airtime_contention_exp: float = 0.0
 
     def set_comm_config(
         self,
@@ -392,9 +407,16 @@ class Network:
     ) -> float:
         """
         Ring all-reduce time accounting for actual pairwise link characteristics.
-        In a ring, each device sends to its next neighbor in the ring.
-        Following this model:
+        In a ring, each device sends to its next neighbor:
             time ≈ 2 * (N - 1) / N * (bytes / bw) + (N - 1) * RTT
+
+        The bandwidth (airtime) component is scaled by the shared-medium contention
+        factor (``_airtime_factor``): on one 802.11 channel the N concurrent ring
+        sends within a step do not run in parallel, so their airtime serializes with
+        the number of contending stations. The latency (RTT) component is NOT scaled
+        — propagation/round-trip delay is unaffected by channel sharing. Separating
+        the two keeps the term correct for both bandwidth-bound prefill (large
+        payloads) and RTT-bound decode (tiny 8KB payloads, ~44 reduces/token).
 
         TODO: take into consideration the case that splits are not the same number
         between attention and FFN blocks.
@@ -405,52 +427,63 @@ class Network:
         if n <= 1:
             return 0.0
 
-        # Build ring: device[i] -> device[(i+1) % n]
-        total_time = 0.0
-
-        # Reduce-scatter phase: (n-1) steps, each step uses one ring link
-        for _ in range(n - 1):
-            # Find the bottleneck link for this step (all devices send simultaneously)
-            step_time = 0.0
+        chunk_size = bytes_size / n
+        # 2*(n-1) steps total (reduce-scatter + all-gather). Each step every device
+        # sends one chunk to its ring neighbor; the step is paced by the bottleneck
+        # link, tracked as separate bandwidth (airtime) and latency (RTT) parts.
+        total_bw = 0.0
+        total_lat = 0.0
+        for _ in range(2 * (n - 1)):
+            step_bw = 0.0
+            step_lat = 0.0
             for i in range(n):
                 sender = servers[i].name
                 receiver = servers[(i + 1) % n].name
+                bw_mbps, rtt_ms = self.link(sender, receiver)
+                if math.isinf(bw_mbps):
+                    continue  # co-located ring neighbor: free
+                bw_t = chunk_size * 8.0 / (bw_mbps * 1e6 * self.rpc_efficiency)
+                lat_t = rtt_ms / 2 / 1000.0 + self.msg_overhead_s
+                if bw_t + lat_t > step_bw + step_lat:  # bottleneck link this step
+                    step_bw, step_lat = bw_t, lat_t
+            total_bw += step_bw
+            total_lat += step_lat
 
-                # Each step sends 1/n of the data
-                chunk_size = bytes_size / n
-                link_time = self.xfer_time_s(chunk_size, sender, receiver)
-                step_time = max(step_time, link_time)  # Bottleneck determines step time
+        return total_bw * self._airtime_factor(n) + total_lat
 
-            total_time += step_time
+    def _airtime_factor(self, n_participants: int) -> float:
+        """Shared-medium contention multiplier for a collective over
+        ``n_participants`` stations (see ``airtime_contention_exp``). Returns 1.0
+        when disabled or with a single participant."""
+        if self.airtime_contention_exp == 0.0 or n_participants <= 1:
+            return 1.0
+        return float(n_participants) ** self.airtime_contention_exp
 
-        # All-gather phase: (n-1) more steps
-        for _ in range(n - 1):
-            step_time = 0.0
-            for i in range(n):
-                sender = servers[i].name
-                receiver = servers[(i + 1) % n].name
-
-                # Each step sends 1/n of the data
-                chunk_size = bytes_size / n
-                link_time = self.xfer_time_s(chunk_size, sender, receiver)
-                step_time = max(step_time, link_time)
-
-            total_time += step_time
-
-        return total_time
-
-    def allreduce_communication_cost(  # pylint: disable=too-many-locals
+    def allreduce_communication_cost(
         self,
         tensor_size_bytes: float,
         servers: Optional[List[Device]] = None,
         **kwargs,
     ) -> float:
-        """Compute communication cost based on the model type and actual pairwise links."""
+        """All-reduce cost by comm model / P2P policy. The shared-medium airtime-
+        contention factor (``_airtime_factor``) is applied INSIDE the peer-to-peer
+        collectives (ring / all-to-all), scaling only their bandwidth (airtime)
+        component; it is 1.0 by default (``airtime_contention_exp = 0``). The
+        centralized path is unscaled — it already serializes partials through the
+        leader, and its RTT terms model coordination latency directly."""
         if servers is None:
             servers = self.servers
         if len(servers) <= 1:
             return 0.0
+        return self._allreduce_base_cost(tensor_size_bytes, servers, **kwargs)
 
+    def _allreduce_base_cost(  # pylint: disable=too-many-locals
+        self,
+        tensor_size_bytes: float,
+        servers: List[Device],
+        **kwargs,
+    ) -> float:
+        """Base (contention-free) all-reduce cost by comm model / P2P policy."""
         communication_model = kwargs.get(
             "communication_model", self.communication_model
         )
@@ -485,7 +518,9 @@ class Network:
                 total_time = max(
                     total_time, max_send_time
                 )  # Each device sends in parallel
-            return total_time
+            # All-to-all ships full tensors (bandwidth-heavy) — scale by the
+            # shared-medium airtime factor (approximated over the whole send here).
+            return total_time * self._airtime_factor(len(servers))
 
         if peer2peer_policy == PeerToPeerPolicy.HIERARCHICAL:
             raise NotImplementedError("Hierarchical all-reduce not implemented yet.")
