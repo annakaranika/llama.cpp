@@ -141,6 +141,9 @@ enum rpc_cmd {
     RPC_CMD_PATCH_COMPUTE,        // (PP diff cache) non-split: patch the stored graph + compute inline (HIT)
     RPC_CMD_ADVANCE_COMPUTE,  // (PP diff cache + prefetch) non-split: advance stored graph by cached stride + compute inline (predicted HIT, no patch payload)
     RPC_CMD_SEND_TO_PEER,  // direct pipeline handoff: the SRC server pushes a tensor straight into the DST peer's buffer (bypasses the client relay)
+    RPC_CMD_PERSIST_BIND,      // (Phase B) "do you have a resident weight buffer for (model_key,size)?" -> rebind, skip alloc+upload
+    RPC_CMD_PERSIST_REGISTER,  // (Phase B) retain this freshly-uploaded weight buffer under model_key (don't free on teardown)
+    RPC_CMD_PERSIST_DETACH,    // (Phase B) client is releasing a resident buffer -> keep it resident, mark unclaimed for the next process
     RPC_CMD_COUNT,
 };
 
@@ -169,6 +172,28 @@ struct rpc_msg_alloc_buffer_req {
 struct rpc_msg_alloc_buffer_rsp {
     uint64_t remote_ptr;
     uint64_t remote_size;
+};
+
+// (Phase B) cross-process resident weights. Each rpc_server IS one device, so the registry
+// key is just (model_key, size); the client dials the specific server's socket.
+struct rpc_msg_persist_bind_req {
+    uint64_t model_key;
+    uint64_t size;
+};
+
+struct rpc_msg_persist_bind_rsp {
+    uint64_t remote_ptr;   // 0 = no resident buffer (client must alloc + upload as normal)
+    uint64_t remote_size;
+};
+
+struct rpc_msg_persist_register_req {
+    uint64_t model_key;
+    uint64_t remote_ptr;
+};
+
+struct rpc_msg_persist_detach_req {
+    uint64_t model_key;
+    uint64_t remote_ptr;
 };
 
 struct rpc_msg_get_alignment_rsp {
@@ -316,6 +341,14 @@ struct ggml_backend_rpc_buffer_context {
     // (which happens under g_get_base_mutex). acquire/release pair the read with that store.
     std::atomic<void *>       base_ptr;
     uint64_t                  remote_ptr;
+    // (Phase B) cross-process resident weights. persist_key != 0 => this weight buffer is
+    // registered/rebound on the server; free_buffer sends PERSIST_DETACH instead of FREE_BUFFER.
+    // skip_upload => bound to an already-resident buffer, so set_tensor is a no-op (data present).
+    // No default member initializers: the struct is aggregate-inited as { sock, base, remote_ptr }
+    // at several sites (a default-init would break that with the atomic member), so these trailing
+    // members are value-initialized (0 / false) by aggregate init and set explicitly where needed.
+    uint64_t                  persist_key;
+    bool                      skip_upload;
 };
 
 struct ggml_tensor_extra_rpc {
@@ -357,6 +390,27 @@ static std::unordered_set<const void *>                                         
 static const bool g_act_pool_on = rpc_opt_enabled() && getenv("RPC_NO_POOL") == nullptr;
 static std::mutex g_act_pool_mtx;
 static std::map<std::pair<const void *, int>, std::pair<ggml_backend_rpc_buffer_context *, size_t>> g_act_pool;
+
+// (Phase B) cross-process RESIDENT MODEL weights (opt-in RPC_PERSIST). Distinct from the #3d
+// per-token activation "persist buffers" above. When llama.cpp calls persist_begin(model_key)
+// before the weight-buffer alloc loop, we set g_rmodel_active for that load window: each weight
+// buffer alloc first tries PERSIST_BIND (rebind to a buffer still resident on the server from a
+// previous process -> skip alloc + upload); freshly-allocated ones are queued and REGISTERed at
+// persist_end so they survive this process's teardown. KV/activation allocs happen AFTER the
+// window (g_rmodel_active=false) -> normal path.
+static bool rpc_xpersist_enabled() {
+    static const bool on = rpc_opt_enabled() && getenv("RPC_PERSIST") != nullptr;
+    return on;
+}
+static bool rpc_xpersist_dbg() {
+    static const bool on = getenv("RPC_DBG_PERSIST") != nullptr;
+    return on;
+}
+static std::mutex g_rmodel_mtx;
+static bool       g_rmodel_active = false;   // inside a persist load window
+static uint64_t   g_rmodel_key    = 0;       // current model_key
+// weight buffers freshly allocated this window (to REGISTER at persist_end): (sock, remote_ptr)
+static std::vector<std::pair<std::shared_ptr<socket_t>, uint64_t>> g_rmodel_pending;
 
 //split context
 struct ggml_backend_rpc_split_buffer_type_context {
@@ -682,6 +736,18 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
 static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     //how to free a buffer on other servers?
     ggml_backend_rpc_buffer_context * ctx     = (ggml_backend_rpc_buffer_context *) buffer->context;
+    // (Phase B) resident weight buffer: DETACH (keep it resident for the next process) instead of
+    // FREE. Do NOT touch the activation pool (a resident weight buffer never owns pool buffers).
+    if (ctx->persist_key != 0) {
+        rpc_msg_persist_detach_req dreq{ ctx->persist_key, ctx->remote_ptr };
+        bool dok = send_rpc_cmd(ctx->sock, RPC_CMD_PERSIST_DETACH, &dreq, sizeof(dreq), nullptr, 0);
+        GGML_ASSERT(dok);
+        if (rpc_xpersist_dbg()) {
+            GGML_LOG_INFO("[persist] client DETACH remote_ptr=%" PRIx64 " (kept resident)\n", ctx->remote_ptr);
+        }
+        delete ctx;
+        return;
+    }
     rpc_msg_free_buffer_req           request = { ctx->remote_ptr };
     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_FREE_BUFFER, &request, sizeof(request), nullptr, 0);
     GGML_ASSERT(status);
@@ -1372,6 +1438,16 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
     // GGML_LOG_INFO("ne0 = %ld ne1 = %ld nb0 = %ld nb1 =%ld nb2 = %ld\n",tensor->ne[0],tensor->ne[1],tensor->nb[0],tensor->nb[1],tensor->nb[2]);
     ggml_backend_rpc_buffer_type_context * buft_ctx   = (ggml_backend_rpc_buffer_type_context *) buffer->buft->context;
     ggml_backend_rpc_buffer_context *      ctx        = (ggml_backend_rpc_buffer_context *) buffer->context;
+
+    // (Phase B) this buffer was rebound to weights already resident on the server from a previous
+    // process -> the data is already there, skip the upload entirely (the whole point of persist).
+    if (ctx->skip_upload) {
+        if (rpc_xpersist_dbg()) {
+            GGML_LOG_INFO("[persist] client skip upload for %s (resident)\n", tensor->name);
+        }
+        return;
+    }
+
     rpc_tensor rpc_tensor1 = serialize_tensor(tensor);
 
     // Weight cache on the NON-SPLIT (pipeline / -sm layer) load path. The split path caches in
@@ -2176,18 +2252,51 @@ static const char * ggml_backend_rpc_buffer_type_name(ggml_backend_buffer_type_t
 
 static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *) buft->context;
-    rpc_msg_alloc_buffer_req               request  = { size };
-    rpc_msg_alloc_buffer_rsp               response;
     //The question is, we can't store these buffers for the tensor, so hard to load them on every server
 
     auto sock   = get_socket(buft_ctx->endpoint);
+
+    // (Phase B) inside a persist load window, first try to rebind to a weight buffer still
+    // resident on this server from a previous process. HIT -> wrap the LIVE remote_ptr, skip the
+    // server alloc and the WiFi upload entirely (set_tensor becomes a no-op for this buffer).
+    bool     rmodel_active = false;
+    uint64_t rmodel_key    = 0;
+    if (rpc_xpersist_enabled()) {
+        std::lock_guard<std::mutex> lock(g_rmodel_mtx);
+        rmodel_active = g_rmodel_active;
+        rmodel_key    = g_rmodel_key;
+    }
+    if (rmodel_active) {
+        rpc_msg_persist_bind_req breq{ rmodel_key, (uint64_t) size };
+        rpc_msg_persist_bind_rsp brsp{ 0, 0 };
+        bool bok = send_rpc_cmd(sock, RPC_CMD_PERSIST_BIND, &breq, sizeof(breq), &brsp, sizeof(brsp));
+        GGML_ASSERT(bok);
+        if (brsp.remote_ptr != 0) {
+            auto * ctx = new ggml_backend_rpc_buffer_context{ sock, nullptr, brsp.remote_ptr };
+            ctx->persist_key = rmodel_key;
+            ctx->skip_upload = true;
+            if (rpc_xpersist_dbg()) {
+                GGML_LOG_INFO("[persist] client BIND HIT size=%zu -> resident (skip alloc+upload)\n", size);
+            }
+            return ggml_backend_buffer_init(buft, ggml_backend_rpc_buffer_interface, ctx, brsp.remote_size);
+        }
+    }
+
+    rpc_msg_alloc_buffer_req request  = { size };
+    rpc_msg_alloc_buffer_rsp response;
     bool status = send_rpc_cmd(sock, RPC_CMD_ALLOC_BUFFER, &request, sizeof(request), &response, sizeof(response));
     GGML_ASSERT(status);
     if (response.remote_ptr != 0) {
+        auto * ctx = new ggml_backend_rpc_buffer_context{ sock, nullptr, response.remote_ptr };
+        // (Phase B) fresh weight buffer in a persist window: upload normally this time, but mark it
+        // so free_buffer DETACHes (keeps it resident) and queue it for REGISTER at persist_end.
+        if (rmodel_active) {
+            ctx->persist_key = rmodel_key;
+            std::lock_guard<std::mutex> lock(g_rmodel_mtx);
+            g_rmodel_pending.emplace_back(sock, response.remote_ptr);
+        }
         ggml_backend_buffer_t buffer = ggml_backend_buffer_init(
-            buft, ggml_backend_rpc_buffer_interface,
-            new ggml_backend_rpc_buffer_context{ sock, nullptr, response.remote_ptr }, response.remote_size);
-        // GGML_LOG_INFO("[%s] allocated buffer for size %zu, remote_ptr=%" PRIx64 ", remote_size=%" PRIu64 "\n", __func__, size, response.remote_ptr, response.remote_size);
+            buft, ggml_backend_rpc_buffer_interface, ctx, response.remote_size);
         return buffer;
     }
     return nullptr;
@@ -4830,6 +4939,10 @@ class rpc_server {
     bool graph_advance(uint8_t graph_number);
     bool load_cached(const rpc_msg_load_cached_req & request, rpc_msg_load_cached_rsp & response);
     bool set_tensor_cache(const std::vector<uint8_t> & input);
+    // (Phase B) cross-process resident weights (opt-in RPC_PERSIST)
+    void persist_bind(const rpc_msg_persist_bind_req & request, rpc_msg_persist_bind_rsp & response);
+    bool persist_register(const rpc_msg_persist_register_req & request);
+    bool persist_detach(const rpc_msg_persist_detach_req & request);
 
     ggml_backend_t & get_backend() { return backend; }
   private:
@@ -4857,7 +4970,40 @@ class rpc_server {
     std::unordered_map<std::string, uint32_t>           all_reduce_seq;       //per-tensor all-reduce sequence (token)
     std::mutex                                          block_mutex;          //mutex for adding or checking blocks
     std::unordered_map<uint8_t, graph_compute_info *>   graph_compute_infos;  // map graph_number to graph_compute_info
+    // (Phase B) cross-process resident weights: model_key -> resident weight buffers on THIS
+    // device. Registered buffers stay in `buffers` (so validation passes) but are NOT freed on
+    // client FREE_BUFFER; a reconnecting client rebinds via PERSIST_BIND. Guarded by persist_mutex.
+    struct resident_buf {
+        ggml_backend_buffer_t buffer;
+        uint64_t              size;
+        bool                  claimed;    // in use by a live client connection
+        uint64_t              last_use;   // (B2) LRU: bumped on bind; monotonic counter
+    };
+    std::unordered_map<uint64_t, std::vector<resident_buf>> persist_registry;
+    std::mutex                                              persist_mutex;
+    uint64_t                                                persist_use_ctr = 0;
 };
+
+// (Phase B) is a given buffer retained by the resident registry? (caller holds persist_mutex)
+static bool rpc_persist_dbg() {
+    static const bool on = getenv("RPC_DBG_PERSIST") != nullptr;
+    return on;
+}
+
+// (Phase B2) RAM cap for resident models on THIS server. Default 8 GB; set RPC_PERSIST_MAX_GB
+// LOW on memory-tight peers (e.g. 1.2 on the 2 GB Pis) so switching models evicts the old one
+// instead of OOMing. 0 or negative = unlimited (no eviction).
+static uint64_t rpc_persist_max_bytes() {
+    static const uint64_t cap = [] {
+        const char * e  = getenv("RPC_PERSIST_MAX_GB");
+        double       gb = e ? atof(e) : 8.0;
+        if (gb <= 0.0) {
+            return (uint64_t) UINT64_MAX;
+        }
+        return (uint64_t) (gb * 1024.0 * 1024.0 * 1024.0);
+    }();
+    return cap;
+}
 
 bool rpc_server::get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response) {
     ggml_backend_buffer_type_t buft;
@@ -4936,9 +5082,130 @@ bool rpc_server::free_buffer(const rpc_msg_free_buffer_req & request) {
         GGML_LOG_ERROR("[%s] buffer not found\n", __func__);
         return false;
     }
+    // (Phase B) if this buffer is retained by the resident registry, keep it alive across the
+    // client teardown so the next process can rebind. The client normally sends PERSIST_DETACH
+    // (not FREE) for such buffers; this is a belt-and-suspenders guard for a stray FREE_BUFFER.
+    {
+        std::lock_guard<std::mutex> lock(persist_mutex);
+        for (auto & kv : persist_registry) {
+            for (auto & rb : kv.second) {
+                if (rb.buffer == buffer) {
+                    rb.claimed = false;
+                    if (rpc_persist_dbg()) {
+                        GGML_LOG_INFO("[persist] RETAIN on free_buffer key=%016" PRIx64 " size=%" PRIu64 "\n", kv.first, rb.size);
+                    }
+                    return true;  // do NOT free
+                }
+            }
+        }
+    }
     ggml_backend_buffer_free(buffer);
     buffers.erase(buffer);
     return true;
+}
+
+// (Phase B) client asks: do you have a resident weight buffer for (model_key, size)? If so,
+// claim it and return its LIVE remote_ptr so the client can rebind and skip alloc+upload.
+void rpc_server::persist_bind(const rpc_msg_persist_bind_req & request, rpc_msg_persist_bind_rsp & response) {
+    response.remote_ptr  = 0;
+    response.remote_size = 0;
+    std::lock_guard<std::mutex> lock(persist_mutex);
+    auto it = persist_registry.find(request.model_key);
+    if (it != persist_registry.end()) {
+        for (auto & rb : it->second) {
+            if (!rb.claimed && rb.size == request.size) {
+                rb.claimed   = true;
+                rb.last_use  = ++persist_use_ctr;
+                response.remote_ptr  = reinterpret_cast<uint64_t>(rb.buffer);
+                response.remote_size = rb.buffer->size;
+                if (rpc_persist_dbg()) {
+                    GGML_LOG_INFO("[persist] BIND HIT key=%016" PRIx64 " size=%" PRIu64 " -> ptr=%" PRIx64 "\n",
+                                  request.model_key, request.size, response.remote_ptr);
+                }
+                return;
+            }
+        }
+    }
+    if (rpc_persist_dbg()) {
+        GGML_LOG_INFO("[persist] BIND MISS key=%016" PRIx64 " size=%" PRIu64 "\n", request.model_key, request.size);
+    }
+}
+
+// (Phase B) retain a freshly-uploaded weight buffer under model_key (already in `buffers`).
+bool rpc_server::persist_register(const rpc_msg_persist_register_req & request) {
+    ggml_backend_buffer_t buffer = reinterpret_cast<ggml_backend_buffer_t>(request.remote_ptr);
+    if (buffers.find(buffer) == buffers.end()) {
+        GGML_LOG_ERROR("[persist] register: buffer not found\n");
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(persist_mutex);
+    // idempotent: skip if already registered under this key
+    auto & vec = persist_registry[request.model_key];
+    for (auto & rb : vec) {
+        if (rb.buffer == buffer) { rb.claimed = true; return true; }
+    }
+    vec.push_back(resident_buf{ buffer, (uint64_t) buffer->size, true, ++persist_use_ctr });
+    if (rpc_persist_dbg()) {
+        GGML_LOG_INFO("[persist] REGISTER key=%016" PRIx64 " size=%zu ptr=%" PRIx64 " (resident bufs=%zu)\n",
+                      request.model_key, buffer->size, request.remote_ptr, vec.size());
+    }
+    // (B2) enforce the RAM cap: while over budget, evict the least-recently-used model whose
+    // buffers are ALL unclaimed (never evict a model a live client is bound to, and never the one
+    // just registered). Frees the buffers and drops them from `buffers`.
+    const uint64_t cap = rpc_persist_max_bytes();
+    auto total_bytes = [&]() {
+        uint64_t t = 0;
+        for (auto & kv : persist_registry) { for (auto & rb : kv.second) { t += rb.size; } }
+        return t;
+    };
+    while (total_bytes() > cap) {
+        uint64_t victim   = 0;
+        uint64_t best_use = UINT64_MAX;
+        bool     found    = false;
+        for (auto & kv : persist_registry) {
+            if (kv.first == request.model_key) { continue; }
+            bool     all_unclaimed = true;
+            uint64_t max_use       = 0;
+            for (auto & rb : kv.second) {
+                if (rb.claimed) { all_unclaimed = false; break; }
+                if (rb.last_use > max_use) { max_use = rb.last_use; }
+            }
+            if (all_unclaimed && max_use < best_use) { best_use = max_use; victim = kv.first; found = true; }
+        }
+        if (!found) { break; }  // nothing evictable (all in use) -> accept being over cap
+        auto vit = persist_registry.find(victim);
+        uint64_t freed = 0;
+        for (auto & rb : vit->second) {
+            freed += rb.size;
+            ggml_backend_buffer_free(rb.buffer);
+            buffers.erase(rb.buffer);
+        }
+        persist_registry.erase(vit);
+        if (rpc_persist_dbg()) {
+            GGML_LOG_INFO("[persist] EVICT key=%016" PRIx64 " freed=%" PRIu64 " bytes (LRU, over %.1f GB cap)\n",
+                          victim, freed, cap / (1024.0 * 1024.0 * 1024.0));
+        }
+    }
+    return true;
+}
+
+// (Phase B) client releasing a resident buffer: keep it resident, mark unclaimed for reuse.
+bool rpc_server::persist_detach(const rpc_msg_persist_detach_req & request) {
+    ggml_backend_buffer_t buffer = reinterpret_cast<ggml_backend_buffer_t>(request.remote_ptr);
+    std::lock_guard<std::mutex> lock(persist_mutex);
+    auto it = persist_registry.find(request.model_key);
+    if (it != persist_registry.end()) {
+        for (auto & rb : it->second) {
+            if (rb.buffer == buffer) {
+                rb.claimed = false;
+                if (rpc_persist_dbg()) {
+                    GGML_LOG_INFO("[persist] DETACH key=%016" PRIx64 " size=%" PRIu64 " (kept resident)\n", request.model_key, rb.size);
+                }
+                return true;
+            }
+        }
+    }
+    return true;  // unknown -> nothing to do
 }
 
 bool rpc_server::buffer_clear(const rpc_msg_buffer_clear_req & request) {
@@ -6643,6 +6910,47 @@ static void rpc_serve_client(rpc_server & server, sockfd_t sockfd, size_t free_m
                     }
                     break;
                 }
+            case RPC_CMD_PERSIST_BIND:
+                {
+                    rpc_msg_persist_bind_req request;
+                    if (!recv_msg(sockfd, &request, sizeof(request))) {
+                        return;
+                    }
+                    rpc_msg_persist_bind_rsp response;
+                    server.persist_bind(request, response);
+                    if (!send_msg(sockfd, &response, sizeof(response))) {
+                        return;
+                    }
+                    break;
+                }
+            case RPC_CMD_PERSIST_REGISTER:
+                {
+                    rpc_msg_persist_register_req request;
+                    if (!recv_msg(sockfd, &request, sizeof(request))) {
+                        return;
+                    }
+                    if (!server.persist_register(request)) {
+                        return;
+                    }
+                    if (!send_msg(sockfd, nullptr, 0)) {
+                        return;
+                    }
+                    break;
+                }
+            case RPC_CMD_PERSIST_DETACH:
+                {
+                    rpc_msg_persist_detach_req request;
+                    if (!recv_msg(sockfd, &request, sizeof(request))) {
+                        return;
+                    }
+                    if (!server.persist_detach(request)) {
+                        return;
+                    }
+                    if (!send_msg(sockfd, nullptr, 0)) {
+                        return;
+                    }
+                    break;
+                }
             case RPC_CMD_GRAPH_COMPUTE:
                 {
                     std::vector<uint8_t> input;
@@ -7138,6 +7446,46 @@ static bool ggml_backend_rpc_create_peer_connection() {
     return true;
 }
 
+// (Phase B) opt-in cross-process resident weights. llama.cpp calls persist_begin(model_key)
+// right before the weight-buffer alloc loop and persist_end() after load_all_data. When
+// RPC_PERSIST is unset these are no-ops, so the default load path is unchanged.
+static void ggml_backend_rpc_persist_begin(uint64_t model_key) {
+    if (!rpc_xpersist_enabled()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_rmodel_mtx);
+    g_rmodel_active = true;
+    g_rmodel_key    = model_key;
+    g_rmodel_pending.clear();
+    if (rpc_xpersist_dbg()) {
+        GGML_LOG_INFO("[persist] persist_begin key=%016" PRIx64 "\n", model_key);
+    }
+}
+
+static void ggml_backend_rpc_persist_end() {
+    if (!rpc_xpersist_enabled()) {
+        return;
+    }
+    std::vector<std::pair<std::shared_ptr<socket_t>, uint64_t>> pending;
+    uint64_t key = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_rmodel_mtx);
+        pending.swap(g_rmodel_pending);
+        key             = g_rmodel_key;
+        g_rmodel_active = false;
+        g_rmodel_key    = 0;
+    }
+    for (auto & p : pending) {
+        rpc_msg_persist_register_req rreq{ key, p.second };
+        bool ok = send_rpc_cmd(p.first, RPC_CMD_PERSIST_REGISTER, &rreq, sizeof(rreq), nullptr, 0);
+        GGML_ASSERT(ok);
+    }
+    if (rpc_xpersist_dbg()) {
+        GGML_LOG_INFO("[persist] persist_end: registered %zu fresh weight buffers under key=%016" PRIx64 "\n",
+                      pending.size(), key);
+    }
+}
+
 static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (std::strcmp(name, "ggml_backend_rpc_add_device") == 0) {
         return (void *) ggml_backend_rpc_add_device;
@@ -7147,6 +7495,12 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (strcmp(name, "ggml_backend_rpc_create_peer_connection") == 0) {
         return (void *) ggml_backend_rpc_create_peer_connection;
+    }
+    if (strcmp(name, "ggml_backend_rpc_persist_begin") == 0) {
+        return (void *) ggml_backend_rpc_persist_begin;
+    }
+    if (strcmp(name, "ggml_backend_rpc_persist_end") == 0) {
+        return (void *) ggml_backend_rpc_persist_end;
     }
     return NULL;
 

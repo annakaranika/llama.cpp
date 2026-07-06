@@ -3465,6 +3465,38 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     const size_t n_max_backend_buffer = ctx_map.size() * ml.files.size();
     pimpl->bufs.reserve(n_max_backend_buffer);
 
+    // (Phase B) cross-process resident weights (opt-in RPC_PERSIST). Announce a model identity to
+    // the RPC backend before allocating/uploading weights so each weight-buffer alloc can rebind to
+    // a buffer still resident on the server from a previous process (skip alloc + WiFi upload). The
+    // key folds model content (n_bytes/n_tensors/n_elements) + the parallel layout (split_mode/
+    // n_gpu_layers/tensor_split) so a different model OR a different split gets a distinct key. No-op
+    // unless RPC_PERSIST is set (the backend's persist_begin/end are then no-ops too).
+    void (*rpc_persist_begin)(uint64_t) = nullptr;
+    void (*rpc_persist_end)()           = nullptr;
+    {
+        ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC");
+        if (rpc_reg != nullptr) {
+            rpc_persist_begin = (void (*)(uint64_t)) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_persist_begin");
+            rpc_persist_end   = (void (*)())         ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_persist_end");
+        }
+        if (rpc_persist_begin != nullptr) {
+            uint64_t h = 1469598103934665603ULL;  // fnv1a-64
+            auto mix = [&](uint64_t v) { for (int i = 0; i < 8; ++i) { h ^= (unsigned char) (v >> (i * 8)); h *= 1099511628211ULL; } };
+            mix(ml.n_bytes);
+            mix((uint64_t) ml.n_tensors);
+            mix(ml.n_elements);
+            mix((uint64_t) split_mode);
+            mix((uint64_t) n_gpu_layers);
+            for (int i = 0; i < (int) n_devices(); ++i) {
+                float    f    = tensor_split ? tensor_split[i] : 0.0f;
+                uint32_t bits = 0;
+                memcpy(&bits, &f, sizeof(bits));
+                mix(bits);
+            }
+            rpc_persist_begin(h);
+        }
+    }
+
     for (auto & it : ctx_map) {
         ggml_backend_buffer_type_t buft = it.first;
         ggml_context * ctx              = it.second;
@@ -3569,9 +3601,17 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         ggml_context * ctx = it.first;
         auto & bufs = it.second;
         if (!ml.load_all_data(ctx, bufs, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
+            if (rpc_persist_end != nullptr) {
+                rpc_persist_end();
+            }
             return false;
         }
         LLAMA_LOG_INFO("%s: loaded tensors from context %p\n", __func__, (void*)ctx);
+    }
+    // (Phase B) close the persist window: REGISTER the freshly-uploaded weight buffers so they
+    // survive this process's teardown (a reconnecting process rebinds via PERSIST_BIND).
+    if (rpc_persist_end != nullptr) {
+        rpc_persist_end();
     }
     // {
     // std::vector<std::thread> threads;
