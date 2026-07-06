@@ -10,6 +10,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <filesystem>
+#ifndef _WIN32
+#    include <utime.h>
+#endif
 #include <chrono>
 #include <cinttypes>
 #include <condition_variable>
@@ -5042,6 +5046,71 @@ static std::string rpc_weight_cache_path(uint64_t hash) {
     return rpc_weight_cache_dir() + "/" + name;
 }
 
+namespace fs = std::filesystem;
+
+// Cache size cap in bytes (RPC_WEIGHT_CACHE_MAX_GB, default 8 GB; 0 = unbounded). The cache is
+// content-addressed and otherwise never self-cleaned, so it grows forever across models/shardings.
+static uint64_t rpc_weight_cache_max_bytes() {
+    static const uint64_t max_b = [] {
+        const char * env = getenv("RPC_WEIGHT_CACHE_MAX_GB");
+        double       gb  = env ? atof(env) : 8.0;
+        return gb > 0 ? (uint64_t) (gb * 1e9) : (uint64_t) 0;
+    }();
+    return max_b;
+}
+
+// LRU eviction: if the cache dir exceeds the cap, delete oldest-mtime files until under it.
+// mtime is refreshed on every HIT (load_cached), so "oldest" == least-recently-USED and the
+// model being loaded now (freshly stored/hit) is never evicted. Skips .tmp.* (in-flight atomic
+// writes). Best-effort -- all errors ignored; one pruner at a time (concurrent stores skip).
+static void rpc_weight_cache_prune() {
+    const uint64_t max_b = rpc_weight_cache_max_bytes();
+    if (max_b == 0 || !rpc_weight_cache_enabled()) {
+        return;
+    }
+    static std::mutex            prune_mtx;
+    std::unique_lock<std::mutex> lk(prune_mtx, std::try_to_lock);
+    if (!lk.owns_lock()) {
+        return;  // another thread is already pruning
+    }
+    struct centry { fs::file_time_type t; uintmax_t sz; fs::path p; };
+    std::vector<centry> files;
+    uint64_t            total = 0;
+    std::error_code     ec;
+    fs::directory_iterator it(rpc_weight_cache_dir(), ec), end;
+    for (; !ec && it != end; it.increment(ec)) {
+        const fs::path & p = it->path();
+        if (p.filename().string().find(".tmp.") != std::string::npos) {
+            continue;  // in-flight atomic write, not a published entry
+        }
+        std::error_code    e2;
+        uintmax_t          sz = fs::file_size(p, e2);
+        fs::file_time_type t  = fs::last_write_time(p, e2);
+        if (e2) {
+            continue;
+        }
+        files.push_back({ t, sz, p });
+        total += sz;
+    }
+    if (total <= max_b) {
+        return;
+    }
+    std::sort(files.begin(), files.end(), [](const centry & a, const centry & b) { return a.t < b.t; });  // oldest first
+    static const bool dbg = getenv("RPC_DBG_WCACHE") != nullptr;
+    for (const centry & f : files) {
+        if (total <= max_b) {
+            break;
+        }
+        std::error_code e3;
+        if (fs::remove(f.p, e3)) {
+            total -= f.sz;
+            if (dbg) {
+                GGML_LOG_INFO("[wcache] EVICT %s (%llu B)\n", f.p.filename().string().c_str(), (unsigned long long) f.sz);
+            }
+        }
+    }
+}
+
 // LOAD_CACHED: if the slice with this content hash is on disk, load it straight
 // into the destination buffer and report hit=1; otherwise hit=0 (client uploads).
 bool rpc_server::load_cached(const rpc_msg_load_cached_req & request, rpc_msg_load_cached_rsp & response) {
@@ -5073,6 +5142,10 @@ bool rpc_server::load_cached(const rpc_msg_load_cached_req & request, rpc_msg_lo
     if (dbg_wcache) {
         GGML_LOG_INFO("[wcache] HIT   %016llx (%lld bytes)\n", (unsigned long long) request.hash, (long long) n);
     }
+    // Refresh mtime so LRU eviction counts this as recently used (never evict what's loading now).
+#ifndef _WIN32
+    utime(rpc_weight_cache_path(request.hash).c_str(), nullptr);
+#endif
     response.hit = 1;
     return true;
 }
@@ -5139,6 +5212,17 @@ bool rpc_server::set_tensor_cache(const std::vector<uint8_t> & input) {
         static const bool dbg_wcache = (getenv("RPC_DBG_WCACHE") != nullptr);
         if (dbg_wcache) {
             GGML_LOG_INFO("[wcache] STORE %016llx (%zu bytes)\n", (unsigned long long) hash, size);
+        }
+        // Bound the cache: after ~cap/4 bytes have been stored, scan+evict down to the cap.
+        // Size-driven (not store-count) so it works regardless of model/tensor count, and the
+        // overshoot is bounded to ~cap/4 between prunes.
+        const uint64_t cap = rpc_weight_cache_max_bytes();
+        if (cap) {
+            static std::atomic<uint64_t> since_prune{ 0 };
+            if (since_prune.fetch_add(size) + size >= cap / 4) {
+                since_prune.store(0);
+                rpc_weight_cache_prune();
+            }
         }
     }
     return true;
