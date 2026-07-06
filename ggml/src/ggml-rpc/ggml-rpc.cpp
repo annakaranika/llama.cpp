@@ -5111,11 +5111,30 @@ bool rpc_server::set_tensor_cache(const std::vector<uint8_t> & input) {
     ggml_backend_tensor_set(tensor, data, offset, size);
     ggml_free(ctx);
 
-    // persist to the on-disk cache (best-effort; a failed write just misses next run)
+    // Persist to the on-disk cache (best-effort; a failed write just misses next run).
+    // ATOMIC publish: write a unique temp file, then rename() into place. rename(2) is atomic
+    // on the same filesystem, so a concurrent LOAD_CACHED reader sees either the old complete
+    // file or the fully-written new one -- never a partial. Two clients writing the same key
+    // write identical (content-addressed) bytes, so the last rename wins and both are valid --
+    // no lock needed. The temp name is unique per (process, write): the ASLR'd address of a
+    // static salts the process, an atomic counter salts the write, so concurrent writers (even
+    // two server processes sharing a dir on localhost) never clobber each other's temp.
     if (rpc_weight_cache_enabled()) {
-        std::ofstream out(rpc_weight_cache_path(hash), std::ios::binary | std::ios::trunc);
-        if (out) {
-            out.write((const char *) data, size);
+        static std::atomic<uint64_t> wc_seq{ 0 };
+        const std::string            path = rpc_weight_cache_path(hash);
+        const std::string            tmp  = path + ".tmp." +
+                                 std::to_string((unsigned long long) (uintptr_t) &wc_seq) + "." +
+                                 std::to_string((unsigned long long) wc_seq.fetch_add(1));
+        bool ok = false;
+        {
+            std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+            if (out) {
+                out.write((const char *) data, (std::streamsize) size);
+                ok = out.good();
+            }
+        }  // flush + close before the rename
+        if (!ok || std::rename(tmp.c_str(), path.c_str()) != 0) {
+            std::remove(tmp.c_str());  // write or rename failed -> drop the temp; miss next run
         }
         static const bool dbg_wcache = (getenv("RPC_DBG_WCACHE") != nullptr);
         if (dbg_wcache) {
