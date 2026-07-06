@@ -1346,17 +1346,67 @@ static uint64_t rpc_fnv1a(const void * data, size_t n) {
     return h;
 }
 
+// Weight-cache key kinds. Folded into the content hash so a WHOLE (non-split / pipeline)
+// tensor, a SPLIT (TP) slice, and different split parts never share a cache entry even if
+// their bytes coincide (e.g. constant / zero tensors). Content stays in the key, so a model
+// swap (different bytes) still misses -> correct across models.
+enum rpc_wkind : uint8_t { RPC_WKIND_WHOLE = 0, RPC_WKIND_SPLIT = 1 };
+
+static uint64_t rpc_weight_key(const void * data, size_t size, uint8_t kind, uint8_t device_id, int8_t split_dim) {
+    uint64_t      h       = rpc_fnv1a(data, size);
+    const uint8_t desc[3] = { kind, device_id, (uint8_t) split_dim };  // fold the descriptor in
+    for (size_t i = 0; i < sizeof(desc); ++i) {
+        h ^= desc[i];
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
 static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data,
                                                size_t offset, size_t size) {
     // GGML_LOG_INFO("[%s] setting tensor %s, offset=%zu, size=%zu\n", __func__, tensor->name, offset, size);
     // GGML_LOG_INFO("ne0 = %ld ne1 = %ld nb0 = %ld nb1 =%ld nb2 = %ld\n",tensor->ne[0],tensor->ne[1],tensor->nb[0],tensor->nb[1],tensor->nb[2]);
     ggml_backend_rpc_buffer_type_context * buft_ctx   = (ggml_backend_rpc_buffer_type_context *) buffer->buft->context;
     ggml_backend_rpc_buffer_context *      ctx        = (ggml_backend_rpc_buffer_context *) buffer->context;
+    rpc_tensor rpc_tensor1 = serialize_tensor(tensor);
+
+    // Weight cache on the NON-SPLIT (pipeline / -sm layer) load path. The split path caches in
+    // cache_or_upload, but pipeline weights came through here UNcached -> every -sm layer load
+    // re-uploaded the whole model over WiFi (~14 min). Only WEIGHTS buffers, only whole-tensor
+    // loads (offset 0): ask the server by content key whether it already has this tensor on
+    // disk; HIT -> skip the upload, MISS -> upload via SET_TENSOR_CACHE (persist). RPC_WKIND_WHOLE
+    // keeps these keys in a separate namespace from TP split slices. Off: RPC_NO_WEIGHT_CACHE.
+    // !split: only the pipeline path needs this. In a TP (-sm row) run the split slices are
+    // already cached in cache_or_upload, and the replicated non-split tensors must stay on the
+    // plain SET_TENSOR path (routing them through SET_TENSOR_CACHE corrupts -sm row output).
+    static const bool weight_cache = rpc_opt_enabled() && (getenv("RPC_NO_WEIGHT_CACHE") == nullptr);
+    if (weight_cache && !split && offset == 0 &&
+        ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+        const uint64_t          hash = rpc_weight_key(data, size, RPC_WKIND_WHOLE, 0, -1);
+        rpc_msg_load_cached_req qreq;
+        qreq.tensor = rpc_tensor1;
+        qreq.hash   = hash;
+        rpc_msg_load_cached_rsp qrsp;
+        qrsp.hit = 0;
+        bool qok = send_rpc_cmd(ctx->sock, RPC_CMD_LOAD_CACHED, &qreq, sizeof(qreq), &qrsp, sizeof(qrsp));
+        GGML_ASSERT(qok);
+        if (qrsp.hit) {
+            return;  // cache HIT -> no WiFi upload
+        }
+        // miss: | rpc_tensor | offset (8) | hash (8) | data | -> server writes AND persists
+        std::vector<uint8_t> in(sizeof(rpc_tensor) + sizeof(uint64_t) + sizeof(uint64_t) + size);
+        memcpy(in.data(), &rpc_tensor1, sizeof(rpc_tensor));
+        memcpy(in.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
+        memcpy(in.data() + sizeof(rpc_tensor) + sizeof(offset), &hash, sizeof(hash));
+        memcpy(in.data() + sizeof(rpc_tensor) + sizeof(offset) + sizeof(hash), data, size);
+        bool ok = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR_CACHE, in.data(), in.size(), nullptr, 0);
+        GGML_ASSERT(ok);
+        return;
+    }
+
     // input serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes) |
-    size_t                                 input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + size;
-    std::vector<uint8_t>                   input(input_size, 0);
-    rpc_tensor                             rpc_tensor1 = serialize_tensor(tensor);
-    // GGML_LOG_INFO("[%s] rpc_tensor.data=%" PRIx64 ", rpc_tensor.buffer=%" PRIx64 "\n", __func__, rpc_tensor1.data, rpc_tensor1.buffer);
+    size_t               input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + size;
+    std::vector<uint8_t> input(input_size, 0);
     memcpy(input.data(), &rpc_tensor1, sizeof(rpc_tensor));
     memcpy(input.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
     memcpy(input.data() + sizeof(rpc_tensor) + sizeof(offset), data, size);
@@ -1893,7 +1943,8 @@ static void ggml_backend_rpc_split_buffer_set_tensor(ggml_backend_buffer_t buffe
     // Given a contiguous slice, either skip it (server cache hit) or upload it.
     auto cache_or_upload = [&](int id, const rpc_tensor & rt, const uint8_t * slice, size_t slice_size) {
         if (weight_cache) {
-            const uint64_t          hash = rpc_fnv1a(slice, slice_size);
+            const uint64_t          hash = rpc_weight_key(slice, slice_size, RPC_WKIND_SPLIT,
+                                                          (uint8_t) id, (int8_t) (extra ? extra->split_dim : -1));
             rpc_msg_load_cached_req qreq;
             qreq.tensor = rt;
             qreq.hash   = hash;
