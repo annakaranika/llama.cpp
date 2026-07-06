@@ -136,6 +136,7 @@ enum rpc_cmd {
     RPC_CMD_GRAPH_COMPUTE_STORE,  // (PP diff cache) non-split: deserialize + STORE + compute inline (MISS)
     RPC_CMD_PATCH_COMPUTE,        // (PP diff cache) non-split: patch the stored graph + compute inline (HIT)
     RPC_CMD_ADVANCE_COMPUTE,  // (PP diff cache + prefetch) non-split: advance stored graph by cached stride + compute inline (predicted HIT, no patch payload)
+    RPC_CMD_SEND_TO_PEER,  // direct pipeline handoff: the SRC server pushes a tensor straight into the DST peer's buffer (bypasses the client relay)
     RPC_CMD_COUNT,
 };
 
@@ -228,6 +229,20 @@ struct rpc_msg_create_peer_connection_req {
 
 struct rpc_msg_create_peer_connection_rsp {
     uint8_t result;
+};
+
+// Direct pipeline handoff (RPC_CMD_SEND_TO_PEER). The client tells the SRC server to
+// push `src` straight into the DST peer's buffer described by `dst` (over the SRC
+// server's existing peer connection to `dst_endpoint`), instead of relaying the bytes
+// src -> client -> dst. Carries no payload: the SRC server reads its own local bytes.
+struct rpc_msg_send_to_peer_req {
+    rpc_tensor src;                 // locate the bytes on the SOURCE server
+    rpc_tensor dst;                 // where to write them on the DESTINATION server
+    char       dst_endpoint[256];   // which peer to push to (key into sockets_connectto)
+};
+
+struct rpc_msg_send_to_peer_rsp {
+    uint8_t result;   // 1 = pushed+acked by the peer; 0 = fall back to the client relay
 };
 
 struct rpc_msg_do_computation_req {
@@ -1431,7 +1446,29 @@ static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, con
     ggml_backend_buffer_t             dst_buffer = dst->buffer;
     ggml_backend_rpc_buffer_context * dst_ctx    = (ggml_backend_rpc_buffer_context *) dst_buffer->context;
     if (src_ctx->sock != dst_ctx->sock) {
-        return false;
+        // Cross-server copy == the pipeline stage->stage handoff. Instead of relaying the
+        // bytes src -> client(coordinator) -> dst, ask the SRC server to push them STRAIGHT
+        // to the DST peer (over the peer link create_peer_connection already dialed). The
+        // activation then crosses the shared channel once, not twice, and never touches the
+        // coordinator's link. Falls back to the generic get/set relay (return false) when opt
+        // is off, the peer link is missing, or the push fails -- so it stays correct always.
+        static const bool direct_handoff = rpc_opt_enabled() && getenv("RPC_NO_DIRECT_HANDOFF") == nullptr;
+        if (split || !direct_handoff) {
+            return false;  // TP (split) keeps the original relay fallback; only pipeline pushes direct
+        }
+        ggml_backend_rpc_buffer_type_context * dst_buft =
+            (ggml_backend_rpc_buffer_type_context *) dst_buffer->buft->context;
+        rpc_msg_send_to_peer_req req;
+        req.src = serialize_tensor(src);
+        req.dst = serialize_tensor(dst);
+        snprintf(req.dst_endpoint, sizeof(req.dst_endpoint), "%s", dst_buft->endpoint.c_str());
+        rpc_msg_send_to_peer_rsp resp;
+        resp.result = 0;
+        bool status = send_rpc_cmd(src_ctx->sock, RPC_CMD_SEND_TO_PEER, &req, sizeof(req), &resp, sizeof(resp));
+        if (!status || !resp.result) {
+            return false;  // fall back to the client relay
+        }
+        return true;
     }
     ggml_backend_rpc_buffer_context *      ctx      = (ggml_backend_rpc_buffer_context *) buffer->context;
     ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *) buffer->buft->context;
@@ -4725,6 +4762,7 @@ class rpc_server {
     bool set_split(rpc_msg_set_split_rsp & response);
     bool create_peer_connection(const rpc_msg_create_peer_connection_req & request,
                                 rpc_msg_create_peer_connection_rsp &       response);
+    bool send_to_peer(const rpc_msg_send_to_peer_req & request, rpc_msg_send_to_peer_rsp & response);
     void add_socket_listen(const std::shared_ptr<socket_t> & sock);
     bool all_reduce(std::vector<uint8_t> & input);
     bool ar_result(std::vector<uint8_t> & input);  // tree all-reduce: non-root applies root's result
@@ -5206,6 +5244,54 @@ bool rpc_server::copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_co
 
     response.result = ggml_backend_buffer_copy_tensor(src, dst);
     ggml_free(ctx);
+    return true;
+}
+
+// Direct pipeline handoff: read our own local `src` bytes and push them straight into the
+// DST peer's buffer via a normal SET_TENSOR over the peer connection we already hold
+// (sockets_connectto[dst_endpoint], dialed by create_peer_connection). Bypasses the client
+// relay (src -> client host -> dst). SET_TENSOR is acked by the peer, so send_rpc_cmd returns
+// only once the write has landed -- the handoff stays synchronous, so the data is in place
+// before the client issues the next stage's compute (which travels a DIFFERENT socket, so we
+// cannot lean on TCP ordering). result=0 makes the client fall back to the relay (always safe).
+bool rpc_server::send_to_peer(const rpc_msg_send_to_peer_req & request, rpc_msg_send_to_peer_rsp & response) {
+    static const bool dbg = getenv("RPC_DBG_HANDOFF") != nullptr;
+    response.result = 0;
+    std::shared_ptr<socket_t> peer;
+    {
+        auto it = sockets_connectto.find(request.dst_endpoint);
+        if (it != sockets_connectto.end()) {
+            peer = it->second.lock();
+        }
+    }
+    if (!peer) {
+        if (dbg) { GGML_LOG_INFO("[send_to_peer] no peer link to %s -> client relay\n", request.dst_endpoint); }
+        return true;  // no peer link -> result=0 -> client relays instead
+    }
+    struct ggml_init_params params{
+        /*.mem_size   =*/ggml_tensor_overhead(),
+        /*.mem_buffer =*/NULL,
+        /*.no_alloc   =*/true,
+    };
+    struct ggml_context * ctx = ggml_init(params);
+    ggml_tensor *         src = deserialize_tensor(ctx, &request.src);
+    if (src == nullptr) {
+        ggml_free(ctx);
+        return true;  // result=0 -> fall back
+    }
+    const size_t size = ggml_is_empty(src) ? 0 : (size_t) ggml_nbytes(src);
+    // standard SET_TENSOR payload for the DST peer: | rpc_tensor(dst) | offset(8)=0 | data |
+    std::vector<uint8_t> input(sizeof(rpc_tensor) + sizeof(uint64_t) + size);
+    memcpy(input.data(), &request.dst, sizeof(rpc_tensor));
+    const uint64_t offset = 0;
+    memcpy(input.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
+    if (size > 0) {
+        ggml_backend_tensor_get(src, input.data() + sizeof(rpc_tensor) + sizeof(offset), 0, size);
+    }
+    ggml_free(ctx);
+    bool ok = send_rpc_cmd(peer, RPC_CMD_SET_TENSOR, input.data(), input.size(), nullptr, 0);
+    if (dbg) { GGML_LOG_INFO("[send_to_peer] pushed %zu B -> %s ok=%d\n", size, request.dst_endpoint, (int) ok); }
+    response.result = ok ? 1 : 0;
     return true;
 }
 
@@ -6381,6 +6467,21 @@ static void rpc_serve_client(rpc_server & server, sockfd_t sockfd, size_t free_m
                     }
                     rpc_msg_copy_tensor_rsp response;
                     if (!server.copy_tensor(request, response)) {
+                        return;
+                    }
+                    if (!send_msg(sockfd, &response, sizeof(response))) {
+                        return;
+                    }
+                    break;
+                }
+            case RPC_CMD_SEND_TO_PEER:
+                {
+                    rpc_msg_send_to_peer_req request;
+                    if (!recv_msg(sockfd, &request, sizeof(request))) {
+                        return;
+                    }
+                    rpc_msg_send_to_peer_rsp response;
+                    if (!server.send_to_peer(request, response)) {
                         return;
                     }
                     if (!send_msg(sockfd, &response, sizeof(response))) {
