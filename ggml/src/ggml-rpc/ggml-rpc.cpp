@@ -141,6 +141,7 @@ enum rpc_cmd {
     RPC_CMD_PATCH_COMPUTE,        // (PP diff cache) non-split: patch the stored graph + compute inline (HIT)
     RPC_CMD_ADVANCE_COMPUTE,  // (PP diff cache + prefetch) non-split: advance stored graph by cached stride + compute inline (predicted HIT, no patch payload)
     RPC_CMD_SEND_TO_PEER,  // direct pipeline handoff: the SRC server pushes a tensor straight into the DST peer's buffer (bypasses the client relay)
+    RPC_CMD_BATCH_LOAD_CACHED,  // batched warm load: one message lists all (tensor,key) a server owns; it loads every hit from its LOCAL cache (no per-tensor round-trip) and returns a hit byte per entry
     RPC_CMD_COUNT,
 };
 
@@ -1366,6 +1367,111 @@ static uint64_t rpc_weight_key(const void * data, size_t size, uint8_t kind, uin
     return h;
 }
 
+// ---- batched warm load (client) -------------------------------------------
+// A pipeline (-sm layer) load streamed ~1 weight/tensor through set_tensor, each a synchronous
+// LOAD_CACHED round-trip -> ~1 s/tensor, dominated by WiFi round-trips, not the ~25 s of local
+// SD reads. Instead DEFER each weight into a per-server batch and flush it as ONE
+// RPC_CMD_BATCH_LOAD_CACHED: the server loads every hit from its LOCAL disk (no per-tensor
+// round-trip); the client uploads only the misses. We keep a COPY of each tensor's bytes (a
+// cheap RAM memcpy of the loader's already-paged data): the loader unmaps its mmap at the end
+// of load_all_data, so a raw src pointer would dangle by graph_compute (miss uploads would
+// SIGSEGV). To bound memory we flush a server's batch once it reaches ~64 MB (during load);
+// the residual is flushed at the first graph_compute, before any compute reads the weights.
+struct rpc_pending_load {
+    rpc_tensor           rt;
+    uint64_t             key;
+    std::vector<uint8_t> data;  // owned copy (the loader's mmap is released before we flush)
+};
+static const size_t                                                  RPC_BATCH_FLUSH_BYTES = 64 * 1024 * 1024;
+static std::mutex                                                     g_pending_mtx;
+static std::unordered_map<std::string, std::vector<rpc_pending_load>> g_pending_loads;
+static std::unordered_map<std::string, size_t>                       g_pending_bytes;
+static std::atomic<bool>                                             g_have_pending{ false };
+
+// Flush one server's batch: query all keys in one message (server loads hits from local disk),
+// then upload the misses from our owned copies. `list` is consumed.
+static void rpc_flush_endpoint(const std::string & endpoint, std::vector<rpc_pending_load> & list) {
+    const uint32_t n = (uint32_t) list.size();
+    if (n == 0) {
+        return;
+    }
+    auto sock = get_socket(endpoint);
+    if (sock) {
+        const size_t         entry = sizeof(rpc_tensor) + sizeof(uint64_t);
+        std::vector<uint8_t> req(sizeof(uint32_t) + (size_t) n * entry);
+        memcpy(req.data(), &n, sizeof(n));
+        size_t off = sizeof(uint32_t);
+        for (const auto & e : list) {
+            memcpy(req.data() + off, &e.rt, sizeof(rpc_tensor));
+            off += sizeof(rpc_tensor);
+            memcpy(req.data() + off, &e.key, sizeof(uint64_t));
+            off += sizeof(uint64_t);
+        }
+        std::vector<uint8_t> hits(n, 0);
+        bool                 ok = send_rpc_cmd(sock, RPC_CMD_BATCH_LOAD_CACHED, req.data(), req.size(), hits.data(), hits.size());
+        int                  n_hit = 0, n_miss = 0;
+        for (uint32_t i = 0; i < n; ++i) {
+            rpc_pending_load & e = list[i];
+            if (ok && hits[i]) {
+                n_hit++;
+                continue;  // server loaded it from its local cache
+            }
+            n_miss++;
+            // MISS: upload + persist (SET_TENSOR_CACHE): | rpc_tensor | offset(8)=0 | key(8) | data |
+            std::vector<uint8_t> in(sizeof(rpc_tensor) + 2 * sizeof(uint64_t) + e.data.size());
+            uint64_t             offset0 = 0;
+            memcpy(in.data(), &e.rt, sizeof(rpc_tensor));
+            memcpy(in.data() + sizeof(rpc_tensor), &offset0, sizeof(offset0));
+            memcpy(in.data() + sizeof(rpc_tensor) + sizeof(offset0), &e.key, sizeof(uint64_t));
+            memcpy(in.data() + sizeof(rpc_tensor) + 2 * sizeof(uint64_t), e.data.data(), e.data.size());
+            send_rpc_cmd(sock, RPC_CMD_SET_TENSOR_CACHE, in.data(), in.size(), nullptr, 0);
+        }
+        static const bool dbg = getenv("RPC_DBG_WCACHE") != nullptr;
+        if (dbg) {
+            GGML_LOG_INFO("[wcache] BATCH %s: %d hit, %d miss (of %u)\n", endpoint.c_str(), n_hit, n_miss, n);
+        }
+    }
+    list.clear();
+}
+
+static void rpc_queue_cached_load(const std::string & endpoint, const rpc_tensor & rt, uint64_t key,
+                                  const void * src, size_t size) {
+    std::vector<rpc_pending_load> to_flush;  // swapped out under the lock, flushed after releasing it
+    std::string                   flush_ep;
+    {
+        std::lock_guard<std::mutex> lk(g_pending_mtx);
+        auto &                      list = g_pending_loads[endpoint];
+        list.push_back({ rt, key, std::vector<uint8_t>((const uint8_t *) src, (const uint8_t *) src + size) });
+        g_pending_bytes[endpoint] += size;
+        g_have_pending.store(true);
+        if (g_pending_bytes[endpoint] >= RPC_BATCH_FLUSH_BYTES) {
+            to_flush.swap(list);
+            g_pending_bytes[endpoint] = 0;
+            flush_ep                  = endpoint;
+        }
+    }
+    if (!to_flush.empty()) {
+        rpc_flush_endpoint(flush_ep, to_flush);
+    }
+}
+
+// Flush every remaining server batch (the residual under the byte threshold). Called at the top
+// of graph_compute so all weights are in place before any compute.
+static void rpc_flush_pending_loads() {
+    if (!g_have_pending.exchange(false)) {
+        return;
+    }
+    std::unordered_map<std::string, std::vector<rpc_pending_load>> batches;
+    {
+        std::lock_guard<std::mutex> lk(g_pending_mtx);
+        batches.swap(g_pending_loads);
+        g_pending_bytes.clear();
+    }
+    for (auto & kv : batches) {
+        rpc_flush_endpoint(kv.first, kv.second);
+    }
+}
+
 static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data,
                                                size_t offset, size_t size) {
     // GGML_LOG_INFO("[%s] setting tensor %s, offset=%zu, size=%zu\n", __func__, tensor->name, offset, size);
@@ -1386,25 +1492,11 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
     static const bool weight_cache = rpc_opt_enabled() && (getenv("RPC_NO_WEIGHT_CACHE") == nullptr);
     if (weight_cache && !split && offset == 0 &&
         ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
-        const uint64_t          hash = rpc_weight_key(data, size, RPC_WKIND_WHOLE, 0, -1);
-        rpc_msg_load_cached_req qreq;
-        qreq.tensor = rpc_tensor1;
-        qreq.hash   = hash;
-        rpc_msg_load_cached_rsp qrsp;
-        qrsp.hit = 0;
-        bool qok = send_rpc_cmd(ctx->sock, RPC_CMD_LOAD_CACHED, &qreq, sizeof(qreq), &qrsp, sizeof(qrsp));
-        GGML_ASSERT(qok);
-        if (qrsp.hit) {
-            return;  // cache HIT -> no WiFi upload
-        }
-        // miss: | rpc_tensor | offset (8) | hash (8) | data | -> server writes AND persists
-        std::vector<uint8_t> in(sizeof(rpc_tensor) + sizeof(uint64_t) + sizeof(uint64_t) + size);
-        memcpy(in.data(), &rpc_tensor1, sizeof(rpc_tensor));
-        memcpy(in.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
-        memcpy(in.data() + sizeof(rpc_tensor) + sizeof(offset), &hash, sizeof(hash));
-        memcpy(in.data() + sizeof(rpc_tensor) + sizeof(offset) + sizeof(hash), data, size);
-        bool ok = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR_CACHE, in.data(), in.size(), nullptr, 0);
-        GGML_ASSERT(ok);
+        // Defer this weight's cache load into the per-server batch; flushed as ONE
+        // RPC_CMD_BATCH_LOAD_CACHED at graph_compute so the server loads all hits from its local
+        // disk in one shot (no per-tensor round-trip). Misses are uploaded there via the mmap src.
+        const uint64_t key = rpc_weight_key(data, size, RPC_WKIND_WHOLE, 0, -1);
+        rpc_queue_cached_load(buft_ctx->endpoint, rpc_tensor1, key, data, size);
         return;
     }
 
@@ -3267,6 +3359,10 @@ static std::atomic<long long> g_bst_ns{ 0 };      // build_segment_tensors only 
 
 static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     // GGML_LOG_INFO("graph compute for cgraph %x\n", (uint64_t) cgraph);
+    // Flush any deferred weight loads (batched warm load) before the first compute -- one
+    // RPC_CMD_BATCH_LOAD_CACHED per server loads all its cache hits from local disk, so every
+    // weight is in place before the graph runs. No-op once flushed (g_have_pending is cleared).
+    rpc_flush_pending_loads();
     static std::unordered_map<uint64_t, uint8_t> graph_splits;  //{graph: number}
     static uint8_t                               global_graph_number = 0;
     ggml_backend_rpc_context *                   rpc_ctx             = (ggml_backend_rpc_context *) backend->context;
@@ -4830,6 +4926,7 @@ class rpc_server {
     bool graph_advance(uint8_t graph_number);
     bool load_cached(const rpc_msg_load_cached_req & request, rpc_msg_load_cached_rsp & response);
     bool set_tensor_cache(const std::vector<uint8_t> & input);
+    bool batch_load_cached(const std::vector<uint8_t> & input, std::vector<uint8_t> & response);
 
     ggml_backend_t & get_backend() { return backend; }
   private:
@@ -5223,6 +5320,79 @@ bool rpc_server::set_tensor_cache(const std::vector<uint8_t> & input) {
                 since_prune.store(0);
                 rpc_weight_cache_prune();
             }
+        }
+    }
+    return true;
+}
+
+// BATCH_LOAD_CACHED: | n(4) | { rpc_tensor | key(8) } * n |. For each entry, load the cache HIT
+// from local disk straight into its buffer and set response[i]=1; a miss leaves 0 (the client
+// uploads it). Parallelized across a small thread pool -- entries write distinct buffer regions,
+// so no locking. Replaces ~n sequential per-tensor LOAD_CACHED round-trips with one message.
+bool rpc_server::batch_load_cached(const std::vector<uint8_t> & input, std::vector<uint8_t> & response) {
+    if (input.size() < sizeof(uint32_t)) {
+        return false;
+    }
+    uint32_t n;
+    memcpy(&n, input.data(), sizeof(n));
+    const size_t entry = sizeof(rpc_tensor) + sizeof(uint64_t);
+    if (input.size() != sizeof(uint32_t) + (size_t) n * entry) {
+        return false;
+    }
+    response.assign(n, 0);
+    if (n == 0 || !rpc_weight_cache_enabled()) {
+        return true;  // all miss -> client uploads
+    }
+    const uint8_t * base   = input.data() + sizeof(uint32_t);
+    auto            worker = [&](uint32_t lo, uint32_t hi) {
+        for (uint32_t i = lo; i < hi; ++i) {
+            const uint8_t *    p  = base + (size_t) i * entry;
+            const rpc_tensor * rt = (const rpc_tensor *) p;
+            uint64_t           key;
+            memcpy(&key, p + sizeof(rpc_tensor), sizeof(key));
+            const std::string path = rpc_weight_cache_path(key);
+            std::ifstream     f(path, std::ios::binary | std::ios::ate);
+            if (!f) {
+                continue;  // miss
+            }
+            const std::streamsize sz = f.tellg();
+            if (sz <= 0) {
+                continue;
+            }
+            f.seekg(0, std::ios::beg);
+            std::vector<uint8_t> data((size_t) sz);
+            if (!f.read((char *) data.data(), sz)) {
+                continue;
+            }
+            struct ggml_init_params params{ ggml_tensor_overhead(), NULL, true };
+            struct ggml_context *   ctx    = ggml_init(params);
+            ggml_tensor *           tensor = deserialize_tensor(ctx, rt);
+            if (tensor != nullptr && (size_t) sz == ggml_nbytes(tensor)) {
+                ggml_backend_tensor_set(tensor, data.data(), 0, (size_t) sz);  // distinct region per entry
+                response[i] = 1;                                               // hit
+#ifndef _WIN32
+                utime(path.c_str(), nullptr);  // LRU touch
+#endif
+            }
+            ggml_free(ctx);
+        }
+    };
+    const unsigned hw       = std::thread::hardware_concurrency();
+    const unsigned nthreads = std::min<unsigned>(hw ? hw : 4u, 4u);
+    if (n <= 1 || nthreads <= 1) {
+        worker(0, n);
+    } else {
+        std::vector<std::thread> pool;
+        const uint32_t           chunk = (n + nthreads - 1) / nthreads;
+        for (unsigned t = 0; t < nthreads; ++t) {
+            const uint32_t lo = (uint32_t) t * chunk;
+            const uint32_t hi = std::min<uint32_t>(n, lo + chunk);
+            if (lo < hi) {
+                pool.emplace_back(worker, lo, hi);
+            }
+        }
+        for (auto & th : pool) {
+            th.join();
         }
     }
     return true;
@@ -6861,6 +7031,21 @@ static void rpc_serve_client(rpc_server & server, sockfd_t sockfd, size_t free_m
                         return;
                     }
                     if (!send_msg(sockfd, nullptr, 0)) {
+                        return;
+                    }
+                    break;
+                }
+            case RPC_CMD_BATCH_LOAD_CACHED:
+                {
+                    std::vector<uint8_t> input;
+                    if (!recv_msg(sockfd, input)) {
+                        return;
+                    }
+                    std::vector<uint8_t> response;
+                    if (!server.batch_load_cached(input, response)) {
+                        return;
+                    }
+                    if (!send_msg(sockfd, response.data(), response.size())) {
                         return;
                     }
                     break;
