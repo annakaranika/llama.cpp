@@ -3847,12 +3847,11 @@ bool llama_model::move_layer_weights(int il, ggml_backend_dev_t dst) {
     // copy each tensor's bytes source -> destination, then repoint the ORIGINAL tensor object (which
     // the graph references) at the destination memory. The old buffer is left in place for now
     // (it is shared with this device's other layers; reclaiming it is a separate re-partition step).
-    std::vector<uint8_t> tmp;
+    // ggml_backend_tensor_copy does a direct source->dest copy when possible: for two RPC tensors it
+    // routes through the backend's cross-server cpy_tensor (a peer-to-peer push), avoiding the host
+    // round-trip (2x -> 1x over the link), and falls back to a host relay otherwise.
     for (size_t i = 0; i < src.size(); i++) {
-        const size_t nb = ggml_nbytes(src[i]);
-        tmp.resize(nb);
-        ggml_backend_tensor_get(src[i], tmp.data(), 0, nb);
-        ggml_backend_tensor_set(dup[i], tmp.data(), 0, nb);
+        ggml_backend_tensor_copy(src[i], dup[i]);
         src[i]->buffer = dup[i]->buffer;
         src[i]->data   = dup[i]->data;
         src[i]->extra  = dup[i]->extra;

@@ -350,14 +350,10 @@ bool llama_kv_cache_move_layer(
         }
     }
 
-    // same capacity -> identical layout, so copy the whole K and V tensors verbatim
-    std::vector<uint8_t> tmp;
-    tmp.resize(ggml_nbytes(cache.k_l[il]));
-    ggml_backend_tensor_get(cache.k_l[il], tmp.data(), 0, tmp.size());
-    ggml_backend_tensor_set(new_k, tmp.data(), 0, tmp.size());
-    tmp.resize(ggml_nbytes(cache.v_l[il]));
-    ggml_backend_tensor_get(cache.v_l[il], tmp.data(), 0, tmp.size());
-    ggml_backend_tensor_set(new_v, tmp.data(), 0, tmp.size());
+    // same capacity -> identical layout, so copy the whole K and V verbatim. ggml_backend_tensor_copy
+    // uses a direct source->dest peer copy (RPC cpy_tensor -> SEND_TO_PEER) when possible, else a relay.
+    ggml_backend_tensor_copy(cache.k_l[il], new_k);
+    ggml_backend_tensor_copy(cache.v_l[il], new_v);
 
     cache.k_l[il] = new_k;
     cache.v_l[il] = new_v;

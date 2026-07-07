@@ -8670,38 +8670,40 @@ static int llama_decode_impl(
                 load[model.dev_layer(il)] += b / (1024.0*1024.0);
                 cnt [model.dev_layer(il)] += 1;
             }
-            ggml_backend_dev_t dmax = nullptr, dmin = nullptr;
-            for (auto * d : model.devices) {
-                if (!dmax || load[d] > load[dmax]) dmax = d;
-                if (!dmin || load[d] < load[dmin]) dmin = d;
+            // most-loaded device + its position in the pipeline order (model.devices is stage order)
+            ggml_backend_dev_t dmax = nullptr;
+            int imax = -1;
+            for (int k = 0; k < (int) model.devices.size(); k++) {
+                if (!dmax || load[model.devices[k]] > load[dmax]) { dmax = model.devices[k]; imax = k; }
             }
+            // shift to an ADJACENT pipeline neighbor (keeps stages contiguous -> no extra handoffs),
+            // preferring the lower-loaded side; move the EDGE layer toward it (highest layer if going
+            // to the next stage, lowest if going to the previous).
+            ggml_backend_dev_t prev = imax-1 >= 0 ? model.devices[imax-1] : nullptr;
+            ggml_backend_dev_t next = imax+1 < (int) model.devices.size() ? model.devices[imax+1] : nullptr;
+            ggml_backend_dev_t target = nullptr; bool up = false;
+            if (prev && (!next || load[prev] <= load[next])) { target = prev; up = false; }
+            else if (next)                                   { target = next; up = true;  }
             // only shift if the source is over budget AND has >=2 more layers than the target, so the
-            // shift reduces the imbalance and the policy converges (stops within one layer of balance)
-            // instead of thrashing once every device is over a fixed budget.
-            if (dmax && dmin && dmax != dmin && load[dmax] > budget_mb && cnt[dmax] >= cnt[dmin] + 2) {
-                // move the highest-indexed layer on dmax to dmin (non-contiguous placement is fine)
-                for (int il = (int) hparams.n_layer - 1; il >= 0; il--) {
-                    if (model.dev_layer(il) == dmax) {
-                        // measure the shift overhead: bytes moved (weights + KV) and wall-clock
-                        size_t wbytes = 0;
-                        {
-                            char pfx[64]; snprintf(pfx, sizeof(pfx), "blk.%d.", il);
-                            for (auto & nt : model.tensors_by_name) {
-                                if (nt.first.rfind(pfx, 0) == 0) wbytes += ggml_nbytes(nt.second);
-                            }
-                        }
-                        const size_t kvbytes = ggml_nbytes(kv_self.k_l[il]) + ggml_nbytes(kv_self.v_l[il]);
-                        const int64_t ts0 = ggml_time_us();
-                        const_cast<llama_model &>(model).move_layer_weights(il, dmin);
-                        const int64_t ts1 = ggml_time_us();
-                        llama_kv_cache_move_layer(kv_self, model, il, dmin);
-                        const int64_t ts2 = ggml_time_us();
-                        fprintf(stderr, "[rebalance] SHIFT layer %d %s->%s: weights=%.1fMB kv=%.2fMB | total=%.0fms (weights=%.0fms kv=%.0fms) | cells=%u\n",
-                                il, ggml_backend_dev_name(dmax), ggml_backend_dev_name(dmin),
-                                wbytes/1e6, kvbytes/1e6, (ts2-ts0)/1e3, (ts1-ts0)/1e3, (ts2-ts1)/1e3, cells);
-                        rb_last = rb_tok;
-                        break;
-                    }
+            // shift reduces the imbalance and the policy converges instead of thrashing.
+            if (dmax && target && load[dmax] > budget_mb && cnt[dmax] >= cnt[target] + 2) {
+                int il = -1;
+                if (up) { for (int k = (int) hparams.n_layer - 1; k >= 0; k--) if (model.dev_layer(k) == dmax) { il = k; break; } }
+                else    { for (int k = 0; k < (int) hparams.n_layer; k++)      if (model.dev_layer(k) == dmax) { il = k; break; } }
+                if (il >= 0) {
+                    size_t wbytes = 0;
+                    { char pfx[64]; snprintf(pfx, sizeof(pfx), "blk.%d.", il);
+                      for (auto & nt : model.tensors_by_name) if (nt.first.rfind(pfx, 0) == 0) wbytes += ggml_nbytes(nt.second); }
+                    const size_t kvbytes = ggml_nbytes(kv_self.k_l[il]) + ggml_nbytes(kv_self.v_l[il]);
+                    const int64_t ts0 = ggml_time_us();
+                    const_cast<llama_model &>(model).move_layer_weights(il, target);
+                    const int64_t ts1 = ggml_time_us();
+                    llama_kv_cache_move_layer(kv_self, model, il, target);
+                    const int64_t ts2 = ggml_time_us();
+                    fprintf(stderr, "[rebalance] SHIFT layer %d %s->%s: weights=%.1fMB kv=%.2fMB | total=%.0fms (weights=%.0fms kv=%.0fms) | cells=%u\n",
+                            il, ggml_backend_dev_name(dmax), ggml_backend_dev_name(target),
+                            wbytes/1e6, kvbytes/1e6, (ts2-ts0)/1e3, (ts1-ts0)/1e3, (ts2-ts1)/1e3, cells);
+                    rb_last = rb_tok;
                 }
             }
         }
