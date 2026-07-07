@@ -358,6 +358,11 @@ struct llama_model {
     ggml_backend_dev_t dev_layer(int il) const;
     ggml_backend_dev_t dev_output() const;
 
+    // Elastic rebalancing: re-home layer il's weight tensors onto device dst and update the
+    // layer->device map, so the next forward (placement is re-derived each decode) schedules the
+    // layer on dst. Returns false if dst is invalid / already the layer's device.
+    bool move_layer_weights(int il, ggml_backend_dev_t dst);
+
     ggml_backend_buffer_type_t select_buft(int il) const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;

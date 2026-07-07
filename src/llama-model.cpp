@@ -3800,6 +3800,76 @@ ggml_backend_dev_t llama_model::dev_layer(int il) const {
     return pimpl->dev_layer.at(il).dev;
 }
 
+bool llama_model::move_layer_weights(int il, ggml_backend_dev_t dst) {
+    if (il < 0 || il >= (int) pimpl->dev_layer.size() || dst == nullptr) {
+        return false;
+    }
+    if (pimpl->dev_layer[il].dev == dst) {
+        return false;  // already there
+    }
+
+    ggml_backend_buffer_type_t dst_buft = ggml_backend_dev_buffer_type(dst);
+
+    // collect this layer's weight tensors by name prefix "blk.<il>."
+    char prefix[64];
+    snprintf(prefix, sizeof(prefix), "blk.%d.", il);
+    std::vector<ggml_tensor *> src;
+    for (auto & nt : tensors_by_name) {
+        if (nt.first.rfind(prefix, 0) == 0) {
+            src.push_back(nt.second);
+        }
+    }
+    if (src.empty()) {
+        return false;
+    }
+
+    // duplicate the tensors into a fresh context and allocate them on the destination buffer type
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ size_t(2u*src.size()*ggml_tensor_overhead()),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        return false;
+    }
+    std::vector<ggml_tensor *> dup(src.size(), nullptr);
+    for (size_t i = 0; i < src.size(); i++) {
+        dup[i] = ggml_dup_tensor(ctx, src[i]);
+        ggml_set_name(dup[i], src[i]->name);
+    }
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, dst_buft);
+    if (!buf) {
+        ggml_free(ctx);
+        return false;
+    }
+
+    // copy each tensor's bytes source -> destination, then repoint the ORIGINAL tensor object (which
+    // the graph references) at the destination memory. The old buffer is left in place for now
+    // (it is shared with this device's other layers; reclaiming it is a separate re-partition step).
+    std::vector<uint8_t> tmp;
+    for (size_t i = 0; i < src.size(); i++) {
+        const size_t nb = ggml_nbytes(src[i]);
+        tmp.resize(nb);
+        ggml_backend_tensor_get(src[i], tmp.data(), 0, nb);
+        ggml_backend_tensor_set(dup[i], tmp.data(), 0, nb);
+        src[i]->buffer = dup[i]->buffer;
+        src[i]->data   = dup[i]->data;
+        src[i]->extra  = dup[i]->extra;
+    }
+
+    // keep the destination context/buffer alive, and update the layer -> device map so the next
+    // forward (placement is re-derived every decode from tensor->buffer + dev_layer) runs il on dst
+    pimpl->ctxs.emplace_back(ctx);
+    pimpl->bufs.emplace_back(buf);
+    pimpl->dev_layer[il].dev = dst;
+    auto bit = pimpl->gpu_buft_list.find(dst);
+    if (bit != pimpl->gpu_buft_list.end()) {
+        pimpl->dev_layer[il].buft_list = &bit->second;
+    }
+    return true;
+}
+
 ggml_backend_dev_t llama_model::dev_output() const {
     return pimpl->dev_output.dev;
 }

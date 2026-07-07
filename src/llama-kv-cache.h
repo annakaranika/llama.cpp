@@ -114,6 +114,15 @@ bool llama_kv_cache_grow(
             const llama_model & model,
                      uint32_t   new_size);
 
+// Elastic rebalancing: migrate layer il's K/V tensors onto device dst (same capacity, different
+// device), copying the live data. Pairs with llama_model::move_layer_weights so a moved layer's KV
+// lives on the same device as its weights. Returns true if it moved.
+bool llama_kv_cache_move_layer(
+        struct llama_kv_cache & cache,
+            const llama_model & model,
+                          int   il,
+           ggml_backend_dev_t   dst);
+
 // find an empty slot of size "n_tokens" in the cache
 // updates the cache head
 // returns a structure holding information about the slot found

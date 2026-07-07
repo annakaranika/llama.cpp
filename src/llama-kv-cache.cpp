@@ -293,6 +293,79 @@ bool llama_kv_cache_grow(
     return true;
 }
 
+bool llama_kv_cache_move_layer(
+        struct llama_kv_cache & cache,
+            const llama_model & model,
+                          int   il,
+           ggml_backend_dev_t   dst) {
+    if (il < 0 || il >= (int) cache.k_l.size() || dst == nullptr) {
+        return false;
+    }
+    ggml_backend_buffer_type_t dst_buft = ggml_backend_dev_buffer_type(dst);
+    if (ggml_backend_buffer_get_type(cache.k_l[il]->buffer) == dst_buft) {
+        return false;  // already on dst
+    }
+
+    const struct llama_hparams & hparams = model.hparams;
+    const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(il) + hparams.n_embd_k_s();
+    const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il) + hparams.n_embd_v_s();
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ size_t(2u*ggml_tensor_overhead()),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        return false;
+    }
+    ggml_tensor * new_k = ggml_new_tensor_1d(ctx, cache.type_k, (int64_t) n_embd_k_gqa*cache.size);
+    ggml_tensor * new_v = ggml_new_tensor_1d(ctx, cache.type_v, (int64_t) n_embd_v_gqa*cache.size);
+    ggml_format_name(new_k, "cache_k_l%d", il);
+    ggml_format_name(new_v, "cache_v_l%d", il);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, dst_buft);
+    if (!buf) {
+        ggml_free(ctx);
+        return false;
+    }
+    ggml_backend_buffer_clear(buf, 0);
+    cache.bufs.emplace_back(buf);
+    // peer/RPC: mirror the per-device buffer registration done at init / grow
+    if (ggml_backend_buft_name(dst_buft)[0] == 'R' && ggml_backend_buft_name(dst_buft)[1] == 'P' && ggml_backend_buft_name(dst_buft)[2] == 'C') {
+        for (struct ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->extra != NULL) {
+                ggml_tensor_extra_rpc * t_extra = (ggml_tensor_extra_rpc *) t->extra;
+                for (int d = 0; d < ggml_backend_rpc_get_device_count(); d++) {
+                    if (t_extra->buffer_ctx[d] != NULL && t_extra->buffer_ctx[d]->remote_ptr != ((ggml_backend_rpc_buffer_context *) buf->context)->remote_ptr) {
+                        ggml_backend_rpc_device_context * dev_ctx = (ggml_backend_rpc_device_context *) ggml_backend_rpc_get_device(d)->context;
+                        auto new_buft = ggml_backend_rpc_buffer_type(dev_ctx->endpoint.c_str());
+                        ggml_backend_buffer_t nb = ggml_backend_buffer_init(new_buft, buf->iface, t_extra->buffer_ctx[d], ggml_nbytes(t));
+                        if (nb == NULL) { return false; }
+                        ggml_backend_buffer_clear(nb, 0);
+                        cache.bufs.emplace_back(nb);
+                    }
+                }
+            }
+        }
+    }
+
+    // same capacity -> identical layout, so copy the whole K and V tensors verbatim
+    std::vector<uint8_t> tmp;
+    tmp.resize(ggml_nbytes(cache.k_l[il]));
+    ggml_backend_tensor_get(cache.k_l[il], tmp.data(), 0, tmp.size());
+    ggml_backend_tensor_set(new_k, tmp.data(), 0, tmp.size());
+    tmp.resize(ggml_nbytes(cache.v_l[il]));
+    ggml_backend_tensor_get(cache.v_l[il], tmp.data(), 0, tmp.size());
+    ggml_backend_tensor_set(new_v, tmp.data(), 0, tmp.size());
+
+    cache.k_l[il] = new_k;
+    cache.v_l[il] = new_v;
+    cache.ctxs.emplace_back(ctx);
+    LLAMA_LOG_INFO("%s: moved layer %d KV to %s\n", __func__, il, ggml_backend_buft_name(dst_buft));
+    return true;
+}
+
 struct llama_kv_cache_slot_info llama_kv_cache_find_slot(
            struct llama_kv_cache & cache,
        const struct llama_ubatch & ubatch) {

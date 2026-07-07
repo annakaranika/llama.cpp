@@ -8629,6 +8629,67 @@ static int llama_decode_impl(
     auto & kv_self = lctx.kv_self;
     llama_kv_slot_restorer kv_slot_restorer(kv_self);
 
+    // elastic rebalancing manual test hook: at token LLAMA_MOVE_AT, re-home layer LLAMA_MOVE_LAYER
+    // onto device index LLAMA_MOVE_TO (into model.devices). One-shot; placement is re-derived on the
+    // next graph build. (The KV for that layer stays put for now -> the sched copies it cross-backend.)
+    {
+        static const int mv_layer = getenv("LLAMA_MOVE_LAYER") ? atoi(getenv("LLAMA_MOVE_LAYER")) : -1;
+        static const int mv_to    = getenv("LLAMA_MOVE_TO")    ? atoi(getenv("LLAMA_MOVE_TO"))    : -1;
+        static const int mv_at    = getenv("LLAMA_MOVE_AT")    ? atoi(getenv("LLAMA_MOVE_AT"))    :  0;
+        static int  mv_tok  = 0;
+        static bool mv_done = false;
+        if (mv_layer >= 0 && mv_to >= 0 && !mv_done && mv_tok >= mv_at) {
+            const auto & devs = lctx.model.devices;
+            if (mv_to < (int) devs.size()) {
+                fprintf(stderr, "[rebalance] moving layer %d -> device %d (%s) at token %d\n",
+                        mv_layer, mv_to, ggml_backend_dev_name(devs[mv_to]), mv_tok);
+                bool ok = const_cast<llama_model &>(lctx.model).move_layer_weights(mv_layer, devs[mv_to]);
+                bool okv = llama_kv_cache_move_layer(kv_self, lctx.model, mv_layer, devs[mv_to]);
+                fprintf(stderr, "[rebalance] move_layer_weights=%d move_layer_kv=%d\n", (int) ok, (int) okv);
+            }
+            mv_done = true;
+        }
+        mv_tok += batch.n_tokens;
+    }
+
+    // gated elastic rebalance: when the most-loaded device's KV footprint exceeds a budget, shift one
+    // of its layers to the least-loaded device. Cooldown (LLAMA_REBALANCE_COOLDOWN tokens) avoids
+    // thrashing -- every shift moves a layer's weights+KV over the link, so we rebalance sparingly.
+    {
+        static const double budget_mb = getenv("LLAMA_REBALANCE_BUDGET_MB") ? atof(getenv("LLAMA_REBALANCE_BUDGET_MB")) : 0.0;
+        static const int    cooldown  = getenv("LLAMA_REBALANCE_COOLDOWN")  ? atoi(getenv("LLAMA_REBALANCE_COOLDOWN"))  : 32;
+        static int rb_tok = 0, rb_last = -1000000;
+        if (budget_mb > 0.0 && rb_tok - rb_last >= cooldown) {
+            const uint32_t cells = kv_self.size;
+            const size_t   elt   = ggml_type_size(kv_self.type_k) + ggml_type_size(kv_self.type_v);
+            // per-device KV bytes (this decode's capacity) across the layers it holds
+            std::map<ggml_backend_dev_t, double> load;
+            for (int il = 0; il < (int) hparams.n_layer; il++) {
+                const double b = (double) cells * (hparams.n_embd_k_gqa(il) + hparams.n_embd_v_gqa(il)) * elt;
+                load[model.dev_layer(il)] += b / (1024.0*1024.0);
+            }
+            ggml_backend_dev_t dmax = nullptr, dmin = nullptr;
+            for (auto * d : model.devices) {
+                if (!dmax || load[d] > load[dmax]) dmax = d;
+                if (!dmin || load[d] < load[dmin]) dmin = d;
+            }
+            if (dmax && dmin && dmax != dmin && load[dmax] > budget_mb) {
+                // move the highest-indexed layer on dmax to dmin (non-contiguous placement is fine)
+                for (int il = (int) hparams.n_layer - 1; il >= 0; il--) {
+                    if (model.dev_layer(il) == dmax) {
+                        fprintf(stderr, "[rebalance] gated shift: layer %d %s->%s (load %.0f>%0.f MB, cells %u)\n",
+                                il, ggml_backend_dev_name(dmax), ggml_backend_dev_name(dmin), load[dmax], budget_mb, cells);
+                        const_cast<llama_model &>(model).move_layer_weights(il, dmin);
+                        llama_kv_cache_move_layer(kv_self, model, il, dmin);
+                        rb_last = rb_tok;
+                        break;
+                    }
+                }
+            }
+        }
+        rb_tok += batch.n_tokens;
+    }
+
     const int64_t n_embd  = hparams.n_embd;
     const int64_t n_vocab = vocab.n_tokens();
 
