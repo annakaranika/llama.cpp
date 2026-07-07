@@ -8662,18 +8662,23 @@ static int llama_decode_impl(
         if (budget_mb > 0.0 && rb_tok - rb_last >= cooldown) {
             const uint32_t cells = kv_self.size;
             const size_t   elt   = ggml_type_size(kv_self.type_k) + ggml_type_size(kv_self.type_v);
-            // per-device KV bytes (this decode's capacity) across the layers it holds
+            // per-device KV bytes (this decode's capacity) + layer count
             std::map<ggml_backend_dev_t, double> load;
+            std::map<ggml_backend_dev_t, int>    cnt;
             for (int il = 0; il < (int) hparams.n_layer; il++) {
                 const double b = (double) cells * (hparams.n_embd_k_gqa(il) + hparams.n_embd_v_gqa(il)) * elt;
                 load[model.dev_layer(il)] += b / (1024.0*1024.0);
+                cnt [model.dev_layer(il)] += 1;
             }
             ggml_backend_dev_t dmax = nullptr, dmin = nullptr;
             for (auto * d : model.devices) {
                 if (!dmax || load[d] > load[dmax]) dmax = d;
                 if (!dmin || load[d] < load[dmin]) dmin = d;
             }
-            if (dmax && dmin && dmax != dmin && load[dmax] > budget_mb) {
+            // only shift if the source is over budget AND has >=2 more layers than the target, so the
+            // shift reduces the imbalance and the policy converges (stops within one layer of balance)
+            // instead of thrashing once every device is over a fixed budget.
+            if (dmax && dmin && dmax != dmin && load[dmax] > budget_mb && cnt[dmax] >= cnt[dmin] + 2) {
                 // move the highest-indexed layer on dmax to dmin (non-contiguous placement is fine)
                 for (int il = (int) hparams.n_layer - 1; il >= 0; il--) {
                     if (model.dev_layer(il) == dmax) {
