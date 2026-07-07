@@ -8682,10 +8682,23 @@ static int llama_decode_impl(
                 // move the highest-indexed layer on dmax to dmin (non-contiguous placement is fine)
                 for (int il = (int) hparams.n_layer - 1; il >= 0; il--) {
                     if (model.dev_layer(il) == dmax) {
-                        fprintf(stderr, "[rebalance] gated shift: layer %d %s->%s (load %.0f>%0.f MB, cells %u)\n",
-                                il, ggml_backend_dev_name(dmax), ggml_backend_dev_name(dmin), load[dmax], budget_mb, cells);
+                        // measure the shift overhead: bytes moved (weights + KV) and wall-clock
+                        size_t wbytes = 0;
+                        {
+                            char pfx[64]; snprintf(pfx, sizeof(pfx), "blk.%d.", il);
+                            for (auto & nt : model.tensors_by_name) {
+                                if (nt.first.rfind(pfx, 0) == 0) wbytes += ggml_nbytes(nt.second);
+                            }
+                        }
+                        const size_t kvbytes = ggml_nbytes(kv_self.k_l[il]) + ggml_nbytes(kv_self.v_l[il]);
+                        const int64_t ts0 = ggml_time_us();
                         const_cast<llama_model &>(model).move_layer_weights(il, dmin);
+                        const int64_t ts1 = ggml_time_us();
                         llama_kv_cache_move_layer(kv_self, model, il, dmin);
+                        const int64_t ts2 = ggml_time_us();
+                        fprintf(stderr, "[rebalance] SHIFT layer %d %s->%s: weights=%.1fMB kv=%.2fMB | total=%.0fms (weights=%.0fms kv=%.0fms) | cells=%u\n",
+                                il, ggml_backend_dev_name(dmax), ggml_backend_dev_name(dmin),
+                                wbytes/1e6, kvbytes/1e6, (ts2-ts0)/1e3, (ts1-ts0)/1e3, (ts2-ts1)/1e3, cells);
                         rb_last = rb_tok;
                         break;
                     }
