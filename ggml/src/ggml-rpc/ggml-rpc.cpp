@@ -409,7 +409,10 @@ static bool rpc_xpersist_dbg() {
 static std::mutex g_rmodel_mtx;
 static bool       g_rmodel_active = false;   // inside a persist load window
 static uint64_t   g_rmodel_key    = 0;       // current model_key
-// weight buffers freshly allocated this window (to REGISTER at persist_end): (sock, remote_ptr)
+// weight buffers freshly allocated this window (to REGISTER at persist_end): (sock, remote_ptr).
+// Only the non-split (pipeline / -sm layer) path participates -- the TP split path is not persisted
+// (its per-slice server buffers can't be reliably reused across processes; -sm row gets warm loads
+// from the on-disk weight cache instead).
 static std::vector<std::pair<std::shared_ptr<socket_t>, uint64_t>> g_rmodel_pending;
 
 //split context
@@ -3793,9 +3796,18 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
 
             graph_splits[reinterpret_cast<uint64_t>(cgraph)] = global_graph_number;
             if (use_diff_cache) {
+                // this_graph_number can be a WRAPPED reuse (the number is a uint8_t). Purge any prior
+                // topology still mapped to it, else that stale topo_hash -> number entry would later
+                // score a false cache-hit and patch this number for the WRONG topology.
+                for (auto it = graph_cache.begin(); it != graph_cache.end();) {
+                    it = (it->second == this_graph_number) ? graph_cache.erase(it) : std::next(it);
+                }
                 graph_cache[topo_hash] = this_graph_number;  // remember: this topology -> this graph_number
             }
-            global_graph_number++;
+            // The number wraps naturally at 256 (uint8_t). RPC_GRAPH_WRAP_AT lowers the wrap point
+            // for testing the reuse path (forces collisions after a few topologies); default 256.
+            static const int wrap_at = getenv("RPC_GRAPH_WRAP_AT") ? atoi(getenv("RPC_GRAPH_WRAP_AT")) : 256;
+            global_graph_number = (uint8_t) ((global_graph_number + 1) % (wrap_at > 0 ? wrap_at : 256));
         } else {
             // HIT: the servers already hold this graph (this_graph_number). Rebuild each
             // device's per-segment tensor array, diff it against what we last shipped, and
@@ -4919,7 +4931,7 @@ class rpc_server {
     bool set_tensor(const std::vector<uint8_t> & input);
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
-    bool graph_compute(const std::vector<uint8_t> & input, rpc_msg_graph_compute_rsp & response);
+    bool graph_compute(const std::vector<uint8_t> & input, rpc_msg_graph_compute_rsp & response, bool fresh_store = false);
     bool graph_compute_batch(const std::vector<uint8_t> & input, rpc_msg_graph_compute_rsp & response);
     bool init_tensor(const rpc_msg_init_tensor_req & request);
     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
@@ -4946,6 +4958,18 @@ class rpc_server {
     void persist_release(uint64_t conn_id);  // release every claim held by a (disconnected) connection
 
     ggml_backend_t & get_backend() { return backend; }
+
+    // Serialize backend compute across connections so two client forward passes (e.g. two
+    // coordinator processes sharing resident weights) can't run on the shared compute backend at
+    // once. Held only around the local compute call, never across the peer all-reduce wait, so the
+    // all-reduce fold (a separate, unlocked backend call on the peer-receive threads) can't
+    // deadlock against a forward that holds this. Fully serializes the -sm layer (pipeline) path,
+    // which has no all-reduce; concurrent -sm row is not fully supported (its per-forward all-reduce
+    // state is keyed only by tensor name + seq, so two concurrent -sm row forwards would cross-talk).
+    ggml_status compute_locked(ggml_cgraph * graph) {
+        std::lock_guard<std::mutex> lock(compute_mutex);
+        return ggml_backend_graph_compute(backend, graph);
+    }
   private:
     ggml_tensor * deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor);
     ggml_tensor * create_node(uint64_t id, struct ggml_context * ctx,
@@ -4983,6 +5007,7 @@ class rpc_server {
     std::unordered_map<uint64_t, std::vector<resident_buf>> persist_registry;
     std::mutex                                              persist_mutex;
     uint64_t                                                persist_use_ctr = 0;
+    std::mutex                                              compute_mutex;  // serializes backend compute across connections
 };
 
 // is a given buffer retained by the resident registry? (caller holds persist_mutex)
@@ -5913,7 +5938,7 @@ bool rpc_server::graph_compute_store(const std::vector<uint8_t> & input, rpc_msg
         graph_compute_infos.erase(old);
     }
     store_graph_compute_info(graph_number, graph, ctx, /*signal=*/0, std::move(by_idx));
-    response.result = ggml_backend_graph_compute(backend, graph);  // compute the just-stored graph inline
+    response.result = compute_locked(graph);  // compute the just-stored graph inline
     return true;                                                   // ctx stays alive in graph_compute_infos
 }
 
@@ -5926,7 +5951,7 @@ bool rpc_server::patch_compute(const std::vector<uint8_t> & input, rpc_msg_graph
     if (it == graph_compute_infos.end() || it->second->head == nullptr) {
         return false;
     }
-    response.result = ggml_backend_graph_compute(backend, it->second->head->cgraph);
+    response.result = compute_locked(it->second->head->cgraph);
     return true;
 }
 
@@ -5942,7 +5967,7 @@ bool rpc_server::advance_compute(uint8_t graph_number, rpc_msg_graph_compute_rsp
     if (it == graph_compute_infos.end() || it->second->head == nullptr) {
         return false;
     }
-    response.result = ggml_backend_graph_compute(backend, it->second->head->cgraph);
+    response.result = compute_locked(it->second->head->cgraph);
     return true;
 }
 
@@ -5968,7 +5993,9 @@ bool rpc_server::graph_compute_batch(const std::vector<uint8_t> & input, rpc_msg
         }
         std::vector<uint8_t> seg(input.begin() + off, input.begin() + off + seg_len);
         off += seg_len;
-        if (!graph_compute(seg, response)) {
+        // the first segment of a batch is a fresh graph -> replace any stale graph held under this
+        // number (guards the uint8_t graph-number wrap); later segments append to it.
+        if (!graph_compute(seg, response, /*fresh_store=*/ s == 0)) {
             return false;
         }
     }
@@ -5976,7 +6003,7 @@ bool rpc_server::graph_compute_batch(const std::vector<uint8_t> & input, rpc_msg
     return true;
 }
 
-bool rpc_server::graph_compute(const std::vector<uint8_t> & input, rpc_msg_graph_compute_rsp & response) {
+bool rpc_server::graph_compute(const std::vector<uint8_t> & input, rpc_msg_graph_compute_rsp & response, bool fresh_store) {
     // Non-split / single-device path: the client only sends RPC_CMD_SET_SPLIT
     // (which sets server_split) in tensor-parallel (-sm row) mode. Without it,
     // the client uses the stock serialize_graph layout (no leading signal byte,
@@ -6023,7 +6050,7 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, rpc_msg_graph
             ggml_free(ctx);
             return false;
         }
-        ggml_status status = ggml_backend_graph_compute(backend, graph);
+        ggml_status status = compute_locked(graph);
         response.result    = status;
         ggml_free(ctx);
         return true;
@@ -6103,6 +6130,18 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, rpc_msg_graph
         }
     }
 
+    // A fresh MISS store (the first segment of a newly-shipped graph) must REPLACE any graph still
+    // held under this number, not append to it. The client's graph number is a uint8_t that wraps
+    // after 256 distinct topologies; without this, a wrapped number reused for a new topology would
+    // chain its segments onto the stale graph's, and a later patch/compute of that number would run
+    // stale + new segments together. Later segments of the SAME store still append (fresh_store=false).
+    if (fresh_store) {
+        auto old = graph_compute_infos.find(graph_number);
+        if (old != graph_compute_infos.end()) {
+            delete old->second;
+            graph_compute_infos.erase(old);
+        }
+    }
     //store graph compute info
     store_graph_compute_info(graph_number, graph, ctx, signal, std::move(by_idx));
     static const bool dbg_store = getenv("RPC_DBG_DIFFCACHE") != nullptr;  // gate per-MISS lifecycle spam
@@ -6382,7 +6421,7 @@ bool rpc_server::do_computation(const rpc_msg_do_computation_req & request) {
         info = info->next;
         try {
             auto        _te    = std::chrono::steady_clock::now();
-            ggml_status status = ggml_backend_graph_compute(backend, graph);
+            ggml_status status = compute_locked(graph);
             GGML_ASSERT(status == GGML_STATUS_SUCCESS);
             g_srv_exec_ns +=
                 std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - _te).count();

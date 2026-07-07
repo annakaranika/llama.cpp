@@ -108,8 +108,18 @@ servers — cluster 7B reload 283 s → 153 s).
     least-recently-used *fully-unclaimed* model when a new registration would exceed the cap,
     so switching models can't OOM the memory-tight peers (2 GB forces reuse-in-place — no
     server-local copies). Debug: `RPC_DBG_PERSIST`.
-  - Scope: covers the pipeline (`-sm layer`) load path; the TP split alloc is a separate path,
-    not yet hooked (TP has no usable WiFi regime anyway — Part 2).
+  - Scope: covers the pipeline (`-sm layer`) load path only. The TP (`-sm row`) split load path
+    was attempted and reverted — its per-slice server buffers can't be reliably reused across
+    processes (a correctly-rebound slice still computed garbage), and TP has no usable WiFi regime
+    anyway (Part 2); `-sm row` gets warm loads from the on-disk weight cache instead.
+- **Concurrent-forward serialization** — a per-server compute lock serializes backend compute across
+  connections, so two coordinator processes sharing resident weights can't run on the shared compute
+  backend at once. Held only around the local compute, never across the peer all-reduce wait (the
+  all-reduce fold is a separate, unlocked backend call), so it can't deadlock a forward. This fully
+  serializes concurrent `-sm layer` (pipeline, no all-reduce) forwards; concurrent `-sm row` is not
+  fully supported (its all-reduce state is keyed only by tensor name + seq, so two concurrent TP
+  forwards would cross-talk). The persist use case is sequential processes, where the lock is
+  uncontended.
 
 ## Environment-variable reference
 
@@ -130,6 +140,7 @@ servers — cluster 7B reload 283 s → 153 s).
 | `RPC_PERSIST` | off | cross-process resident weights (bind/register/detach) |
 | `RPC_PERSIST_MAX_GB` | 8 | resident-model RAM cap per server (≤0 = unlimited) |
 | `RPC_DBG_PERSIST` | off | log BIND/REGISTER/DETACH/RELEASE/EVICT |
+| `RPC_GRAPH_WRAP_AT` | 256 | lower the diff-cache graph-number wrap point for testing the reuse path |
 
 ## Correctness fixes that were prerequisites (enabling, not speedups)
 
@@ -139,11 +150,22 @@ guard; single-device (non-split) graph compute path.
 
 ## Known limits
 
-- **`-sm row` resident serving** corrupts past ~256 *distinct* graph topologies in one
-  process: the per-graph diff-cache id is a `uint8_t` that wraps with no eviction, and the
-  split store appends on a reused id. Bounded for a single one-shot run; a long-lived `-sm row`
-  server exceeds it. Not the serving path (`-sm layer` is), so deferred.
-- Cross-process persist covers `-sm layer` only (see above).
+- Cross-process persist covers `-sm layer` only (see above); `-sm row` uses the disk weight cache.
+- Concurrent multi-coordinator serving over the peer backend is only partially supported (the
+  compute lock serializes backend compute, but the peer topology and all-reduce state aren't
+  per-connection isolated). The supported model is one coordinator at a time; persist rebinds on
+  restart.
+
+## Correctness note: `-sm row` diff-cache graph-number wrap (fixed)
+
+The `-sm row` diff cache keys stored graphs by a `uint8_t` graph number the client hands out per
+distinct topology; it wraps after 256. A wrapped number reused for a new topology used to (a) append
+the new graph's segments onto the stale graph's chain on the server, and (b) leave the old
+`topo_hash → number` mapping on the client so the old topology could later false-hit and patch the
+wrong graph. Fixed: the server replaces (delete-before-store) on the first segment of a fresh batch,
+and the client purges stale mappings for a reused number. Validated by forcing an early wrap
+(`RPC_GRAPH_WRAP_AT=4`): numbers 0–3 reused 5× each across distinct topologies, output stayed
+coherent. No effect below 256 distinct graphs.
 
 ---
 
