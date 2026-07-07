@@ -171,7 +171,8 @@ static void llm_build_kv_store(
     const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
     const int64_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
 
-    GGML_ASSERT(kv.size == n_ctx);
+    // growable KV: capacity (kv.size) may be < the configured max (n_ctx); it grows in blocks.
+    GGML_ASSERT(kv.size <= (uint32_t) n_ctx);
 
     struct ggml_tensor * k_cache_view = ggml_view_1d(ctx, kv.k_l[il], n_tokens*n_embd_k_gqa, ggml_row_size(kv.k_l[il]->type, n_embd_k_gqa)*kv_head);
     cb(k_cache_view, "k_cache_view", il);
@@ -188,7 +189,7 @@ static void llm_build_kv_store(
     } else {
         // note: the V cache is transposed when not using flash attention
         v_cache_view = ggml_view_2d(ctx, kv.v_l[il], n_tokens, n_embd_v_gqa,
-                (  n_ctx)*ggml_element_size(kv.v_l[il]),
+                (kv.size)*ggml_element_size(kv.v_l[il]),
                 (kv_head)*ggml_element_size(kv.v_l[il]));
 
         v_cur = ggml_transpose(ctx, v_cur);
@@ -623,14 +624,15 @@ static struct ggml_tensor * llm_build_kqv(
         kq = ggml_soft_max_ext(ctx, kq, kq_mask, kq_scale, hparams.f_max_alibi_bias);
         cb(kq, "kq_soft_max_ext", il);
 
-        GGML_ASSERT(kv.size == n_ctx);
+        // growable KV: V-transposed stride is the current capacity (kv.size), not the max (n_ctx)
+        GGML_ASSERT(kv.size <= (uint32_t) n_ctx);
 
         // split cached v into n_head heads
         struct ggml_tensor * v =
             ggml_view_3d(ctx, kv.v_l[il],
                     n_kv, n_embd_head_v, n_head_kv,
-                    ggml_element_size(kv.v_l[il])*n_ctx,
-                    ggml_element_size(kv.v_l[il])*n_ctx*n_embd_head_v,
+                    ggml_element_size(kv.v_l[il])*kv.size,
+                    ggml_element_size(kv.v_l[il])*kv.size*n_embd_head_v,
                     0);
         cb(v, "v", il);
 
@@ -1167,7 +1169,9 @@ struct llm_build_context {
     struct ggml_cgraph * build_k_shift() {
         struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, model.max_nodes(), false);
 
-        GGML_ASSERT(kv_self.size == n_ctx);
+        // growable KV: capacity may be < n_ctx. (context-shift/k-shift is not exercised by the
+        // greedy single-sequence path the growable cache is first validated on.)
+        GGML_ASSERT(kv_self.size <= (uint32_t) n_ctx);
 
         lctx.inp_K_shift = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_ctx);
         cb(lctx.inp_K_shift, "K_shift", -1);
@@ -6945,8 +6949,8 @@ struct llm_build_context {
                 struct ggml_tensor * v =
                     ggml_view_3d(ctx0, kv_self.v_l[il],
                             n_kv, n_embd_head_v, n_head_kv,
-                            ggml_element_size(kv_self.v_l[il])*n_ctx,
-                            ggml_element_size(kv_self.v_l[il])*n_ctx*n_embd_head_v,
+                            ggml_element_size(kv_self.v_l[il])*kv_self.size,
+                            ggml_element_size(kv_self.v_l[il])*kv_self.size*n_embd_head_v,
                             0);
                 cb(v, "v", il);
 
@@ -8547,9 +8551,25 @@ static int llama_prepare_ubatch(
         llama_kv_cache_update(&lctx);
 
         // if we have enough unused cells before the current head ->
-        //   better to start searching from the beginning of the cache, hoping to fill it
-        if (kv_self.head > kv_self.used + 2*ubatch.n_tokens) {
+        //   better to start searching from the beginning of the cache, hoping to fill it.
+        // (skipped for a growable cache: there head is the monotonic append frontier — we grow the
+        // cache rather than wrap head back over live cells.)
+        if (kv_self.grow_block == 0 && kv_self.head > kv_self.used + 2*ubatch.n_tokens) {
             kv_self.head = 0;
+        }
+
+        // growable KV: if this ubatch would overrun the current capacity, grow the cache in blocks
+        // first (up to the configured max). The compute graph is reserved per size, and the sched
+        // reallocates the compute buffer when a grown graph exceeds its reservation.
+        // grow before head would reach the current capacity (this cache is a ring buffer: head wraps
+        // at size). new size must strictly exceed need so the next write has room. Once at size_max
+        // it stops growing and wraps like a normal fixed cache.
+        if (kv_self.grow_block > 0 && kv_self.size < kv_self.size_max) {
+            const uint32_t need = kv_self.head + ubatch.n_tokens;
+            if (need >= kv_self.size) {
+                const uint32_t grown = std::min<uint32_t>(kv_self.size_max, GGML_PAD(need + 1, kv_self.grow_block));
+                llama_kv_cache_grow(kv_self, lctx.model, grown);
+            }
         }
 
         const auto slot = llama_kv_cache_find_slot(kv_self, ubatch);

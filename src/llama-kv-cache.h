@@ -40,8 +40,14 @@ struct llama_kv_cache {
     // for a free KV slot. llama_decode_impl also uses it, so it
     // cannot be freely changed after a slot has been allocated.
     uint32_t head = 0;
-    uint32_t size = 0;
+    uint32_t size = 0; // current capacity (cells). With a growable cache this grows in blocks toward size_max.
     uint32_t used = 0; // used cells (i.e. at least one seq_id)
+
+    // growable KV cache: allocate in blocks instead of committing the full context up front, so the
+    // memory footprint tracks the live context. size starts at one block and grows by grow_block up
+    // to size_max (== the configured n_ctx). grow_block == 0 disables it (size fixed at size_max).
+    uint32_t size_max   = 0;
+    uint32_t grow_block  = 0;
 
     // computed before each graph build
     uint32_t n = 0;
@@ -99,6 +105,14 @@ bool llama_kv_cache_init(
                     ggml_type   type_v,
                      uint32_t   kv_size,
                          bool   offload);
+
+// Grow a growable KV cache to at least new_size cells (capped at size_max), preserving the cells
+// already in use. Reallocates the per-layer K/V tensors + buffers at the larger capacity and copies
+// the live data across (K contiguous; transposed V re-strided). Returns true if the cache grew.
+bool llama_kv_cache_grow(
+        struct llama_kv_cache & cache,
+            const llama_model & model,
+                     uint32_t   new_size);
 
 // find an empty slot of size "n_tokens" in the cache
 // updates the cache head

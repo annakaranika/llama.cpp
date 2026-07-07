@@ -44,11 +44,29 @@ bool llama_kv_cache_init(
     cache.size = kv_size;
     cache.used = 0;
 
+    // growable KV cache (opt-in LLAMA_KV_GROW_BLOCK=<tokens>): start at one block and grow toward
+    // the full context on demand, so the footprint tracks the live context instead of committing
+    // the whole n_ctx up front. 0/unset keeps the old behaviour (full n_ctx allocated at load).
+    cache.size_max  = kv_size;
+    cache.grow_block = 0;
+    if (const char * grow_env = getenv("LLAMA_KV_GROW_BLOCK")) {
+        const long b = atol(grow_env);
+        if (b > 0) {
+            // the worst-case graph reserve (and each prompt ubatch) processes up to n_ubatch tokens in
+            // one step, so a block must hold a whole ubatch. Memory-saving therefore needs a small
+            // -ub (= block); with the default n_ubatch this just allocates the full context.
+            cache.grow_block = std::max<uint32_t>((uint32_t) b, cparams.n_ubatch);
+            cache.size       = std::min<uint32_t>(cache.grow_block, kv_size);
+            LLAMA_LOG_INFO("%s: growable KV: block = %u (n_ubatch = %u), initial size = %u, max = %u\n",
+                    __func__, cache.grow_block, cparams.n_ubatch, cache.size, cache.size_max);
+        }
+    }
+
     cache.type_k = type_k;
     cache.type_v = type_v;
 
     cache.cells.clear();
-    cache.cells.resize(kv_size);
+    cache.cells.resize(cache.size);
 
     // create a context for each buffer type
     std::map<ggml_backend_buffer_type_t, ggml_context *> ctx_map;
@@ -94,8 +112,8 @@ bool llama_kv_cache_init(
             return false;
         }
 
-        ggml_tensor * k = ggml_new_tensor_1d(ctx, type_k, n_embd_k_gqa*kv_size);
-        ggml_tensor * v = ggml_new_tensor_1d(ctx, type_v, n_embd_v_gqa*kv_size);
+        ggml_tensor * k = ggml_new_tensor_1d(ctx, type_k, n_embd_k_gqa*cache.size);
+        ggml_tensor * v = ggml_new_tensor_1d(ctx, type_v, n_embd_v_gqa*cache.size);
         ggml_format_name(k, "cache_k_l%d", i);
         ggml_format_name(v, "cache_v_l%d", i);
         cache.k_l.push_back(k);
@@ -140,6 +158,138 @@ bool llama_kv_cache_init(
         }
     }
 
+    return true;
+}
+
+bool llama_kv_cache_grow(
+        struct llama_kv_cache & cache,
+            const llama_model & model,
+                     uint32_t   new_size) {
+    if (cache.grow_block == 0) {
+        return false;  // not a growable cache
+    }
+    new_size = std::min(new_size, cache.size_max);
+    if (new_size <= cache.size) {
+        return false;  // nothing to do (already big enough, or capped)
+    }
+
+    const struct llama_hparams & hparams = model.hparams;
+    const int        n_layer  = (int) cache.k_l.size();
+    const ggml_type  type_k   = cache.type_k;
+    const ggml_type  type_v   = cache.type_v;
+    const uint32_t   old_size = cache.size;
+    const uint32_t   live     = cache.head;  // single-sequence append frontier: cells [0, head) are live
+
+    // allocate new, larger K/V tensors on the SAME buffer type each layer already used (so the
+    // per-layer device placement is preserved), in fresh metadata contexts.
+    std::map<ggml_backend_buffer_type_t, ggml_context *> ctx_map;
+    std::vector<ggml_context_ptr>        new_ctxs;
+    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
+        auto it = ctx_map.find(buft);
+        if (it != ctx_map.end()) {
+            return it->second;
+        }
+        struct ggml_init_params params = {
+            /*.mem_size   =*/ size_t(2u*n_layer*ggml_tensor_overhead()),
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context * ctx = ggml_init(params);
+        if (!ctx) {
+            return nullptr;
+        }
+        ctx_map[buft] = ctx;
+        new_ctxs.emplace_back(ctx);
+        return ctx;
+    };
+
+    std::vector<ggml_tensor *> new_k(n_layer, nullptr);
+    std::vector<ggml_tensor *> new_v(n_layer, nullptr);
+    for (int i = 0; i < n_layer; i++) {
+        const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(i) + hparams.n_embd_k_s();
+        const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(i) + hparams.n_embd_v_s();
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(cache.k_l[i]->buffer);
+        ggml_context * ctx = ctx_for_buft(buft);
+        if (!ctx) {
+            LLAMA_LOG_ERROR("%s: failed to create ggml context\n", __func__);
+            return false;
+        }
+        new_k[i] = ggml_new_tensor_1d(ctx, type_k, (int64_t) n_embd_k_gqa*new_size);
+        new_v[i] = ggml_new_tensor_1d(ctx, type_v, (int64_t) n_embd_v_gqa*new_size);
+        ggml_format_name(new_k[i], "cache_k_l%d", i);
+        ggml_format_name(new_v[i], "cache_v_l%d", i);
+    }
+
+    std::vector<ggml_backend_buffer_ptr> new_bufs;
+    for (auto it : ctx_map) {
+        auto * buft = it.first;
+        auto * ctx  = it.second;
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+        if (!buf) {
+            LLAMA_LOG_ERROR("%s: failed to allocate grown kv buffer\n", __func__);
+            return false;
+        }
+        ggml_backend_buffer_clear(buf, 0);
+        new_bufs.emplace_back(buf);
+        // peer/RPC: mirror the per-device buffer registration done at init (see llama_kv_cache_init)
+        if (ggml_backend_buft_name(buft)[0] == 'R' && ggml_backend_buft_name(buft)[1] == 'P' && ggml_backend_buft_name(buft)[2] == 'C') {
+            for (struct ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+                if (t->extra != NULL) {
+                    ggml_tensor_extra_rpc * t_extra = (ggml_tensor_extra_rpc *) t->extra;
+                    for (int d = 0; d < ggml_backend_rpc_get_device_count(); d++) {
+                        if (t_extra->buffer_ctx[d] != NULL && t_extra->buffer_ctx[d]->remote_ptr != ((ggml_backend_rpc_buffer_context *) buf->context)->remote_ptr) {
+                            ggml_backend_rpc_device_context * dev_ctx = (ggml_backend_rpc_device_context *) ggml_backend_rpc_get_device(d)->context;
+                            auto new_buft = ggml_backend_rpc_buffer_type(dev_ctx->endpoint.c_str());
+                            ggml_backend_buffer_t new_buf = ggml_backend_buffer_init(new_buft, buf->iface, t_extra->buffer_ctx[d], ggml_nbytes(t));
+                            if (new_buf == NULL) {
+                                LLAMA_LOG_ERROR("%s: failed to init RPC buffer on grow\n", __func__);
+                                return false;
+                            }
+                            ggml_backend_buffer_clear(new_buf, 0);
+                            new_bufs.emplace_back(new_buf);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // copy the live prefix [0, live) from old to new. K is position-contiguous (a straight prefix
+    // copy); transposed V is channel-major with stride == capacity, so each channel's live prefix
+    // moves from the old stride to the new stride.
+    std::vector<uint8_t> tmp;
+    std::vector<uint8_t> tmpv;
+    for (int i = 0; i < n_layer; i++) {
+        const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(i) + hparams.n_embd_k_s();
+        const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(i) + hparams.n_embd_v_s();
+        if (live > 0) {
+            const size_t k_bytes = ggml_row_size(type_k, n_embd_k_gqa) * (size_t) live;
+            tmp.resize(k_bytes);
+            ggml_backend_tensor_get(cache.k_l[i], tmp.data(), 0, k_bytes);
+            ggml_backend_tensor_set(new_k[i], tmp.data(), 0, k_bytes);
+
+            const size_t elt_v = ggml_type_size(type_v);
+            tmpv.assign((size_t) n_embd_v_gqa * old_size * elt_v, 0);
+            ggml_backend_tensor_get(cache.v_l[i], tmpv.data(), 0, tmpv.size());
+            std::vector<uint8_t> newv((size_t) n_embd_v_gqa * new_size * elt_v, 0);
+            for (uint32_t c = 0; c < n_embd_v_gqa; c++) {
+                memcpy(newv.data() + (size_t) c * new_size * elt_v,
+                       tmpv.data() + (size_t) c * old_size * elt_v,
+                       (size_t) live * elt_v);
+            }
+            ggml_backend_tensor_set(new_v[i], newv.data(), 0, newv.size());
+        }
+    }
+
+    // swap in the grown tensors/buffers (old buffers + contexts are freed as the ptr vectors are replaced)
+    cache.k_l  = std::move(new_k);
+    cache.v_l  = std::move(new_v);
+    cache.bufs = std::move(new_bufs);
+    cache.ctxs = std::move(new_ctxs);
+    cache.size = new_size;
+    cache.cells.resize(new_size);  // preserves cells [0, old_size); new cells are default (empty)
+
+    LLAMA_LOG_INFO("%s: grew KV cache %u -> %u cells (live %u)\n", __func__, old_size, new_size, live);
     return true;
 }
 
