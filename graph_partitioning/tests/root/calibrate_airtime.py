@@ -3,24 +3,27 @@
 (``Network.airtime_contention_exp``) against the measured ``-sm row``
 (tensor-parallel) N-sweep.
 
-Ground truth (bench-results.md, 2026-06-16; Mac coordinator over the AP;
-``llama-bench -ngl 23 -sm row -p 128 -n 8``, rpi{1,2,4}):
+Ground truth (bench-results.md, 2026-07-01; peer branch bade7672; rpi1-eth
+coordinator + IBSS peers rpi24/25/20/22; ``llama-bench -ngl 23 -sm row -p 128 -n 8``):
 
     N |  pp128 t/s | tg8 t/s
-    1 |    2.71    |  0.22
-    2 |    1.11    |  0.03
-    4 |    0.42    |  0.02
+    2 |    5.19    |  0.96
+    4 |    1.27    |  0.39
 
-Over infrastructure Wi-Fi every transfer — coordinator-relayed OR peer-to-peer —
-funnels through the one AP, so the collective is airtime-bound and P2P costs the
-same as centralized on hardware (peer-p2p-status memory: HW N=2 P2P = 0.03 t/s =
-parallel's centralized 0.03 t/s). This sweep is therefore the airtime signal.
+This is the ACTUAL peer-to-peer all-reduce the RPC backend runs: every server
+broadcasts its partial to all N-1 peers (ALL-TO-ALL, N(N-1) sends/reduce) and folds
+locally -- see ggml-rpc.cpp all_reduce_block (the "opt" path is concurrent +
+fire-and-forget; RING is NOT implemented; TREE reduce-to-root is opt-in RPC_AR_TREE).
+On the one shared 802.11 channel those N(N-1) sends re-contend for airtime, so the
+collective SUPER-scales -- throughput DROPS as N grows.
 
-The airtime term scales the PEER-TO-PEER ring/all-to-all collective, whose base
-model assumes the g concurrent transfers run on independent parallel links (per-step
-``max``) and so UNDER-predicts the growth. We fit the exponent to the clean
-N=2->N=4 all-reduce scaling (both have a collective; the shared regime cancels the
-N=1 baseline, which carries Mac-coordination overhead the P2P path does not model).
+The airtime term scales the PEER-TO-PEER all-to-all collective, whose base model
+assumes the concurrent transfers run on independent parallel links (per-step ``max``)
+and so UNDER-predicts the growth (exp=0 -> ~0.94x, nearly flat). We fit the exponent
+to the clean N=2->N=4 all-reduce scaling; N=1 is unavailable (-sm row single-device
+crashes) and the shared regime cancels it anyway. Result: exp~2.1 reproduces the
+measured 4.09x prefill anti-scaling near-exactly (decode over-scales -- it is
+RTT-saturated on tiny payloads, not airtime-bound -- so we fit on prefill).
 
 Run from repo root:  PYTHONPATH=. python3 graph_partitioning/tests/root/calibrate_airtime.py
 """
@@ -57,15 +60,19 @@ TINY = ModelSpec(name="TinyLlama-1.1B", num_layers=23, num_heads=32, num_kv_head
                  d_model=2048, d_k=64, d_ff=5632, vocab_size=32000)
 PROFILE = "graph_partitioning/tests/device_profiles.csv"
 LINKS = "graph_partitioning/tests/pair_links_measured.csv"
-RPIS = ["rpi1", "rpi2", "rpi3", "rpi4"]
+RPIS = ["rpi24", "rpi25", "rpi20", "rpi22"]  # the IBSS peer backends
 
 _pool = {d.name: d for d in devices_from_profiles(
     PROFILE, quant="q4_K", compute="peak", cost_model=CostModel.ROOFLINE,
     default_mem_gb=2.0, swap_bandwidth_mbps=320.0)}
-SERVERS = [_pool[n] for n in RPIS]
+SERVERS = [_pool[n] for n in RPIS if n in _pool]
 
-# measured -sm row sweep: N -> (pp128 t/s, tg8 t/s)
-MEAS = {1: (2.71, 0.22), 2: (1.11, 0.03), 4: (0.42, 0.02)}
+# Measured PEER-TO-PEER -sm row sweep: N -> (pp128 t/s, tg8 t/s). Peer branch
+# (bade7672), rpi1-eth coordinator + IBSS peers rpi24/25/20/22, -ngl 23 -sm row,
+# llama-bench (2026-07-01). This is the ACTUAL P2P all-reduce regime the ring model
+# targets -- the old Mac-coordinated {1:(2.71,0.22),2:(1.11,0.03),4:(0.42,0.02)} was
+# CENTRALIZED (a regime mismatch). N=1 omitted (-sm row single-device crashes).
+MEAS = {2: (5.19, 0.96), 4: (1.27, 0.39)}
 PP_SEQ = 128
 
 
@@ -75,9 +82,13 @@ def make_net(n, mode, exp, eta):
     net.set_pairwise_links(filename=LINKS)
     if mode == "cs":
         net.set_comm_config(communication_model=CommunicationModel.CLIENT_SERVER)
-    else:  # peer-to-peer ring
+    else:  # peer-to-peer ALL-TO-ALL -- what the RPC backend actually does: every
+           # server broadcasts its partial to all N-1 peers (N(N-1) sends/reduce) and
+           # folds locally (ggml-rpc.cpp all_reduce_block; "opt" path is concurrent
+           # fire-and-forget). RING is not implemented; TREE reduce-to-root is opt-in
+           # (RPC_AR_TREE) and bit-identical, so all-to-all is the default to model.
         net.set_comm_config(communication_model=CommunicationModel.PEER_TO_PEER,
-                            peer2peer_policy=PeerToPeerPolicy.RING)
+                            peer2peer_policy=PeerToPeerPolicy.ALL_TO_ALL)
     net.rpc_efficiency = eta
     net.airtime_contention_exp = exp
     return net
@@ -102,7 +113,7 @@ def meas_scaling_42(typ):
 
 
 def rms_logerr_42(exp, eta, typs=("pp", "tg")):
-    se = [(math.log(scaling_42(t, "ring", exp, eta)) - math.log(meas_scaling_42(t))) ** 2
+    se = [(math.log(scaling_42(t, "a2a", exp, eta)) - math.log(meas_scaling_42(t))) ** 2
           for t in typs]
     return math.sqrt(float(np.mean(se)))
 
@@ -124,9 +135,9 @@ if __name__ == "__main__":
     print("Measured N=2->4 latency scaling T(4)/T(2):  "
           f"prefill={meas_scaling_42('pp'):.2f}x  decode={meas_scaling_42('tg'):.2f}x")
     print()
-    print("RING base (exp=0) predicts T(4)/T(2):")
+    print("ALL-TO-ALL base (exp=0) predicts T(4)/T(2):")
     for t in ("pp", "tg"):
-        print(f"  {t}: {scaling_42(t, 'ring', 0.0, 0.5):.2f}x   (measured {meas_scaling_42(t):.2f}x)")
+        print(f"  {t}: {scaling_42(t, 'a2a', 0.0, 0.5):.2f}x   (measured {meas_scaling_42(t):.2f}x)")
     print()
 
     # fit on prefill (bandwidth/airtime-dominated; decode 2->4 is RTT-saturated)
@@ -137,13 +148,13 @@ if __name__ == "__main__":
     print()
 
     exp, eta = fp[0], fp[1]
-    print(f"With exp={exp}, eta={eta} (ring / peer-to-peer):")
-    print(f"{'N':>2} {'phase':>5} {'meas t/s':>9} {'ring t/s':>9}")
-    for n in (1, 2, 4):
+    print(f"With exp={exp}, eta={eta} (all-to-all / peer-to-peer):")
+    print(f"{'N':>2} {'phase':>5} {'meas t/s':>9} {'a2a t/s':>9}")
+    for n in sorted(MEAS):
         for j, t in enumerate(("pp", "tg")):
-            print(f"{n:>2} {t:>5} {MEAS[n][j]:9.3f} {tps(n, t, 'ring', exp, eta):9.3f}")
+            print(f"{n:>2} {t:>5} {MEAS[n][j]:9.3f} {tps(n, t, 'a2a', exp, eta):9.3f}")
     print()
     print("N=2->4 scaling with fitted exponent:")
     for t in ("pp", "tg"):
-        print(f"  {t}: ring={scaling_42(t, 'ring', exp, eta):.2f}x   measured={meas_scaling_42(t):.2f}x"
-              f"   (exp=0 ring was {scaling_42(t, 'ring', 0.0, eta):.2f}x)")
+        print(f"  {t}: a2a={scaling_42(t, 'a2a', exp, eta):.2f}x   measured={meas_scaling_42(t):.2f}x"
+              f"   (exp=0 a2a was {scaling_42(t, 'a2a', 0.0, eta):.2f}x)")

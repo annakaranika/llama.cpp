@@ -175,3 +175,43 @@ fit) that the simulator explores.
 > (no RPC, see `rpi1_local` above) does ~3.3 t/s decode — i.e. the Mac-coordination
 > alone costs ~15× on decode before any tensor split. Coordinator placement matters
 > as much as N.
+
+---
+
+## Tensor parallelism (`-sm row`) — PEER-TO-PEER all-reduce (peer branch)
+
+**Date:** 2026-07-01 — **Branch:** `peer` (bade7672) — **Coordinator:** rpi1 (wired
+eth jump-anchor) — **Backends:** IBSS peers rpi24/25/20/22 on the ad-hoc cell —
+`llama-bench -ngl 23 -sm row -p 128 -n 8 -r 3`, via `rpi-automation/airtime_sweep.sh`.
+**First peer-to-peer `-sm row` llama-bench data** after the three llama-bench crash
+fixes (split_serialize null-guard `6a086a9e`; the missing
+`ggml_backend_rpc_create_peer_connection` call `bade7672`; empty-tensor
+`deserialize_tensor` OOB `bade7672`).
+
+Unlike the Mac-coordinated sweep above, servers exchange partials **directly
+peer-to-peer** — every server broadcasts its partial to all N−1 peers (ALL-TO-ALL,
+N(N−1) sends per reduce) and folds locally (`ggml-rpc.cpp` `all_reduce_block`). No
+relay through the coordinator; the coordinator only drives the graph.
+
+| N (devices) | pp128 (t/s) | tg8 (t/s) | pp ÷ N=2 | tg ÷ N=2 |
+|------------:|------------:|----------:|---------:|---------:|
+| 2           | 5.19 ± 0.01 | 0.96 ± 0.01 | 1.00×  | 1.00×    |
+| 4           | 1.27 ± 0.02 | 0.39 ± 0.01 | 0.24×  | 0.41×    |
+
+> N=1 `-sm row` crashes systematically in warmup (single-device split path), so no
+> N=1 point. `-sm row` still needs N | num_kv_heads (=4), so N ∈ {2,4} here.
+
+**Still anti-scaling, but far faster than the old Mac-coordinated centralized run:
+N=2 prefill 5.19 vs 1.11 t/s (~4.7×), decode 0.96 vs 0.03 t/s (~32×).** Direct peer
+exchange over the IBSS mesh removes the Mac↔AP↔rpi relay that dominated the
+centralized numbers. N=2→4 still drops (prefill 4.09×, decode 2.46× slower): on the
+one shared 802.11 channel the N(N−1) all-to-all sends re-contend for airtime, and the
+1.1 B model already fits one Pi so there is no compute saving to offset the growing
+collective. **This N=2→4 prefill 4.09× is what the simulator's airtime-contention
+exponent is calibrated against** (`graph_partitioning/tests/root/calibrate_airtime.py`:
+ALL_TO_ALL, exp≈2.1 reproduces 4.10×; wired into `hw_calibration.ipynb` §10 as the
+`peer_p2p_smrow` scenario).
+
+> Teardown caveat: llama-bench exits non-zero (134/139) *after* the results print —
+> a racy `send_rpc_cmd` on socket teardown (get_socket weak_ptr churn). The measured
+> rows are fully captured before the crash; parse stdout and ignore the exit code.
