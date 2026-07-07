@@ -3465,7 +3465,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     const size_t n_max_backend_buffer = ctx_map.size() * ml.files.size();
     pimpl->bufs.reserve(n_max_backend_buffer);
 
-    // (Phase B) cross-process resident weights (opt-in RPC_PERSIST). Announce a model identity to
+    // cross-process resident weights (opt-in RPC_PERSIST). Announce a model identity to
     // the RPC backend before allocating/uploading weights so each weight-buffer alloc can rebind to
     // a buffer still resident on the server from a previous process (skip alloc + WiFi upload). The
     // key folds model content (n_bytes/n_tensors/n_elements) + the parallel layout (split_mode/
@@ -3608,7 +3608,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
         LLAMA_LOG_INFO("%s: loaded tensors from context %p\n", __func__, (void*)ctx);
     }
-    // (Phase B) close the persist window: REGISTER the freshly-uploaded weight buffers so they
+    // close the persist window: REGISTER the freshly-uploaded weight buffers so they
     // survive this process's teardown (a reconnecting process rebinds via PERSIST_BIND).
     if (rpc_persist_end != nullptr) {
         rpc_persist_end();
