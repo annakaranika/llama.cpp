@@ -218,6 +218,29 @@ duplicated src+dst). Bit-identical, freeing ~99 % of each large tensor (source o
 shedding from "lower the KV slope" into "lower the KV slope *and* the weight floor," so the pressured
 device actually frees room rather than just slowing its own growth.
 
+### Planned: capacity-aware placement + hidden batch recruit
+
+The current placement + rebalance assume **identical** devices and react to KV pressure with
+**one-layer** shifts. Three planned refinements form one design — the cluster continuously right-sizes
+itself:
+
+1. **Capacity-aware, periodically re-measured placement.** Real devices differ in memory *and*
+   compute. Before each placement/rebalance decision, measure each device's *available memory* and
+   *current compute load* — not just once at load, and not assuming uniform — and weight each device's
+   layer share by its live capacity (a larger/faster device holds more). This generalizes today's
+   minimal-packing (which already reads per-device free memory) to (a) compute-weighting and (b)
+   periodic re-measurement so decisions track the actual cluster state.
+2. **Recruit = balanced batch, not one layer.** Recruiting a device and handing it a single layer is
+   near-pointless: it barely relieves pressure and forces repeated rebalancing. Instead, when
+   recruiting, move a *batch* that brings the new device to its capacity-weighted balanced share in one
+   step — maximising KV headroom across *all* devices at once and minimising how often (and thus how
+   expensively) we rebalance. (Today's recruit is emergent one-at-a-time — correct, but this is the
+   efficient version.)
+3. **Hide every move behind decode.** A move must *never* delay inference: predict the need ahead from
+   KV growth and prefetch the (batch) transfer in the background so it overlaps the compute-bound
+   decode and commits instantly. Combined with (2), a batch recruit is a larger transfer but fully
+   hidden — full relief, zero inference stall.
+
 ## Environment-variable reference
 
 | Var | Default | Effect |
