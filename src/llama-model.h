@@ -369,6 +369,12 @@ struct llama_model {
     bool prefetch_layer_weights(int il, ggml_backend_dev_t dst);
     bool commit_layer_weights(int il);
 
+    // Cache-aware rebalancing: layer_cache_hits_on reports how many of il's weight tensors are already
+    // cached on dst (for locality-driven target selection); move_layer_weights_cached moves il to dst,
+    // loading cached tensors locally (0x WiFi) and lazily caching the rest. Returns cache-hit count.
+    int layer_cache_hits_on(int il, ggml_backend_dev_t dst) const;
+    int move_layer_weights_cached(int il, ggml_backend_dev_t dst);
+
     ggml_backend_buffer_type_t select_buft(int il) const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;

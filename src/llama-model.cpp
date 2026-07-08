@@ -3978,6 +3978,105 @@ bool llama_model::commit_layer_weights(int il) {
     return true;
 }
 
+typedef uint64_t (*rpc_weight_hash_t)(const ggml_tensor *);
+typedef bool     (*rpc_cache_probe_t)(ggml_backend_buffer_type_t, uint64_t);
+typedef bool     (*rpc_cache_load_t)(ggml_tensor *, uint64_t);
+typedef bool     (*rpc_cache_store_t)(const ggml_tensor *, uint64_t);
+
+template <typename F> static F rpc_resolve(const char * sym) {
+    ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
+    return reg ? (F) ggml_backend_reg_get_proc_address(reg, sym) : nullptr;
+}
+
+// (cache-aware rebalance) how many of layer il's weight tensors are already cached on device dst.
+// Content keys are device-independent, so a device that ever held/cached this layer (a prior
+// residency or a prior run's lazy store) reports hits -- lets the policy pick a 0x-WiFi destination.
+int llama_model::layer_cache_hits_on(int il, ggml_backend_dev_t dst) const {
+    static rpc_weight_hash_t hash_fn  = rpc_resolve<rpc_weight_hash_t>("ggml_backend_rpc_weight_hash");
+    static rpc_cache_probe_t probe_fn = rpc_resolve<rpc_cache_probe_t>("ggml_backend_rpc_cache_probe");
+    if (!hash_fn || !probe_fn || dst == nullptr) {
+        return 0;
+    }
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dst);
+    char prefix[64];
+    snprintf(prefix, sizeof(prefix), "blk.%d.", il);
+    int hits = 0;
+    for (auto & nt : tensors_by_name) {
+        if (nt.first.rfind(prefix, 0) == 0) {
+            uint64_t h = hash_fn(nt.second);
+            if (h && probe_fn(buft, h)) {
+                hits++;
+            }
+        }
+    }
+    return hits;
+}
+
+// (cache-aware rebalance) move layer il to dst, loading each weight tensor from dst's LOCAL cache
+// when present (0x WiFi) instead of transferring it; cold tensors transfer and are then cached on dst
+// (lazy-warm) so the next move here hits. Returns the number of tensors served from cache (-1 fail).
+int llama_model::move_layer_weights_cached(int il, ggml_backend_dev_t dst) {
+    static rpc_weight_hash_t hash_fn  = rpc_resolve<rpc_weight_hash_t>("ggml_backend_rpc_weight_hash");
+    static rpc_cache_load_t  load_fn  = rpc_resolve<rpc_cache_load_t>("ggml_backend_rpc_cache_load");
+    static rpc_cache_store_t store_fn = rpc_resolve<rpc_cache_store_t>("ggml_backend_rpc_cache_store");
+    if (il < 0 || il >= (int) pimpl->dev_layer.size() || dst == nullptr) {
+        return -1;
+    }
+    if (pimpl->dev_layer[il].dev == dst) {
+        return -1;
+    }
+    ggml_backend_buffer_type_t dst_buft = ggml_backend_dev_buffer_type(dst);
+    char prefix[64];
+    snprintf(prefix, sizeof(prefix), "blk.%d.", il);
+    std::vector<ggml_tensor *> src;
+    for (auto & nt : tensors_by_name) {
+        if (nt.first.rfind(prefix, 0) == 0) {
+            src.push_back(nt.second);
+        }
+    }
+    if (src.empty()) {
+        return -1;
+    }
+    struct ggml_init_params params = { size_t(2u*src.size()*ggml_tensor_overhead()), NULL, true };
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        return -1;
+    }
+    std::vector<ggml_tensor *> dup(src.size(), nullptr);
+    for (size_t i = 0; i < src.size(); i++) {
+        dup[i] = ggml_dup_tensor(ctx, src[i]);
+        ggml_set_name(dup[i], src[i]->name);
+    }
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, dst_buft);
+    if (!buf) {
+        ggml_free(ctx);
+        return -1;
+    }
+    int hits = 0;
+    for (size_t i = 0; i < src.size(); i++) {
+        const uint64_t h = hash_fn ? hash_fn(src[i]) : 0;
+        if (h && load_fn && load_fn(dup[i], h)) {
+            hits++;                                   // served from dst's local cache: 0x WiFi
+        } else {
+            ggml_backend_tensor_copy(src[i], dup[i]); // cold: transfer over the link
+            if (h && store_fn) {
+                store_fn(dup[i], h);                  // lazy-warm dst so the next move here hits
+            }
+        }
+        src[i]->buffer = dup[i]->buffer;
+        src[i]->data   = dup[i]->data;
+        src[i]->extra  = dup[i]->extra;
+    }
+    pimpl->ctxs.emplace_back(ctx);
+    pimpl->bufs.emplace_back(buf);
+    pimpl->dev_layer[il].dev = dst;
+    auto bit = pimpl->gpu_buft_list.find(dst);
+    if (bit != pimpl->gpu_buft_list.end()) {
+        pimpl->dev_layer[il].buft_list = &bit->second;
+    }
+    return hits;
+}
+
 ggml_backend_dev_t llama_model::dev_output() const {
     return pimpl->dev_output.dev;
 }

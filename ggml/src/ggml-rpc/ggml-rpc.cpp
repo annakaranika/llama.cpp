@@ -144,6 +144,8 @@ enum rpc_cmd {
     RPC_CMD_SEND_TO_PEER,  // direct pipeline handoff: the SRC server pushes a tensor straight into the DST peer's buffer (bypasses the client relay)
     RPC_CMD_SEND_TO_PEER_ASYNC,  // (elastic prefetch) like SEND_TO_PEER but the SRC enqueues the push on a background worker (fresh socket) and acks immediately, so the transfer overlaps decode
     RPC_CMD_PREFETCH_WAIT,       // (elastic prefetch) block until all this server's background pushes have landed (commit barrier)
+    RPC_CMD_CACHE_PROBE,         // (cache-aware rebalance) "do you have the weight slice with this content hash on disk?" -- no load, just hit/miss for target selection
+    RPC_CMD_CACHE_STORE,         // (cache-aware rebalance) persist a resident tensor's bytes to this server's on-disk weight cache under a hash (lazy-warm after a cold transfer)
     RPC_CMD_PERSIST_BIND,      // "do you have a resident weight buffer for (model_key,size)?" -> rebind, skip alloc+upload
     RPC_CMD_PERSIST_REGISTER,  // retain this freshly-uploaded weight buffer under model_key (don't free on teardown)
     RPC_CMD_PERSIST_DETACH,    // client is releasing a resident buffer -> keep it resident, mark unclaimed for the next process
@@ -322,6 +324,22 @@ struct rpc_msg_load_cached_req {
 
 struct rpc_msg_load_cached_rsp {
     uint8_t hit;
+};
+
+// (cache-aware rebalance) probe: does this server hold the slice with `hash` on disk? No load.
+struct rpc_msg_cache_probe_req {
+    uint64_t hash;
+};
+struct rpc_msg_cache_probe_rsp {
+    uint8_t hit;
+};
+// (cache-aware rebalance) store: persist tensor's own resident bytes to the disk cache under `hash`.
+struct rpc_msg_cache_store_req {
+    rpc_tensor tensor;
+    uint64_t   hash;
+};
+struct rpc_msg_cache_store_rsp {
+    uint8_t stored;
 };
 
 #pragma pack(pop)
@@ -1446,6 +1464,14 @@ static uint64_t rpc_weight_key(const void * data, size_t size, uint8_t kind, uin
     return h;
 }
 
+// (cache-aware rebalance) client-side retained map: WHOLE weight tensor name -> its content hash,
+// filled as weights upload at load. A mid-generation layer MOVE no longer holds the bytes, so it
+// looks the layer's cache keys up here to load them from a destination's local disk cache (0x WiFi).
+// WHOLE keys are device-independent (kind/dev/dim folded as WHOLE,0,-1), so a layer's key is the same
+// on every server -- exactly what makes a cross-device cached load correct.
+static std::mutex                                g_weight_hash_mtx;
+static std::unordered_map<std::string, uint64_t> g_weight_hashes;
+
 static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data,
                                                size_t offset, size_t size) {
     // GGML_LOG_INFO("[%s] setting tensor %s, offset=%zu, size=%zu\n", __func__, tensor->name, offset, size);
@@ -1477,6 +1503,8 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
     if (weight_cache && !split && offset == 0 &&
         ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
         const uint64_t          hash = rpc_weight_key(data, size, RPC_WKIND_WHOLE, 0, -1);
+        // retain the key so a later elastic MOVE of this tensor can load it from a peer's local cache
+        { std::lock_guard<std::mutex> lk(g_weight_hash_mtx); g_weight_hashes[tensor->name] = hash; }
         rpc_msg_load_cached_req qreq;
         qreq.tensor = rpc_tensor1;
         qreq.hash   = hash;
@@ -4965,6 +4993,9 @@ class rpc_server {
     bool graph_advance(uint8_t graph_number);
     bool load_cached(const rpc_msg_load_cached_req & request, rpc_msg_load_cached_rsp & response);
     bool set_tensor_cache(const std::vector<uint8_t> & input);
+    // (cache-aware rebalance) probe disk cache (no load) + persist a resident tensor to disk cache.
+    bool cache_probe(const rpc_msg_cache_probe_req & request, rpc_msg_cache_probe_rsp & response);
+    bool cache_store(const rpc_msg_cache_store_req & request, rpc_msg_cache_store_rsp & response);
     // cross-process resident weights (opt-in RPC_PERSIST)
     void persist_bind(const rpc_msg_persist_bind_req & request, rpc_msg_persist_bind_rsp & response, uint64_t conn_id);
     bool persist_register(const rpc_msg_persist_register_req & request, uint64_t conn_id);
@@ -5490,6 +5521,72 @@ bool rpc_server::load_cached(const rpc_msg_load_cached_req & request, rpc_msg_lo
     utime(rpc_weight_cache_path(request.hash).c_str(), nullptr);
 #endif
     response.hit = 1;
+    return true;
+}
+
+// (cache-aware rebalance) atomic write of `size` bytes to the disk cache under `hash` (temp+rename,
+// same publish discipline as set_tensor_cache). Returns true on a durable write.
+static bool rpc_weight_cache_write(uint64_t hash, const void * data, size_t size) {
+    if (!rpc_weight_cache_enabled()) {
+        return false;
+    }
+    static std::atomic<uint64_t> wc_seq{ 0 };
+    const std::string path = rpc_weight_cache_path(hash);
+    const std::string tmp  = path + ".tmp." +
+                             std::to_string((unsigned long long) (uintptr_t) &wc_seq) + "." +
+                             std::to_string((unsigned long long) wc_seq.fetch_add(1));
+    bool ok = false;
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        if (out) {
+            out.write((const char *) data, (std::streamsize) size);
+            ok = out.good();
+        }
+    }
+    if (!ok || std::rename(tmp.c_str(), path.c_str()) != 0) {
+        std::remove(tmp.c_str());
+        return false;
+    }
+    return true;
+}
+
+// (cache-aware rebalance) CACHE_PROBE: is the slice with `hash` present on disk? No load -- just a
+// hit/miss so the rebalance policy can pick a destination that already holds the layer (0x WiFi move).
+bool rpc_server::cache_probe(const rpc_msg_cache_probe_req & request, rpc_msg_cache_probe_rsp & response) {
+    response.hit = 0;
+    if (!rpc_weight_cache_enabled()) {
+        return true;
+    }
+    std::ifstream f(rpc_weight_cache_path(request.hash), std::ios::binary);
+    response.hit = f.good() ? 1 : 0;
+    return true;
+}
+
+// (cache-aware rebalance) CACHE_STORE: persist a tensor ALREADY resident on this server to the disk
+// cache under `hash` (reads its own bytes; no data payload). Lazy-warms a destination after a cold
+// transfer so the next move of this layer here is a 0x-WiFi cache hit.
+bool rpc_server::cache_store(const rpc_msg_cache_store_req & request, rpc_msg_cache_store_rsp & response) {
+    response.stored = 0;
+    if (!rpc_weight_cache_enabled()) {
+        return true;
+    }
+    struct ggml_init_params params{ ggml_tensor_overhead(), NULL, true };
+    struct ggml_context *   ctx    = ggml_init(params);
+    ggml_tensor *           tensor = deserialize_tensor(ctx, &request.tensor);
+    if (tensor == nullptr) {
+        ggml_free(ctx);
+        return true;
+    }
+    const size_t size = ggml_nbytes(tensor);
+    std::vector<uint8_t> data(size);
+    ggml_backend_tensor_get(tensor, data.data(), 0, size);
+    ggml_free(ctx);
+    response.stored = rpc_weight_cache_write(request.hash, data.data(), size) ? 1 : 0;
+    static const bool dbg_wcache = (getenv("RPC_DBG_WCACHE") != nullptr);
+    if (dbg_wcache) {
+        GGML_LOG_INFO("[wcache] STORE(resident) %016llx (%zu bytes) ok=%d\n",
+                      (unsigned long long) request.hash, size, (int) response.stored);
+    }
     return true;
 }
 
@@ -7387,6 +7484,36 @@ static void rpc_serve_client(rpc_server & server, sockfd_t sockfd, size_t free_m
                     }
                     break;
                 }
+            case RPC_CMD_CACHE_PROBE:
+                {
+                    rpc_msg_cache_probe_req request;
+                    if (!recv_msg(sockfd, &request, sizeof(request))) {
+                        return;
+                    }
+                    rpc_msg_cache_probe_rsp response;
+                    if (!server.cache_probe(request, response)) {
+                        return;
+                    }
+                    if (!send_msg(sockfd, &response, sizeof(response))) {
+                        return;
+                    }
+                    break;
+                }
+            case RPC_CMD_CACHE_STORE:
+                {
+                    rpc_msg_cache_store_req request;
+                    if (!recv_msg(sockfd, &request, sizeof(request))) {
+                        return;
+                    }
+                    rpc_msg_cache_store_rsp response;
+                    if (!server.cache_store(request, response)) {
+                        return;
+                    }
+                    if (!send_msg(sockfd, &response, sizeof(response))) {
+                        return;
+                    }
+                    break;
+                }
             default:
                 {
                     fprintf(stderr, "Unknown command: %d\n", cmd);
@@ -7740,6 +7867,58 @@ static void ggml_backend_rpc_prefetch_wait(const ggml_tensor * t) {
     send_rpc_cmd(ctx->sock, RPC_CMD_PREFETCH_WAIT, &req, sizeof(req), &resp, sizeof(resp));
 }
 
+// (cache-aware rebalance) look up a weight tensor's retained content hash (0 if unknown -- e.g. the
+// weight cache was off at load, so the key was never computed/retained).
+static uint64_t ggml_backend_rpc_weight_hash(const ggml_tensor * t) {
+    if (!t) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lk(g_weight_hash_mtx);
+    auto it = g_weight_hashes.find(t->name);
+    return it != g_weight_hashes.end() ? it->second : 0;
+}
+
+// (cache-aware rebalance) does the server behind buffer type `buft` hold the slice with `hash` on
+// disk? No load -- just hit/miss, so the policy can pick a destination that already holds the layer.
+static bool ggml_backend_rpc_cache_probe(ggml_backend_buffer_type_t buft, uint64_t hash) {
+    if (!buft || hash == 0 || buft->iface.get_name != ggml_backend_rpc_buffer_type_name) {
+        return false;
+    }
+    auto * buft_ctx = (ggml_backend_rpc_buffer_type_context *) buft->context;
+    rpc_msg_cache_probe_req req;  req.hash = hash;
+    rpc_msg_cache_probe_rsp resp; resp.hit = 0;
+    bool ok = send_rpc_cmd(get_socket(buft_ctx->endpoint.c_str()), RPC_CMD_CACHE_PROBE, &req, sizeof(req), &resp, sizeof(resp));
+    return ok && resp.hit == 1;
+}
+
+// (cache-aware rebalance) load `hash` from dst's local cache straight into the dst tensor's buffer
+// (0x WiFi on a hit). Returns true on a hit (dst now holds the bytes), false on a miss.
+static bool ggml_backend_rpc_cache_load(ggml_tensor * dst, uint64_t hash) {
+    if (!dst || !dst->buffer || hash == 0 ||
+        dst->buffer->buft->iface.get_name != ggml_backend_rpc_buffer_type_name) {
+        return false;
+    }
+    auto * ctx = (ggml_backend_rpc_buffer_context *) dst->buffer->context;
+    rpc_msg_load_cached_req req;  req.tensor = serialize_tensor(dst); req.hash = hash;
+    rpc_msg_load_cached_rsp resp; resp.hit = 0;
+    bool ok = send_rpc_cmd(ctx->sock, RPC_CMD_LOAD_CACHED, &req, sizeof(req), &resp, sizeof(resp));
+    return ok && resp.hit == 1;
+}
+
+// (cache-aware rebalance) persist a tensor already resident on its server to that server's disk cache
+// under `hash`, so a future move of this layer here becomes a 0x-WiFi hit. Returns true on a store.
+static bool ggml_backend_rpc_cache_store(const ggml_tensor * t, uint64_t hash) {
+    if (!t || !t->buffer || hash == 0 ||
+        t->buffer->buft->iface.get_name != ggml_backend_rpc_buffer_type_name) {
+        return false;
+    }
+    auto * ctx = (ggml_backend_rpc_buffer_context *) t->buffer->context;
+    rpc_msg_cache_store_req req;  req.tensor = serialize_tensor(t); req.hash = hash;
+    rpc_msg_cache_store_rsp resp; resp.stored = 0;
+    bool ok = send_rpc_cmd(ctx->sock, RPC_CMD_CACHE_STORE, &req, sizeof(req), &resp, sizeof(resp));
+    return ok && resp.stored == 1;
+}
+
 static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (std::strcmp(name, "ggml_backend_rpc_add_device") == 0) {
         return (void *) ggml_backend_rpc_add_device;
@@ -7749,6 +7928,18 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (strcmp(name, "ggml_backend_rpc_prefetch_wait") == 0) {
         return (void *) ggml_backend_rpc_prefetch_wait;
+    }
+    if (strcmp(name, "ggml_backend_rpc_weight_hash") == 0) {
+        return (void *) ggml_backend_rpc_weight_hash;
+    }
+    if (strcmp(name, "ggml_backend_rpc_cache_probe") == 0) {
+        return (void *) ggml_backend_rpc_cache_probe;
+    }
+    if (strcmp(name, "ggml_backend_rpc_cache_load") == 0) {
+        return (void *) ggml_backend_rpc_cache_load;
+    }
+    if (strcmp(name, "ggml_backend_rpc_cache_store") == 0) {
+        return (void *) ggml_backend_rpc_cache_store;
     }
     if (strcmp(name, "ggml_backend_split_buffer_type") == 0) {
         return (void *) ggml_backend_rpc_split_buffer_type;

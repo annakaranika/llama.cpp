@@ -6,6 +6,7 @@
 #include "llama-model.h"
 #include "llama-kv-cache.h"
 #include "llama-adapter.h"
+#include "llama-rebalance.h"
 
 #include "ggml-cpp.h"
 
@@ -21,6 +22,10 @@ struct llama_context {
         , t_load_us(model.t_load_us) {}
 
     const struct llama_model & model;
+
+    // Elastic-rebalancing policy invoked once per decode (default: the built-in gated policy).
+    // Overridable via llama_set_rebalance_callback; a no-op unless LLAMA_REBALANCE_BUDGET_MB is set.
+    llama_rebalance_fn rebalance_cb = llama_rebalance_step;
 
     struct llama_cparams      cparams;
     struct llama_sbatch       sbatch;  // TODO: revisit if needed
