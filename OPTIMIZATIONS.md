@@ -189,10 +189,24 @@ commits the KV on demand and sheds a layer off dev0 as it crosses budget: **4 gr
 dev0→dev1 at 64 cells), 242 coherent tokens, 0 errors**, and every Pi stays under 2 GB (rpi20=1395,
 rpi22=1140, rpi24=874, rpi25=905 MB at ctx ≈160). Elastic runs a provisioning static crashes on.
 
-- *Caveat (honest):* shedding relieves KV *growth* (fewer active layers on the pressured device → a
-  smaller KV slope), but a shed layer's **weights** stay resident on the source (not reclaimed), so it
-  lowers the slope, not the ~1.34 GB weight floor. Reclaiming source weights (re-partition the shared
-  buffer) is future work; until then the reachable-context gain is bounded by the retained weights.
+**Weight reclaim** (`LLAMA_REBALANCE_RECLAIM`, opt-in): by default a shed layer relieves only *KV*
+growth — its ~130 MB of weights stay resident on the source (packed in a shared buffer that can't
+shrink, and a repack would momentarily double memory → OOM on a 2 GB Pi). Reclaim instead
+`madvise(MADV_DONTNEED)`s the moved layer's interior pages on the source: the physical RAM returns to
+the OS while the buffer stays valid for its other layers (only pages fully inside the tensor are
+touched, never one shared with a live neighbour). Measured A/B (7B, 4-Pi, budget 15 MB, one shift of
+layer 10 dev0→dev1):
+
+| | source dev0 at shift | dev0 at end | cluster total at end |
+|---|---|---|---|
+| reclaim **off** | 1339 → 1340 MB (weights kept) | 1411 MB | 4340 MB |
+| reclaim **on** | 1339 → **1215 MB** (~124 MB freed) | **1246 MB** | **4175 MB** |
+
+So reclaim drops the source device by the shed layer's weight (~124 MB freed the instant it moves;
+~165 MB lower by the end), and keeps cluster total from growing per shift (the moved weight is not
+duplicated src+dst). Bit-identical, freeing ~99 % of each large tensor (source only). This turns
+shedding from "lower the KV slope" into "lower the KV slope *and* the weight floor," so the pressured
+device actually frees room rather than just slowing its own growth.
 
 ## Environment-variable reference
 
