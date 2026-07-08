@@ -329,6 +329,7 @@ void llama_rebalance_step(llama_model & model, llama_kv_cache & kv, int32_t n_to
             };
 
             std::vector<llama_rebalance_move> plan;
+            int plan_runs_cur = 0, plan_runs_want = 0;  // pipeline contiguity before/after the plan
             if (batch.empty()) {
                 if (!apportion()) {
                     // the active set cannot fit at the horizon -> recruit the best idle device
@@ -345,31 +346,68 @@ void llama_rebalance_step(llama_model & model, llama_kv_cache & kv, int32_t n_to
                     }
                 }
 
-                // PLAN THE BATCH: the moves that take every member from its current count to its
-                // target -- donors give their edge layer toward each recipient (their own block
-                // stays contiguous). Planned fresh each decode until a batch is staged, so it
-                // follows the live measurements right up to the point of transfer.
+                // PLAN THE BATCH, CONTIGUITY-PRESERVING: every member with a nonzero target gets
+                // ONE consecutive block of layers (sizes = targets), so hops/token stays at
+                // members-1 forever instead of growing with each recruit (scattered edge-picking
+                // gave a recruit 3 separate runs = 6 pipeline boundaries on the 9-Pi cluster).
+                // Block order keeps the members' current relative order (sorted by the median of
+                // the layers each holds); a member holding nothing (a fresh recruit) is tried at
+                // EVERY insertion position and the cheapest wins -- a middle slot typically costs
+                // only a couple of extra (hidden) moves but keeps the pipeline contiguous. The
+                // plan is then simply every layer whose desired block owner differs from its
+                // current one; cascaded boundary shifts fall out of that naturally.
                 if (wsum > 0.0) {
-                    std::vector<int> ldev(nl, 0), cur(nd, 0);
+                    std::vector<int> ldev(nl, 0);
                     for (int k = 0; k < nl; k++) {
                         for (int i = 0; i < nd; i++) {
                             if (model.devices[i] == model.dev_layer(k)) { ldev[k] = i; break; }
                         }
-                        cur[ldev[k]]++;
                     }
-                    for (;;) {
-                        int r = -1, d = -1, rdef = 0, dsur = 0;
-                        for (int i = 0; i < nd; i++) {
-                            if (target[i] - cur[i] > rdef) { rdef = target[i] - cur[i]; r = i; }
-                            if (cur[i] - target[i] > dsur) { dsur = cur[i] - target[i]; d = i; }
+                    // members that hold layers, in current pipeline order (median layer index);
+                    // members with a target but no layers (recruits) are placed by search below.
+                    std::vector<int> held, fresh;
+                    for (int i = 0; i < nd; i++) {
+                        if (target[i] <= 0) { continue; }
+                        if (cnt[model.devices[i]] > 0) { held.push_back(i); } else { fresh.push_back(i); }
+                    }
+                    std::vector<double> med(nd, 0.0);
+                    for (int i : held) {
+                        std::vector<int> ls;
+                        for (int k = 0; k < nl; k++) { if (ldev[k] == i) { ls.push_back(k); } }
+                        med[i] = ls[ls.size()/2];
+                    }
+                    std::sort(held.begin(), held.end(), [&](int a, int b) { return med[a] < med[b]; });
+                    // desired owner per layer for a given block order; returns the move count
+                    auto layout = [&](const std::vector<int> & order, std::vector<int> & want) -> int {
+                        want.assign(nl, -1);
+                        int at = 0, moves = 0;
+                        for (int i : order) {
+                            for (int t = 0; t < target[i] && at < nl; t++, at++) { want[at] = i; }
                         }
-                        if (r < 0 || d < 0) { break; }
-                        int il = -1;
-                        if (d < r) { for (int k = nl - 1; k >= 0; k--) { if (ldev[k] == d) { il = k; break; } } }
-                        else       { for (int k = 0; k < nl; k++)      { if (ldev[k] == d) { il = k; break; } } }
-                        if (il < 0) { break; }
-                        plan.push_back({ il, d, r, false });
-                        ldev[il] = r; cur[d]--; cur[r]++;
+                        for (int k = 0; k < nl; k++) { moves += want[k] >= 0 && want[k] != ldev[k] ? 1 : 0; }
+                        return moves;
+                    };
+                    // insert each fresh member (one per cycle by design) at its cheapest position
+                    std::vector<int> order = held, want, cand;
+                    for (int f : fresh) {
+                        int best_pos = 0, best_moves = -1;
+                        for (size_t p = 0; p <= order.size(); p++) {
+                            std::vector<int> o = order;
+                            o.insert(o.begin() + p, f);
+                            const int m = layout(o, cand);
+                            if (best_moves < 0 || m < best_moves) { best_moves = m; best_pos = (int) p; }
+                        }
+                        order.insert(order.begin() + best_pos, f);
+                    }
+                    layout(order, want);
+                    for (int k = 0; k < nl; k++) {
+                        if (want[k] >= 0 && want[k] != ldev[k]) { plan.push_back({ k, ldev[k], want[k], false }); }
+                    }
+                    // contiguity metric: pipeline runs (device changes along the layer axis + 1)
+                    plan_runs_cur = 1; plan_runs_want = 1;
+                    for (int k = 1; k < nl; k++) {
+                        plan_runs_cur  += ldev[k] != ldev[k-1] ? 1 : 0;
+                        plan_runs_want += want[k] >= 0 && want[k-1] >= 0 && want[k] != want[k-1] ? 1 : 0;
                     }
                 }
             }
@@ -385,8 +423,8 @@ void llama_rebalance_step(llama_model & model, llama_kv_cache & kv, int32_t n_to
                         staged_n += m.staged ? 1 : 0;
                     }
                     batch = plan;
-                    fprintf(stderr, "[rebalance] PREFETCH-BATCH %zu layers (%d staged) | cells=%u load=%.1fMB proj=%.1fMB budget=%.1fMB | targets:",
-                            batch.size(), staged_n, cells, load[dmax], projected, budget_mb);
+                    fprintf(stderr, "[rebalance] PREFETCH-BATCH %zu layers (%d staged) | cells=%u load=%.1fMB proj=%.1fMB budget=%.1fMB | runs %d->%d | targets:",
+                            batch.size(), staged_n, cells, load[dmax], projected, budget_mb, plan_runs_cur, plan_runs_want);
                     for (int i = 0; i < nd; i++) { fprintf(stderr, " %d", target[i]); }
                     fprintf(stderr, "\n");
                 }
