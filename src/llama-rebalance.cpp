@@ -7,10 +7,12 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <vector>
 
 // Log the current per-device layer distribution (how many of the model's layers each device holds).
 // Changes only at a shift, so logging it right after each shift captures the full timeline.
@@ -21,6 +23,56 @@ static void log_layer_dist(llama_model & model, uint32_t n_layer) {
     for (auto * dev : model.devices) { fprintf(stderr, " %s=%d", ggml_backend_dev_name(dev), d[dev]); }
     fprintf(stderr, "\n");
 }
+
+// (capacity-aware) measure one device's LIVE capacity via the RPC live-stats probe: memory available
+// right now + how many cores other work is consuming on the host. Falls back to the static
+// ggml_backend_dev_memory snapshot (idle-host assumption) for non-RPC devices. Shared building block:
+// the elastic placement at load and every rebalance policy read capacity through this one probe.
+typedef bool (*rpc_live_stats_t)(ggml_backend_dev_t, uint64_t *, uint64_t *, uint32_t *, float *);
+
+llama_dev_capacity llama_dev_capacity_measure(ggml_backend_dev_t dev) {
+    static rpc_live_stats_t live_fn = [] () -> rpc_live_stats_t {
+        ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
+        return reg ? (rpc_live_stats_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_dev_live_stats") : nullptr;
+    }();
+    llama_dev_capacity cap = {};
+    uint64_t free_b = 0, total_b = 0;
+    uint32_t ncpu   = 0;
+    float    ext    = 0.0f;
+    if (live_fn && live_fn(dev, &free_b, &total_b, &ncpu, &ext)) {
+        cap.mem_free_mb  = (double) free_b  / (1024.0*1024.0);
+        cap.mem_total_mb = (double) total_b / (1024.0*1024.0);
+        cap.n_cpu        = (int) ncpu;
+        cap.ext_load     = ext;
+        cap.live         = true;
+        return cap;
+    }
+    size_t free_s = 0, total_s = 0;
+    ggml_backend_dev_memory(dev, &free_s, &total_s);
+    cap.mem_free_mb  = (double) free_s  / (1024.0*1024.0);
+    cap.mem_total_mb = (double) total_s / (1024.0*1024.0);
+    cap.n_cpu        = 1;
+    cap.ext_load     = 0.0;
+    cap.live         = false;
+    return cap;
+}
+
+double llama_dev_compute_frac(const llama_dev_capacity & cap) {
+    if (cap.n_cpu <= 0) {
+        return 1.0;
+    }
+    const double f = ((double) cap.n_cpu - cap.ext_load) / (double) cap.n_cpu;
+    return std::max(0.05, std::min(1.0, f));
+}
+
+// (balanced policy) one planned layer move of a batch: src/dst are indices into model.devices;
+// staged means its weights were successfully pre-staged in the background (commit is then ~instant).
+struct llama_rebalance_move {
+    int  il;
+    int  src_i;
+    int  dst_i;
+    bool staged;
+};
 
 // Gated elastic rebalance: when the most-loaded device's KV footprint exceeds a budget, shift one of
 // its layers to another device. Cooldown (LLAMA_REBALANCE_COOLDOWN tokens) avoids thrashing -- every
@@ -40,7 +92,8 @@ void llama_rebalance_step(llama_model & model, llama_kv_cache & kv, int32_t n_to
     // layer in its local weight cache (a 0x-WiFi load), falling back to the least-loaded device.
     static const llama_rebalance_policy policy = [] {
         const char * p = getenv("LLAMA_REBALANCE_POLICY");
-        if (p && strcmp(p, "cache") == 0) { return LLAMA_REBALANCE_POLICY_CACHE; }
+        if (p && strcmp(p, "cache")    == 0) { return LLAMA_REBALANCE_POLICY_CACHE;    }
+        if (p && strcmp(p, "balanced") == 0) { return LLAMA_REBALANCE_POLICY_BALANCED; }
         return LLAMA_REBALANCE_POLICY_ADJACENT;
     }();
     static int rb_tok = 0, rb_last = -1000000;
@@ -168,6 +221,163 @@ void llama_rebalance_step(llama_model & model, llama_kv_cache & kv, int32_t n_to
                             wbytes/1e6, kvbytes/1e6, (ts2-ts0)/1e3, (ts1-ts0)/1e3, (ts2-ts1)/1e3, cells, hits, total_t);
                     log_layer_dist(model, hparams.n_layer);
                     rb_last = rb_tok;
+                }
+            }
+        } else if (policy == LLAMA_REBALANCE_POLICY_BALANCED) {
+            // ===== CAPACITY-AWARE BALANCED-BATCH POLICY =====
+            // Weight each device's layer share by its LIVE capacity (available memory x free
+            // compute), re-measured periodically, and correct deviations as ONE batch: when KV
+            // pressure is predicted, pre-stage every move needed to put each device at its
+            // capacity-weighted share, and commit them together at the budget crossing. A recruit
+            // therefore hands the new device its full balanced share in one step (max KV headroom
+            // everywhere, far fewer rebalances) instead of draining onto it a layer at a time, and
+            // the whole batch transfer overlaps decode so no move stalls inference.
+            static const int    measure_every = getenv("LLAMA_REBALANCE_MEASURE")   ? atoi(getenv("LLAMA_REBALANCE_MEASURE"))   : 32;
+            static const double margin_mb     = getenv("LLAMA_REBALANCE_MARGIN_MB") ? atof(getenv("LLAMA_REBALANCE_MARGIN_MB")) : 100.0;
+            static const int    headroom_tok  = getenv("LLAMA_ELASTIC_KV_HEADROOM") ? atoi(getenv("LLAMA_ELASTIC_KV_HEADROOM")) : 512;
+            const int nd = (int) model.devices.size();
+            const int nl = (int) hparams.n_layer;
+
+            // PERIODIC MEASUREMENT: live per-device capacity, re-read every measure_every tokens
+            // (a few bytes per device on the existing sockets) so decisions track the actual
+            // cluster state -- another process eating a device's memory or cores shows up here.
+            static std::vector<llama_dev_capacity> caps;
+            static int cap_tok = -1000000;
+            if ((int) caps.size() != nd || rb_tok - cap_tok >= measure_every) {
+                caps.clear();
+                for (auto * d : model.devices) { caps.push_back(llama_dev_capacity_measure(d)); }
+                cap_tok = rb_tok;
+            }
+
+            // CAPACITY-WEIGHTED TARGETS: apportion the layers by live capacity. A device's memory
+            // capacity for our layers = free now + what our layers already occupy there (a move
+            // returns the source's share, so the total is move-invariant), scaled by the fraction
+            // of its compute not consumed by other work; clamped so no target overruns the
+            // device's memory at a KV horizon of current cells + a headroom reserve.
+            static const double w_layer_mb = [&model, nl] {
+                size_t b = 0;
+                for (auto & nt : model.tensors_by_name) {
+                    if (nt.first.rfind("blk.", 0) == 0) { b += ggml_nbytes(nt.second); }
+                }
+                return b / (1024.0*1024.0) / std::max(1, nl);
+            }();
+            const double per_tok_mb  = (double) (hparams.n_embd_k_gqa(0) + hparams.n_embd_v_gqa(0)) * elt / (1024.0*1024.0);
+            const double kv_layer_mb = cells * per_tok_mb;
+            const double kv_res_mb   = (cells + headroom_tok) * per_tok_mb;
+            std::vector<double> mem_cap(nd), ideal(nd, 0.0);
+            std::vector<int>    target(nd, 0), cap_layers(nd);
+            double wsum = 0.0;
+            for (int i = 0; i < nd; i++) {
+                const double held = cnt[model.devices[i]] * (w_layer_mb + kv_layer_mb);
+                mem_cap[i] = std::max(0.0, caps[i].mem_free_mb - margin_mb + held);
+                wsum      += mem_cap[i] * llama_dev_compute_frac(caps[i]);
+            }
+            if (wsum > 0.0) {
+                int assigned = 0;
+                for (int i = 0; i < nd; i++) {
+                    ideal[i]      = nl * mem_cap[i] * llama_dev_compute_frac(caps[i]) / wsum;
+                    target[i]     = (int) ideal[i];
+                    cap_layers[i] = (int) (mem_cap[i] / (w_layer_mb + kv_res_mb));
+                    assigned     += target[i];
+                }
+                // largest-remainder: hand the leftover layers to the largest fractional shares
+                std::vector<int> order(nd);
+                for (int i = 0; i < nd; i++) { order[i] = i; }
+                std::sort(order.begin(), order.end(), [&](int a, int b) { return ideal[a] - target[a] > ideal[b] - target[b]; });
+                for (int k = 0; assigned < nl; k = (k + 1) % nd) { target[order[k]]++; assigned++; }
+                // memory clamp + redistribute the clipped layers to devices with spare headroom
+                int excess = 0;
+                for (int i = 0; i < nd; i++) {
+                    if (target[i] > cap_layers[i]) { excess += target[i] - cap_layers[i]; target[i] = cap_layers[i]; }
+                }
+                while (excess > 0) {
+                    int best = -1;
+                    for (int i = 0; i < nd; i++) {
+                        if (target[i] < cap_layers[i] && (best < 0 || ideal[i] - target[i] > ideal[best] - target[best])) { best = i; }
+                    }
+                    if (best < 0) { break; }  // nothing fits the horizon anywhere -- leave the rest where it is
+                    target[best]++; excess--;
+                }
+            }
+
+            // PLAN THE BATCH: the moves that take every device from its current count to its
+            // target -- donors give their edge layer toward each recipient (their own block stays
+            // contiguous). Planned fresh each decode until a batch is staged, so it follows the
+            // live measurements right up to the point of transfer.
+            static std::vector<llama_rebalance_move> batch;  // staged, awaiting the budget crossing
+            std::vector<llama_rebalance_move> plan;
+            if (wsum > 0.0 && batch.empty()) {
+                std::vector<int> ldev(nl, 0), cur(nd, 0);
+                for (int k = 0; k < nl; k++) {
+                    for (int i = 0; i < nd; i++) {
+                        if (model.devices[i] == model.dev_layer(k)) { ldev[k] = i; break; }
+                    }
+                    cur[ldev[k]]++;
+                }
+                for (;;) {
+                    int r = -1, d = -1, rdef = 0, dsur = 0;
+                    for (int i = 0; i < nd; i++) {
+                        if (target[i] - cur[i] > rdef) { rdef = target[i] - cur[i]; r = i; }
+                        if (cur[i] - target[i] > dsur) { dsur = cur[i] - target[i]; d = i; }
+                    }
+                    if (r < 0 || d < 0) { break; }
+                    int il = -1;
+                    if (d < r) { for (int k = nl - 1; k >= 0; k--) { if (ldev[k] == d) { il = k; break; } } }
+                    else       { for (int k = 0; k < nl; k++)      { if (ldev[k] == d) { il = k; break; } } }
+                    if (il < 0) { break; }
+                    plan.push_back({ il, d, r, false });
+                    ldev[il] = r; cur[d]--; cur[r]++;
+                }
+            }
+
+            // PREFETCH THE WHOLE BATCH when the projected load one lead ahead crosses the budget:
+            // every planned layer's weights start moving in the background while decode continues.
+            const uint32_t gb = kv.grow_block > 0 ? kv.grow_block : 0;
+            if (pf_lead > 0.0 && batch.empty() && !plan.empty() && cells > 0) {
+                const double projected = load[dmax] * (double) (cells + (uint32_t) (pf_lead * gb)) / (double) cells;
+                if (projected > budget_mb) {
+                    int staged_n = 0;
+                    for (auto & m : plan) {
+                        m.staged  = model.prefetch_layer_weights(m.il, model.devices[m.dst_i]);
+                        staged_n += m.staged ? 1 : 0;
+                    }
+                    batch = plan;
+                    fprintf(stderr, "[rebalance] PREFETCH-BATCH %zu layers (%d staged) | cells=%u load=%.1fMB proj=%.1fMB budget=%.1fMB | targets:",
+                            batch.size(), staged_n, cells, load[dmax], projected, budget_mb);
+                    for (int i = 0; i < nd; i++) { fprintf(stderr, " %d", target[i]); }
+                    fprintf(stderr, "\n");
+                }
+            }
+
+            // COMMIT THE BATCH at the actual budget crossing: staged layers just barrier + repoint
+            // (~instant), unstaged ones fall back to a synchronous move; each layer's (tiny) KV
+            // moves with it. One cooldown covers the whole batch.
+            if (rb_tok - rb_last >= cooldown && load[dmax] > budget_mb) {
+                std::vector<llama_rebalance_move> & moves = !batch.empty() ? batch : plan;
+                if (!moves.empty()) {
+                    const int64_t tb0 = ggml_time_us();
+                    int done = 0;
+                    for (auto & m : moves) {
+                        ggml_backend_dev_t dst_dev = model.devices[m.dst_i];
+                        ggml_backend_dev_t src_dev = model.dev_layer(m.il);
+                        const int64_t ts0 = ggml_time_us();
+                        const bool committed = m.staged && model.commit_layer_weights(m.il);
+                        if (!committed && !model.move_layer_weights(m.il, dst_dev)) {
+                            continue;
+                        }
+                        const int64_t ts1 = ggml_time_us();
+                        llama_kv_cache_move_layer(kv, model, m.il, dst_dev);
+                        const int64_t ts2 = ggml_time_us();
+                        fprintf(stderr, "[rebalance] SHIFT layer %d %s->%s: total=%.0fms (weights=%.0fms kv=%.0fms) | prefetched=%d (batch)\n",
+                                m.il, ggml_backend_dev_name(src_dev), ggml_backend_dev_name(dst_dev),
+                                (ts2-ts0)/1e3, (ts1-ts0)/1e3, (ts2-ts1)/1e3, (int) committed);
+                        done++;
+                    }
+                    fprintf(stderr, "[rebalance] BATCH commit: %d/%zu moves in %.0fms | cells=%u load=%.1fMB budget=%.1fMB\n",
+                            done, moves.size(), (ggml_time_us()-tb0)/1e3, cells, load[dmax], budget_mb);
+                    log_layer_dist(model, hparams.n_layer);
+                    rb_last = rb_tok;
+                    batch.clear();
                 }
             }
         }

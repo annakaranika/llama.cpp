@@ -48,7 +48,12 @@
 #    include <sys/socket.h>
 #    include <sys/types.h>
 #    include <sys/mman.h>  // madvise, for weight reclaim (MADV_DONTNEED)
+#    include <sys/resource.h>  // getrusage, for the live-stats self-CPU measurement
 #    include <unistd.h>
+#endif
+#ifdef __APPLE__
+#    include <mach/mach.h>   // host_statistics64, live free memory
+#    include <sys/sysctl.h>  // hw.memsize
 #endif
 #include <cstring>
 
@@ -151,6 +156,7 @@ enum rpc_cmd {
     RPC_CMD_PERSIST_BIND,      // "do you have a resident weight buffer for (model_key,size)?" -> rebind, skip alloc+upload
     RPC_CMD_PERSIST_REGISTER,  // retain this freshly-uploaded weight buffer under model_key (don't free on teardown)
     RPC_CMD_PERSIST_DETACH,    // client is releasing a resident buffer -> keep it resident, mark unclaimed for the next process
+    RPC_CMD_GET_LIVE_STATS,    // (capacity-aware rebalance) live free memory + compute load measured NOW (GET_DEVICE_MEMORY is a connection-time snapshot)
     RPC_CMD_COUNT,
 };
 
@@ -287,6 +293,21 @@ struct rpc_msg_prefetch_wait_req {
 };
 struct rpc_msg_prefetch_wait_rsp {
     uint8_t result;   // 1 = all background pushes complete
+};
+
+// (capacity-aware rebalance) live capacity of the machine behind this server, measured at request
+// time: memory available to new allocations (NOT the snapshot GET_DEVICE_MEMORY took when the client
+// connected) plus how busy the host is with OTHER work (1-min loadavg minus this server's own recent
+// CPU use, in cores). Lets a placement/rebalance policy weight each device's layer share by what the
+// device can actually take NOW, instead of assuming uniform devices frozen at load time.
+struct rpc_msg_get_live_stats_req {
+    uint8_t dummy;
+};
+struct rpc_msg_get_live_stats_rsp {
+    uint64_t free_mem;   // bytes available to new allocations right now
+    uint64_t total_mem;  // bytes of physical memory
+    uint32_t n_cpu;      // online cores
+    float    ext_load;   // cores busy with work that is NOT this server (>= 0)
 };
 
 struct rpc_msg_do_computation_req {
@@ -7046,6 +7067,90 @@ rpc_server::~rpc_server() {
     }
 }
 
+// (capacity-aware rebalance) live host stats, measured at request time. The free/total pair passed
+// into rpc_serve_client is a snapshot taken when the client connected (and on Linux CPU servers it
+// reports free == total), so decisions that should track the actual cluster state ask here instead.
+// ext_load = 1-min loadavg minus this process's own recent CPU use (getrusage delta between stats
+// requests), i.e. compute pressure from OTHER work; the first request has no delta window yet and
+// counts the whole loadavg as external. Test hooks: RPC_STATS_FREE_MB / RPC_STATS_EXT_LOAD override
+// the measured values (exercise capacity weighting locally); RPC_DBG_STATS logs each report.
+static void rpc_get_live_stats(rpc_msg_get_live_stats_rsp & rsp) {
+    uint64_t free_mem = 0, total_mem = 0;
+#if defined(_WIN32)
+    MEMORYSTATUSEX status;
+    status.dwLength = sizeof(status);
+    GlobalMemoryStatusEx(&status);
+    total_mem = status.ullTotalPhys;
+    free_mem  = status.ullAvailPhys;
+#elif defined(__APPLE__)
+    {
+        int64_t mem = 0;
+        size_t  len = sizeof(mem);
+        sysctlbyname("hw.memsize", &mem, &len, NULL, 0);
+        total_mem = (uint64_t) mem;
+        mach_msg_type_number_t  count = HOST_VM_INFO64_COUNT;
+        vm_statistics64_data_t  vm;
+        if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t) &vm, &count) == KERN_SUCCESS) {
+            free_mem = (uint64_t) (vm.free_count + vm.inactive_count) * (uint64_t) sysconf(_SC_PAGESIZE);
+        }
+    }
+#elif defined(__linux__)
+    {
+        // MemAvailable = the kernel's estimate of what new allocations can take without swapping
+        std::ifstream mi("/proc/meminfo");
+        std::string   key, unit;
+        uint64_t      kb = 0;
+        while (mi >> key >> kb >> unit) {
+            if (key == "MemTotal:")     { total_mem = kb * 1024; }
+            if (key == "MemAvailable:") { free_mem  = kb * 1024; }
+        }
+    }
+#else
+    {
+        long pages     = sysconf(_SC_PHYS_PAGES);
+        long page_size = sysconf(_SC_PAGE_SIZE);
+        total_mem = free_mem = (uint64_t) pages * (uint64_t) page_size;
+    }
+#endif
+    double self_cores = 0.0;
+    float  ext_load   = 0.0f;
+#ifndef _WIN32
+    double la[1] = { 0.0 };
+    getloadavg(la, 1);
+    {
+        static std::mutex mtx;
+        static double     prev_cpu  = -1.0;
+        static int64_t    prev_wall = 0;
+        static float      last_self = 0.0f;
+        std::lock_guard<std::mutex> lk(mtx);
+        rusage ru;
+        getrusage(RUSAGE_SELF, &ru);
+        const double  cpu  = ru.ru_utime.tv_sec + ru.ru_stime.tv_sec + (ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) / 1e6;
+        const int64_t wall = ggml_time_us();
+        if (prev_cpu >= 0.0 && wall - prev_wall > 100000) {  // need a >0.1 s window for a stable delta
+            last_self = (float) ((cpu - prev_cpu) / ((wall - prev_wall) / 1e6));
+        }
+        prev_cpu   = cpu;
+        prev_wall  = wall;
+        self_cores = last_self;
+    }
+    ext_load = std::max(0.0f, (float) la[0] - (float) self_cores);
+#endif
+    rsp.free_mem  = free_mem;
+    rsp.total_mem = total_mem;
+    rsp.n_cpu     = std::max(1u, std::thread::hardware_concurrency());
+    rsp.ext_load  = ext_load;
+    static const char * env_free = getenv("RPC_STATS_FREE_MB");
+    static const char * env_load = getenv("RPC_STATS_EXT_LOAD");
+    if (env_free) { rsp.free_mem = (uint64_t) (atof(env_free) * 1024.0 * 1024.0); }
+    if (env_load) { rsp.ext_load = (float) atof(env_load); }
+    static const bool dbg = getenv("RPC_DBG_STATS") != nullptr;
+    if (dbg) {
+        GGML_LOG_INFO("[live-stats] free=%.0fMB total=%.0fMB ncpu=%u ext_load=%.2f (self=%.2f cores)\n",
+                      rsp.free_mem / 1048576.0, rsp.total_mem / 1048576.0, rsp.n_cpu, rsp.ext_load, self_cores);
+    }
+}
+
 static void rpc_serve_client(rpc_server & server, sockfd_t sockfd, size_t free_mem, size_t total_mem) {
     // rpc_server server(backend);
     // unique id for THIS connection (monotonic, never reuses a value the way a raw fd
@@ -7263,6 +7368,19 @@ static void rpc_serve_client(rpc_server & server, sockfd_t sockfd, size_t free_m
                     if (!server.prefetch_wait(request, response)) {
                         return;
                     }
+                    if (!send_msg(sockfd, &response, sizeof(response))) {
+                        return;
+                    }
+                    break;
+                }
+            case RPC_CMD_GET_LIVE_STATS:
+                {
+                    rpc_msg_get_live_stats_req request;
+                    if (!recv_msg(sockfd, &request, sizeof(request))) {
+                        return;
+                    }
+                    rpc_msg_get_live_stats_rsp response;
+                    rpc_get_live_stats(response);
                     if (!send_msg(sockfd, &response, sizeof(response))) {
                         return;
                     }
@@ -7929,6 +8047,30 @@ static void ggml_backend_rpc_prefetch_wait(const ggml_tensor * t) {
     send_rpc_cmd(ctx->sock, RPC_CMD_PREFETCH_WAIT, &req, sizeof(req), &resp, sizeof(resp));
 }
 
+// (capacity-aware rebalance) live capacity of the device's host, measured NOW: available memory,
+// core count, and how many cores are busy with OTHER work. The GET_DEVICE_MEMORY value is a snapshot
+// taken when the client connected (and on Linux CPU servers it reports free == total), so placement
+// and rebalance decisions that should track the actual cluster state use this instead.
+static bool ggml_backend_rpc_dev_live_stats(ggml_backend_dev_t dev, uint64_t * free_mem, uint64_t * total_mem, uint32_t * n_cpu, float * ext_load) {
+    if (!dev || dev->iface.get_name != ggml_backend_rpc_device_get_name) {
+        return false;
+    }
+    auto * dev_ctx = (ggml_backend_rpc_device_context *) dev->context;
+    rpc_msg_get_live_stats_req req;
+    req.dummy = 0;
+    rpc_msg_get_live_stats_rsp rsp;
+    memset(&rsp, 0, sizeof(rsp));
+    auto sock = get_socket(dev_ctx->endpoint);
+    if (sock == nullptr || !send_rpc_cmd(sock, RPC_CMD_GET_LIVE_STATS, &req, sizeof(req), &rsp, sizeof(rsp))) {
+        return false;
+    }
+    *free_mem  = rsp.free_mem;
+    *total_mem = rsp.total_mem;
+    *n_cpu     = rsp.n_cpu;
+    *ext_load  = rsp.ext_load;
+    return true;
+}
+
 // (cache-aware rebalance) look up a weight tensor's retained content hash (0 if unknown -- e.g. the
 // weight cache was off at load, so the key was never computed/retained).
 static uint64_t ggml_backend_rpc_weight_hash(const ggml_tensor * t) {
@@ -8004,6 +8146,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (strcmp(name, "ggml_backend_rpc_prefetch_wait") == 0) {
         return (void *) ggml_backend_rpc_prefetch_wait;
+    }
+    if (strcmp(name, "ggml_backend_rpc_dev_live_stats") == 0) {
+        return (void *) ggml_backend_rpc_dev_live_stats;
     }
     if (strcmp(name, "ggml_backend_rpc_weight_hash") == 0) {
         return (void *) ggml_backend_rpc_weight_hash;

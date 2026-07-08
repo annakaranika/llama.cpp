@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 #include "llama-mmap.h"
 #include "llama-model-loader.h"
+#include "llama-rebalance.h"  // llama_dev_capacity_measure, for capacity-aware elastic placement
 
 
 #include "ggml-cpp.h"
@@ -384,9 +385,10 @@ struct llama_model::impl {
     layer_dev dev_output = {};
     std::vector<layer_dev> dev_layer;
 
-    // (elastic prefetch) one in-flight background weight pre-stage: the destination buffer + duplicate
-    // tensors are allocated and the async pushes fired; commit_layer_weights() barriers on completion
-    // and repoints. il < 0 means no prefetch pending.
+    // (elastic prefetch) in-flight background weight pre-stages, one entry per staged layer: the
+    // destination buffer + duplicate tensors are allocated and the async pushes fired;
+    // commit_layer_weights(il) barriers on completion and repoints. Multiple layers may be staged at
+    // once (a balanced batch recruit pre-stages its whole batch), each committed independently.
     struct pending_prefetch {
         int                        il  = -1;
         ggml_backend_dev_t         dst = nullptr;
@@ -395,7 +397,7 @@ struct llama_model::impl {
         std::vector<ggml_tensor *> src;   // original tensor objects (referenced by the graph)
         std::vector<ggml_tensor *> dup;   // pre-staged copies on dst
     };
-    pending_prefetch prefetch;
+    std::vector<pending_prefetch> prefetch;
 };
 
 llama_model::llama_model(const struct llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
@@ -1337,11 +1339,17 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         std::vector<int> lpd(n_devices(), 0);
         int remaining = (int) hparams.n_layer;
         for (size_t i = 0; i < n_devices() && remaining > 0; ++i) {
-            size_t free = 0, total = 0;
-            ggml_backend_dev_memory(devices[i], &free, &total);
-            const double cap  = (double) free - overhead_b;
-            const int    fit  = cap > 0.0 ? (int) (cap / cost) : 0;
-            const int    take = std::min(remaining, fit);
+            // CAPACITY-AWARE: live free memory (the connection-time snapshot reports free == total
+            // on Linux CPU servers) scaled by the fraction of the device's compute other work is
+            // not consuming, so a smaller or busier device takes proportionally fewer layers.
+            const llama_dev_capacity dc = llama_dev_capacity_measure(devices[i]);
+            const double cfrac = llama_dev_compute_frac(dc);
+            const double cap   = dc.mem_free_mb * 1024.0 * 1024.0 - overhead_b;
+            const int    fit   = cap > 0.0 ? (int) (cap / cost * cfrac) : 0;
+            const int    take  = std::min(remaining, fit);
+            LLAMA_LOG_INFO("%s: elastic placement: %s free=%.0fMB ext_load=%.2f/%d -> fit %d layers%s\n",
+                           __func__, ggml_backend_dev_name(devices[i]), dc.mem_free_mb, dc.ext_load, dc.n_cpu,
+                           fit, dc.live ? "" : " (static probe)");
             lpd[i] = take;
             remaining -= take;
         }
@@ -3952,8 +3960,13 @@ bool llama_model::prefetch_layer_weights(int il, ggml_backend_dev_t dst) {
     if (il < 0 || il >= (int) pimpl->dev_layer.size() || dst == nullptr) {
         return false;
     }
-    if (pimpl->dev_layer[il].dev == dst || pimpl->prefetch.il >= 0) {
-        return false;  // already there, or a prefetch is already in flight (one at a time)
+    if (pimpl->dev_layer[il].dev == dst) {
+        return false;  // already there
+    }
+    for (const auto & pf : pimpl->prefetch) {
+        if (pf.il == il) {
+            return false;  // this layer is already staged
+        }
     }
 
     ggml_backend_buffer_type_t dst_buft = ggml_backend_dev_buffer_type(dst);
@@ -3993,7 +4006,7 @@ bool llama_model::prefetch_layer_weights(int il, ggml_backend_dev_t dst) {
             return false;
         }
     }
-    pimpl->prefetch = { il, dst, ctx, buf, std::move(src), std::move(dup) };
+    pimpl->prefetch.push_back({ il, dst, ctx, buf, std::move(src), std::move(dup) });
     return true;
 }
 
@@ -4001,15 +4014,19 @@ bool llama_model::prefetch_layer_weights(int il, ggml_backend_dev_t dst) {
 // repoint the original tensor objects (which the graph references) at the pre-staged dst memory and
 // flip the layer->device map. Returns false if nothing is staged for il (caller uses the sync move).
 bool llama_model::commit_layer_weights(int il) {
-    auto & pf = pimpl->prefetch;
-    if (pf.il != il) {
+    auto it = std::find_if(pimpl->prefetch.begin(), pimpl->prefetch.end(),
+                           [il](const impl::pending_prefetch & p) { return p.il == il; });
+    if (it == pimpl->prefetch.end()) {
         return false;
     }
+    auto & pf = *it;
     static rpc_prefetch_wait_t wait_fn = []() -> rpc_prefetch_wait_t {
         ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
         return reg ? (rpc_prefetch_wait_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_prefetch_wait") : nullptr;
     }();
-    // all of the layer's tensors sit on one src server, so one barrier on the src socket drains them.
+    // all of the layer's tensors sit on one src server, so one barrier on the src socket drains them
+    // (the barrier waits for ALL of that server's queued pushes, which also covers any other staged
+    // layers coming from the same source -- harmless, their commits then wait ~0).
     if (wait_fn && !pf.src.empty()) {
         wait_fn(pf.src[0]);
     }
@@ -4026,7 +4043,7 @@ bool llama_model::commit_layer_weights(int il) {
     if (bit != pimpl->gpu_buft_list.end()) {
         pimpl->dev_layer[il].buft_list = &bit->second;
     }
-    pf = impl::pending_prefetch{};  // clear the slot
+    pimpl->prefetch.erase(it);
     return true;
 }
 
