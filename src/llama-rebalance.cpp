@@ -12,6 +12,16 @@
 #include <cstring>
 #include <map>
 
+// Log the current per-device layer distribution (how many of the model's layers each device holds).
+// Changes only at a shift, so logging it right after each shift captures the full timeline.
+static void log_layer_dist(llama_model & model, uint32_t n_layer) {
+    std::map<ggml_backend_dev_t, int> d;
+    for (int k = 0; k < (int) n_layer; k++) { d[model.dev_layer(k)]++; }
+    fprintf(stderr, "[rebalance] dist:");
+    for (auto * dev : model.devices) { fprintf(stderr, " %s=%d", ggml_backend_dev_name(dev), d[dev]); }
+    fprintf(stderr, "\n");
+}
+
 // Gated elastic rebalance: when the most-loaded device's KV footprint exceeds a budget, shift one of
 // its layers to another device. Cooldown (LLAMA_REBALANCE_COOLDOWN tokens) avoids thrashing -- every
 // shift moves a layer's weights+KV over the link, so we rebalance sparingly. Runs once per decode; a
@@ -116,6 +126,7 @@ void llama_rebalance_step(llama_model & model, llama_kv_cache & kv, int32_t n_to
                     fprintf(stderr, "[rebalance] SHIFT layer %d %s->%s: weights=%.1fMB kv=%.2fMB | total=%.0fms (weights=%.0fms kv=%.0fms) | cells=%u prefetched=%d\n",
                             commit_il, ggml_backend_dev_name(src_dev), ggml_backend_dev_name(commit_dst),
                             wbytes/1e6, kvbytes/1e6, (ts2-ts0)/1e3, (ts1-ts0)/1e3, (ts2-ts1)/1e3, cells, (int) committed);
+                    log_layer_dist(model, hparams.n_layer);
                     rb_last = rb_tok;
                     pf_il = -1; pf_target = nullptr;
                 }
@@ -155,6 +166,7 @@ void llama_rebalance_step(llama_model & model, llama_kv_cache & kv, int32_t n_to
                     fprintf(stderr, "[rebalance] SHIFT layer %d %s->%s: weights=%.1fMB kv=%.2fMB | total=%.0fms (weights=%.0fms kv=%.0fms) | cells=%u cache=%d/%d\n",
                             il, ggml_backend_dev_name(dmax), ggml_backend_dev_name(target),
                             wbytes/1e6, kvbytes/1e6, (ts2-ts0)/1e3, (ts1-ts0)/1e3, (ts2-ts1)/1e3, cells, hits, total_t);
+                    log_layer_dist(model, hparams.n_layer);
                     rb_last = rb_tok;
                 }
             }

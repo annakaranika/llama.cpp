@@ -219,6 +219,8 @@ rpi22=1140, rpi24=874, rpi25=905 MB at ctx ≈160). Elastic runs a provisioning 
 | `LLAMA_REBALANCE_COOLDOWN` | 32 | min tokens between shifts (anti-thrash) |
 | `LLAMA_REBALANCE_POLICY` | `adjacent` | `adjacent` = shift to lower-loaded neighbor + prefetch; `cache` = shift to a device that caches the layer (0× WiFi) |
 | `LLAMA_REBALANCE_PREFETCH` | 1 | (adjacent policy) grow-blocks of lead to pre-stage the transfer; 0 = synchronous shift |
+| `LLAMA_REBALANCE_RECLAIM` | off | after a shift, `madvise(DONTNEED)` the moved layer's pages on the source so its weight RAM is freed (not just KV) |
+| `RPC_DBG_RECLAIM` | off | log per-tensor bytes released by weight reclaim |
 
 ## Correctness fixes that were prerequisites (enabling, not speedups)
 

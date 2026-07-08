@@ -47,6 +47,7 @@
 #    include <netinet/tcp.h>
 #    include <sys/socket.h>
 #    include <sys/types.h>
+#    include <sys/mman.h>  // madvise, for weight reclaim (MADV_DONTNEED)
 #    include <unistd.h>
 #endif
 #include <cstring>
@@ -146,6 +147,7 @@ enum rpc_cmd {
     RPC_CMD_PREFETCH_WAIT,       // (elastic prefetch) block until all this server's background pushes have landed (commit barrier)
     RPC_CMD_CACHE_PROBE,         // (cache-aware rebalance) "do you have the weight slice with this content hash on disk?" -- no load, just hit/miss for target selection
     RPC_CMD_CACHE_STORE,         // (cache-aware rebalance) persist a resident tensor's bytes to this server's on-disk weight cache under a hash (lazy-warm after a cold transfer)
+    RPC_CMD_RELEASE_REGION,      // (weight reclaim) madvise(DONTNEED) a moved layer's interior pages so the source frees its physical RAM (buffer stays valid for other layers)
     RPC_CMD_PERSIST_BIND,      // "do you have a resident weight buffer for (model_key,size)?" -> rebind, skip alloc+upload
     RPC_CMD_PERSIST_REGISTER,  // retain this freshly-uploaded weight buffer under model_key (don't free on teardown)
     RPC_CMD_PERSIST_DETACH,    // client is releasing a resident buffer -> keep it resident, mark unclaimed for the next process
@@ -340,6 +342,14 @@ struct rpc_msg_cache_store_req {
 };
 struct rpc_msg_cache_store_rsp {
     uint8_t stored;
+};
+// (weight reclaim) release the physical pages backing a tensor that has moved away (its bytes are
+// dead on this server now); the buffer allocation stays valid for the other tensors it shares.
+struct rpc_msg_release_region_req {
+    rpc_tensor tensor;
+};
+struct rpc_msg_release_region_rsp {
+    uint64_t freed_bytes;   // pages actually returned to the OS
 };
 
 #pragma pack(pop)
@@ -4996,6 +5006,8 @@ class rpc_server {
     // (cache-aware rebalance) probe disk cache (no load) + persist a resident tensor to disk cache.
     bool cache_probe(const rpc_msg_cache_probe_req & request, rpc_msg_cache_probe_rsp & response);
     bool cache_store(const rpc_msg_cache_store_req & request, rpc_msg_cache_store_rsp & response);
+    // (weight reclaim) madvise(DONTNEED) a moved tensor's interior pages -> return physical RAM.
+    bool release_region(const rpc_msg_release_region_req & request, rpc_msg_release_region_rsp & response);
     // cross-process resident weights (opt-in RPC_PERSIST)
     void persist_bind(const rpc_msg_persist_bind_req & request, rpc_msg_persist_bind_rsp & response, uint64_t conn_id);
     bool persist_register(const rpc_msg_persist_register_req & request, uint64_t conn_id);
@@ -5587,6 +5599,41 @@ bool rpc_server::cache_store(const rpc_msg_cache_store_req & request, rpc_msg_ca
         GGML_LOG_INFO("[wcache] STORE(resident) %016llx (%zu bytes) ok=%d\n",
                       (unsigned long long) request.hash, size, (int) response.stored);
     }
+    return true;
+}
+
+// (weight reclaim) RELEASE_REGION: the tensor's bytes moved to another device and are dead here, so
+// return their physical RAM with madvise(MADV_DONTNEED). Only pages FULLY inside the tensor's byte
+// range are released, so a page shared with a neighbouring (still-live) tensor in the same packed
+// weight buffer is never touched. The buffer/mapping stays valid; a later access (there is none --
+// the layer moved) would fault back zero-filled pages.
+bool rpc_server::release_region(const rpc_msg_release_region_req & request, rpc_msg_release_region_rsp & response) {
+    response.freed_bytes = 0;
+#ifndef _WIN32
+    struct ggml_init_params params{ ggml_tensor_overhead(), NULL, true };
+    struct ggml_context *   ctx    = ggml_init(params);
+    ggml_tensor *           tensor = deserialize_tensor(ctx, &request.tensor);  // validates vs buffers
+    if (tensor == nullptr || tensor->data == nullptr) {
+        ggml_free(ctx);
+        return true;
+    }
+    const size_t    nbytes = ggml_nbytes(tensor);
+    const uintptr_t base   = (uintptr_t) tensor->data;
+    const long      ps     = sysconf(_SC_PAGESIZE);
+    if (ps > 0) {
+        const uintptr_t start = (base + (uintptr_t) ps - 1) & ~((uintptr_t) ps - 1);  // round up
+        const uintptr_t end   = (base + nbytes) & ~((uintptr_t) ps - 1);              // round down
+        if (end > start && madvise((void *) start, (size_t) (end - start), MADV_DONTNEED) == 0) {
+            response.freed_bytes = (uint64_t) (end - start);
+        }
+    }
+    static const bool dbg = getenv("RPC_DBG_RECLAIM") != nullptr;
+    if (dbg) {
+        GGML_LOG_INFO("[reclaim] released %" PRIu64 " / %zu B of %s\n",
+                      response.freed_bytes, nbytes, tensor->name);
+    }
+    ggml_free(ctx);
+#endif
     return true;
 }
 
@@ -7514,6 +7561,21 @@ static void rpc_serve_client(rpc_server & server, sockfd_t sockfd, size_t free_m
                     }
                     break;
                 }
+            case RPC_CMD_RELEASE_REGION:
+                {
+                    rpc_msg_release_region_req request;
+                    if (!recv_msg(sockfd, &request, sizeof(request))) {
+                        return;
+                    }
+                    rpc_msg_release_region_rsp response;
+                    if (!server.release_region(request, response)) {
+                        return;
+                    }
+                    if (!send_msg(sockfd, &response, sizeof(response))) {
+                        return;
+                    }
+                    break;
+                }
             default:
                 {
                     fprintf(stderr, "Unknown command: %d\n", cmd);
@@ -7905,6 +7967,20 @@ static bool ggml_backend_rpc_cache_load(ggml_tensor * dst, uint64_t hash) {
     return ok && resp.hit == 1;
 }
 
+// (weight reclaim) tell the server holding `t` to release the physical pages backing it (the tensor
+// has moved to another device, so its bytes here are dead). Returns bytes freed. Pass the SOURCE
+// tensor's descriptor BEFORE repointing it, so it still resolves to the source buffer.
+static uint64_t ggml_backend_rpc_release_tensor(const ggml_tensor * t) {
+    if (!t || !t->buffer || t->buffer->buft->iface.get_name != ggml_backend_rpc_buffer_type_name) {
+        return 0;
+    }
+    auto * ctx = (ggml_backend_rpc_buffer_context *) t->buffer->context;
+    rpc_msg_release_region_req req;  req.tensor = serialize_tensor(t);
+    rpc_msg_release_region_rsp resp; resp.freed_bytes = 0;
+    bool ok = send_rpc_cmd(ctx->sock, RPC_CMD_RELEASE_REGION, &req, sizeof(req), &resp, sizeof(resp));
+    return ok ? resp.freed_bytes : 0;
+}
+
 // (cache-aware rebalance) persist a tensor already resident on its server to that server's disk cache
 // under `hash`, so a future move of this layer here becomes a 0x-WiFi hit. Returns true on a store.
 static bool ggml_backend_rpc_cache_store(const ggml_tensor * t, uint64_t hash) {
@@ -7940,6 +8016,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (strcmp(name, "ggml_backend_rpc_cache_store") == 0) {
         return (void *) ggml_backend_rpc_cache_store;
+    }
+    if (strcmp(name, "ggml_backend_rpc_release_tensor") == 0) {
+        return (void *) ggml_backend_rpc_release_tensor;
     }
     if (strcmp(name, "ggml_backend_split_buffer_type") == 0) {
         return (void *) ggml_backend_rpc_split_buffer_type;

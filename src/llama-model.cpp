@@ -3813,6 +3813,25 @@ ggml_backend_dev_t llama_model::dev_layer(int il) const {
     return pimpl->dev_layer.at(il).dev;
 }
 
+// (weight reclaim, opt-in LLAMA_REBALANCE_RECLAIM) after a layer's tensor has been copied to its new
+// device, tell the SOURCE server to release the physical RAM still backing it here (the bytes are
+// dead -- the layer moved). Call with the source descriptor BEFORE repointing it to the destination.
+// Without this a shed layer's weights stay resident on the source (only its KV is relieved).
+static void rpc_maybe_release(const ggml_tensor * src) {
+    static const bool on = getenv("LLAMA_REBALANCE_RECLAIM") != nullptr;
+    if (!on || !src) {
+        return;
+    }
+    typedef uint64_t (*rpc_release_t)(const ggml_tensor *);
+    static rpc_release_t fn = [] () -> rpc_release_t {
+        ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
+        return reg ? (rpc_release_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_release_tensor") : nullptr;
+    }();
+    if (fn) {
+        fn(src);
+    }
+}
+
 bool llama_model::move_layer_weights(int il, ggml_backend_dev_t dst) {
     if (il < 0 || il >= (int) pimpl->dev_layer.size() || dst == nullptr) {
         return false;
@@ -3865,6 +3884,7 @@ bool llama_model::move_layer_weights(int il, ggml_backend_dev_t dst) {
     // round-trip (2x -> 1x over the link), and falls back to a host relay otherwise.
     for (size_t i = 0; i < src.size(); i++) {
         ggml_backend_tensor_copy(src[i], dup[i]);
+        rpc_maybe_release(src[i]);  // free the source pages (bytes now on dst); before repoint
         src[i]->buffer = dup[i]->buffer;
         src[i]->data   = dup[i]->data;
         src[i]->extra  = dup[i]->extra;
@@ -3963,6 +3983,7 @@ bool llama_model::commit_layer_weights(int il) {
         wait_fn(pf.src[0]);
     }
     for (size_t i = 0; i < pf.src.size(); i++) {
+        rpc_maybe_release(pf.src[i]);  // free the source pages (prefetched to dst); before repoint
         pf.src[i]->buffer = pf.dup[i]->buffer;
         pf.src[i]->data   = pf.dup[i]->data;
         pf.src[i]->extra  = pf.dup[i]->extra;
@@ -4063,6 +4084,7 @@ int llama_model::move_layer_weights_cached(int il, ggml_backend_dev_t dst) {
                 store_fn(dup[i], h);                  // lazy-warm dst so the next move here hits
             }
         }
+        rpc_maybe_release(src[i]);  // free the source pages (bytes now on dst); before repoint
         src[i]->buffer = dup[i]->buffer;
         src[i]->data   = dup[i]->data;
         src[i]->extra  = dup[i]->extra;
