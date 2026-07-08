@@ -264,77 +264,120 @@ void llama_rebalance_step(llama_model & model, llama_kv_cache & kv, int32_t n_to
             const double per_tok_mb  = (double) (hparams.n_embd_k_gqa(0) + hparams.n_embd_v_gqa(0)) * elt / (1024.0*1024.0);
             const double kv_layer_mb = cells * per_tok_mb;
             const double kv_res_mb   = (cells + headroom_tok) * per_tok_mb;
+            const uint32_t gb        = kv.grow_block > 0 ? kv.grow_block : 0;
+            // the horizon the membership decision (and the staging trigger below) look ahead to:
+            // pf_lead grow-blocks, i.e. exactly early enough that a decided batch can transfer
+            // hidden behind decode before the pressure actually lands.
+            const double proj_cells  = (double) cells + pf_lead * gb;
+
+            // LAZY MEMBERSHIP: apportion the layers over the devices that already hold some ("use
+            // the least of the cluster and grow"). An idle device is recruited -- ONE per cycle,
+            // best live capacity first -- only when even balanced targets over the current members
+            // would break a device's memory or the KV budget at the horizon; the recruit then
+            // receives its full capacity-weighted share in the same batch as the rebalance.
+            // The whole decision phase is skipped while a staged batch awaits its commit.
+            static std::vector<llama_rebalance_move> batch;  // staged, awaiting the budget crossing
             std::vector<double> mem_cap(nd), ideal(nd, 0.0);
             std::vector<int>    target(nd, 0), cap_layers(nd);
+            std::vector<char>   member(nd, 0);
+            for (int i = 0; i < nd; i++) { member[i] = cnt[model.devices[i]] > 0 ? 1 : 0; }
             double wsum = 0.0;
-            for (int i = 0; i < nd; i++) {
-                const double held = cnt[model.devices[i]] * (w_layer_mb + kv_layer_mb);
-                mem_cap[i] = std::max(0.0, caps[i].mem_free_mb - margin_mb + held);
-                wsum      += mem_cap[i] * llama_dev_compute_frac(caps[i]);
-            }
-            if (wsum > 0.0) {
-                int assigned = 0;
+
+            // apportion nl layers over the current members by live capacity (memory x free-core
+            // fraction, largest remainder, memory-clamped at the horizon). Returns true when the
+            // result FITS: no clipped layers left over and no member above the KV budget at the
+            // horizon even at its target share.
+            auto apportion = [&]() -> bool {
+                wsum = 0.0;
                 for (int i = 0; i < nd; i++) {
-                    ideal[i]      = nl * mem_cap[i] * llama_dev_compute_frac(caps[i]) / wsum;
-                    target[i]     = (int) ideal[i];
+                    ideal[i]  = 0.0;
+                    target[i] = 0;
+                    const double held = cnt[model.devices[i]] * (w_layer_mb + kv_layer_mb);
+                    mem_cap[i]    = std::max(0.0, caps[i].mem_free_mb - margin_mb + held);
                     cap_layers[i] = (int) (mem_cap[i] / (w_layer_mb + kv_res_mb));
-                    assigned     += target[i];
+                    if (member[i]) { wsum += mem_cap[i] * llama_dev_compute_frac(caps[i]); }
+                }
+                if (wsum <= 0.0) { return false; }
+                int assigned = 0;
+                std::vector<int> order;
+                for (int i = 0; i < nd; i++) {
+                    if (!member[i]) { continue; }
+                    ideal[i]  = nl * mem_cap[i] * llama_dev_compute_frac(caps[i]) / wsum;
+                    target[i] = (int) ideal[i];
+                    assigned += target[i];
+                    order.push_back(i);
                 }
                 // largest-remainder: hand the leftover layers to the largest fractional shares
-                std::vector<int> order(nd);
-                for (int i = 0; i < nd; i++) { order[i] = i; }
                 std::sort(order.begin(), order.end(), [&](int a, int b) { return ideal[a] - target[a] > ideal[b] - target[b]; });
-                for (int k = 0; assigned < nl; k = (k + 1) % nd) { target[order[k]]++; assigned++; }
-                // memory clamp + redistribute the clipped layers to devices with spare headroom
+                for (size_t k = 0; assigned < nl && !order.empty(); k = (k + 1) % order.size()) { target[order[k]]++; assigned++; }
+                // memory clamp + redistribute the clipped layers to members with spare headroom
                 int excess = 0;
                 for (int i = 0; i < nd; i++) {
-                    if (target[i] > cap_layers[i]) { excess += target[i] - cap_layers[i]; target[i] = cap_layers[i]; }
+                    if (member[i] && target[i] > cap_layers[i]) { excess += target[i] - cap_layers[i]; target[i] = cap_layers[i]; }
                 }
                 while (excess > 0) {
                     int best = -1;
                     for (int i = 0; i < nd; i++) {
-                        if (target[i] < cap_layers[i] && (best < 0 || ideal[i] - target[i] > ideal[best] - target[best])) { best = i; }
+                        if (member[i] && target[i] < cap_layers[i] && (best < 0 || ideal[i] - target[i] > ideal[best] - target[best])) { best = i; }
                     }
-                    if (best < 0) { break; }  // nothing fits the horizon anywhere -- leave the rest where it is
+                    if (best < 0) { return false; }  // memory-infeasible: the members can't hold everything at the horizon
                     target[best]++; excess--;
                 }
-            }
+                int tmax = 0;
+                for (int i = 0; i < nd; i++) { tmax = std::max(tmax, target[i]); }
+                return tmax * proj_cells * per_tok_mb <= budget_mb;  // budget-feasible at the horizon?
+            };
 
-            // PLAN THE BATCH: the moves that take every device from its current count to its
-            // target -- donors give their edge layer toward each recipient (their own block stays
-            // contiguous). Planned fresh each decode until a batch is staged, so it follows the
-            // live measurements right up to the point of transfer.
-            static std::vector<llama_rebalance_move> batch;  // staged, awaiting the budget crossing
             std::vector<llama_rebalance_move> plan;
-            if (wsum > 0.0 && batch.empty()) {
-                std::vector<int> ldev(nl, 0), cur(nd, 0);
-                for (int k = 0; k < nl; k++) {
+            if (batch.empty()) {
+                if (!apportion()) {
+                    // the active set cannot fit at the horizon -> recruit the best idle device
+                    // (one per cycle; if it is still not enough the next cycle recruits another).
+                    int best = -1;
                     for (int i = 0; i < nd; i++) {
-                        if (model.devices[i] == model.dev_layer(k)) { ldev[k] = i; break; }
+                        if (!member[i] && (best < 0 || mem_cap[i] * llama_dev_compute_frac(caps[i]) > mem_cap[best] * llama_dev_compute_frac(caps[best]))) { best = i; }
                     }
-                    cur[ldev[k]]++;
+                    if (best >= 0) {
+                        member[best] = 1;
+                        fprintf(stderr, "[rebalance] RECRUIT %s (active set cannot fit at horizon cells=%.0f)\n",
+                                ggml_backend_dev_name(model.devices[best]), proj_cells);
+                        apportion();
+                    }
                 }
-                for (;;) {
-                    int r = -1, d = -1, rdef = 0, dsur = 0;
-                    for (int i = 0; i < nd; i++) {
-                        if (target[i] - cur[i] > rdef) { rdef = target[i] - cur[i]; r = i; }
-                        if (cur[i] - target[i] > dsur) { dsur = cur[i] - target[i]; d = i; }
+
+                // PLAN THE BATCH: the moves that take every member from its current count to its
+                // target -- donors give their edge layer toward each recipient (their own block
+                // stays contiguous). Planned fresh each decode until a batch is staged, so it
+                // follows the live measurements right up to the point of transfer.
+                if (wsum > 0.0) {
+                    std::vector<int> ldev(nl, 0), cur(nd, 0);
+                    for (int k = 0; k < nl; k++) {
+                        for (int i = 0; i < nd; i++) {
+                            if (model.devices[i] == model.dev_layer(k)) { ldev[k] = i; break; }
+                        }
+                        cur[ldev[k]]++;
                     }
-                    if (r < 0 || d < 0) { break; }
-                    int il = -1;
-                    if (d < r) { for (int k = nl - 1; k >= 0; k--) { if (ldev[k] == d) { il = k; break; } } }
-                    else       { for (int k = 0; k < nl; k++)      { if (ldev[k] == d) { il = k; break; } } }
-                    if (il < 0) { break; }
-                    plan.push_back({ il, d, r, false });
-                    ldev[il] = r; cur[d]--; cur[r]++;
+                    for (;;) {
+                        int r = -1, d = -1, rdef = 0, dsur = 0;
+                        for (int i = 0; i < nd; i++) {
+                            if (target[i] - cur[i] > rdef) { rdef = target[i] - cur[i]; r = i; }
+                            if (cur[i] - target[i] > dsur) { dsur = cur[i] - target[i]; d = i; }
+                        }
+                        if (r < 0 || d < 0) { break; }
+                        int il = -1;
+                        if (d < r) { for (int k = nl - 1; k >= 0; k--) { if (ldev[k] == d) { il = k; break; } } }
+                        else       { for (int k = 0; k < nl; k++)      { if (ldev[k] == d) { il = k; break; } } }
+                        if (il < 0) { break; }
+                        plan.push_back({ il, d, r, false });
+                        ldev[il] = r; cur[d]--; cur[r]++;
+                    }
                 }
             }
 
-            // PREFETCH THE WHOLE BATCH when the projected load one lead ahead crosses the budget:
+            // PREFETCH THE WHOLE BATCH when the projected load at the horizon crosses the budget:
             // every planned layer's weights start moving in the background while decode continues.
-            const uint32_t gb = kv.grow_block > 0 ? kv.grow_block : 0;
             if (pf_lead > 0.0 && batch.empty() && !plan.empty() && cells > 0) {
-                const double projected = load[dmax] * (double) (cells + (uint32_t) (pf_lead * gb)) / (double) cells;
+                const double projected = load[dmax] * proj_cells / (double) cells;
                 if (projected > budget_mb) {
                     int staged_n = 0;
                     for (auto & m : plan) {
