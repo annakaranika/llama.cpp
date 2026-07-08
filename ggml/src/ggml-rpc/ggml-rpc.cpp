@@ -5984,14 +5984,36 @@ void rpc_server::do_prefetch_transfer(const prefetch_job & job) {
     ggml_tensor * src = deserialize_tensor(ctx, &job.src);
     if (src == nullptr) { ggml_free(ctx); return; }
     const size_t size = ggml_is_empty(src) ? 0 : (size_t) ggml_nbytes(src);
-    std::vector<uint8_t> input(sizeof(rpc_tensor) + sizeof(uint64_t) + size);
-    memcpy(input.data(), &job.dst, sizeof(rpc_tensor));
-    const uint64_t offset = 0;
-    memcpy(input.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
-    if (size > 0) { ggml_backend_tensor_get(src, input.data() + sizeof(rpc_tensor) + sizeof(offset), 0, size); }
+    // (paced staging, RPC_PREFETCH_RATE_MBPS) cap the background transfer rate: staging can then
+    // start much earlier (bigger prefetch lead) and SIP airtime alongside the per-token decode
+    // handoffs instead of gulping the shared channel -- an unpaced ~GB batch measurably slows
+    // decode even though it never stalls it. 0/unset = unlimited (previous behavior). Pacing
+    // chunks the push through SET_TENSOR's offset field with sleeps sized to the target rate;
+    // a PREFETCH_WAIT barrier issued early simply blocks until the paced pushes drain.
+    static const double rate_mbps = getenv("RPC_PREFETCH_RATE_MBPS") ? atof(getenv("RPC_PREFETCH_RATE_MBPS")) : 0.0;
+    const size_t chunk = rate_mbps > 0.0 ? (size_t) 1024*1024 : (size ? size : 1);
+    bool ok = true;
+    for (size_t off = 0; off < size || (size == 0 && off == 0); off += chunk) {
+        const size_t n = std::min(chunk, size - off > 0 ? size - off : 0);
+        std::vector<uint8_t> input(sizeof(rpc_tensor) + sizeof(uint64_t) + n);
+        memcpy(input.data(), &job.dst, sizeof(rpc_tensor));
+        const uint64_t offset = off;
+        memcpy(input.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
+        if (n > 0) { ggml_backend_tensor_get(src, input.data() + sizeof(rpc_tensor) + sizeof(offset), off, n); }
+        const int64_t t0 = ggml_time_us();
+        ok = send_rpc_cmd(peer, RPC_CMD_SET_TENSOR, input.data(), input.size(), nullptr, 0) && ok;
+        if (rate_mbps > 0.0 && n > 0) {
+            const int64_t want_us  = (int64_t) ((double) n / (rate_mbps * 1024.0 * 1024.0) * 1e6);
+            const int64_t spent_us = ggml_time_us() - t0;
+            if (want_us > spent_us) {
+                std::this_thread::sleep_for(std::chrono::microseconds(want_us - spent_us));
+            }
+        }
+        if (size == 0) { break; }
+    }
     ggml_free(ctx);
-    bool ok = send_rpc_cmd(peer, RPC_CMD_SET_TENSOR, input.data(), input.size(), nullptr, 0);
-    if (dbg) { GGML_LOG_INFO("[prefetch] pushed %zu B -> %s ok=%d\n", size, job.endpoint.c_str(), (int) ok); }
+    if (dbg) { GGML_LOG_INFO("[prefetch] pushed %zu B -> %s ok=%d rate=%s\n", size, job.endpoint.c_str(), (int) ok,
+                             rate_mbps > 0.0 ? "paced" : "unlimited"); }
 }
 
 // (elastic prefetch) single background worker: drain the queue, one push at a time.
