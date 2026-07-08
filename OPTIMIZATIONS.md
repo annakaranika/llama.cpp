@@ -180,6 +180,20 @@ mechanisms, both opt-in and bit-identical to baseline:
   every shift already hit (`cache=9/9`); a true miss costs the direct-peer transfer (20.4 s) measured
   above, so the SD read (~3.2 s, or ~0.3 s from page cache) is the steady-state cost.
 
+**Payoff — reaching contexts static provisioning can't (7B, 4× 2 GB Pi, `-ts 3,2,2,2`, measured):**
+Static provisioning of `n_ctx = 8192` (no growable KV) commits the full KV at context creation: dev0
+(~11 layers) needs ~1.34 GB weights + ~1.4 GB KV ≈ 2.7 GB > 2 GB, so a server is OOM-killed during
+`kv_cache_init` (`kv_size = 8192`) and the client aborts (`Connection closed by peer`). **It cannot
+run.** The *same* provisioning under elastic (`LLAMA_KV_GROW_BLOCK=64` + `LLAMA_REBALANCE_BUDGET_MB=20`)
+commits the KV on demand and sheds a layer off dev0 as it crosses budget: **4 grows, 1 shift (layer 10
+dev0→dev1 at 64 cells), 242 coherent tokens, 0 errors**, and every Pi stays under 2 GB (rpi20=1395,
+rpi22=1140, rpi24=874, rpi25=905 MB at ctx ≈160). Elastic runs a provisioning static crashes on.
+
+- *Caveat (honest):* shedding relieves KV *growth* (fewer active layers on the pressured device → a
+  smaller KV slope), but a shed layer's **weights** stay resident on the source (not reclaimed), so it
+  lowers the slope, not the ~1.34 GB weight floor. Reclaiming source weights (re-partition the shared
+  buffer) is future work; until then the reachable-context gain is bounded by the retained weights.
+
 ## Environment-variable reference
 
 | Var | Default | Effect |
