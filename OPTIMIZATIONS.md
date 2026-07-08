@@ -143,8 +143,18 @@ The elastic boundary-shift row is broken out per weight-move strategy in *Elasti
 
 ## Elastic rebalancing (growable KV + adaptive boundary shift)
 
-The pipeline is sized to fit, then rebalanced as the KV cache grows (Part 2 is the analysis). Two
-mechanisms, both opt-in and bit-identical to baseline:
+The pipeline is sized to fit, then rebalanced as the KV cache grows (Part 2 is the analysis). The
+cluster **auto-sizes to the workload**: place on the fewest devices, then recruit more on demand.
+Mechanisms, all opt-in and bit-identical to baseline:
+
+- **Auto minimal placement** (`LLAMA_ELASTIC_PLACEMENT`, replaces manual `-ts`) — at load, pack the
+  model onto the FEWEST devices that hold the weights + a per-layer KV headroom reserve, leaving the
+  rest idle. "Use the least of the cluster and grow." Validated: 22-layer model, 2 servers -> `22 0`
+  (one device, one idle), then the idle one recruited as the KV grew, bit-identical.
+- **Recruit is emergent** — no separate policy. Both move policies pick the shed target by load, and an
+  idle device has load 0, so once one exists the rebalancer drains layers onto it on demand (validated
+  `-ts 1,0`: `dev0=21 dev1=1 -> ... -> dev0=14 dev1=8` over 11 shifts). So "all policies recruit" falls
+  out of the shared load metric rather than being coded per policy.
 
 - **Growable KV cache** (`LLAMA_KV_GROW_BLOCK=N`) — grow the cache in blocks of N tokens as context
   grows, instead of committing the full `n_ctx` up front. Frees ~500 MB/Pi on the 7B cluster and is the
@@ -228,6 +238,9 @@ device actually frees room rather than just slowing its own growth.
 | `RPC_PERSIST_MAX_GB` | 8 | resident-model RAM cap per server (≤0 = unlimited) |
 | `RPC_DBG_PERSIST` | off | log BIND/REGISTER/DETACH/RELEASE/EVICT |
 | `RPC_GRAPH_WRAP_AT` | 256 | lower the diff-cache graph-number wrap point for testing the reuse path |
+| `LLAMA_ELASTIC_PLACEMENT` | off | auto-pack the model onto the FEWEST devices (no `-ts`), leaving the rest idle to recruit on demand |
+| `LLAMA_ELASTIC_KV_HEADROOM` | 512 | per-layer KV headroom (tokens) reserved when packing, so it doesn't recruit on token one |
+| `LLAMA_ELASTIC_OVERHEAD_MB` | 300 | per-device memory reserved for non-KV overhead when packing |
 | `LLAMA_KV_GROW_BLOCK` | 0 (off) | grow the KV cache in blocks of N tokens instead of committing full `n_ctx` |
 | `LLAMA_REBALANCE_BUDGET_MB` | 0 (off) | per-device KV budget; a device over it sheds a layer (enables elastic rebalance) |
 | `LLAMA_REBALANCE_COOLDOWN` | 32 | min tokens between shifts (anti-thrash) |

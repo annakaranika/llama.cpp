@@ -1322,7 +1322,38 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     // calculate the split points
     bool all_zero = tensor_split == nullptr || std::all_of(tensor_split, tensor_split + n_devices(), [](float x) { return x == 0.0f; });
     std::vector<float> splits(n_devices());
-    if (all_zero) {
+    static const bool elastic_place = getenv("LLAMA_ELASTIC_PLACEMENT") != nullptr;
+    if (all_zero && elastic_place && !devices.empty() && hparams.n_layer > 0) {
+        // ELASTIC minimal placement: pack the model onto the FEWEST devices to use the least of the
+        // cluster. Each device takes as many whole layers as fit in its free memory minus a fixed
+        // overhead and a KV headroom reserve (room for a starting context); the overflow spills to
+        // the next device, and the rest stay IDLE (0 layers) to be recruited on demand as the KV
+        // grows (the rebalancer drains layers onto an idle device once the active set is pressured).
+        static const int    headroom_tok = getenv("LLAMA_ELASTIC_KV_HEADROOM") ? atoi(getenv("LLAMA_ELASTIC_KV_HEADROOM")) : 512;
+        static const double overhead_b   = (getenv("LLAMA_ELASTIC_OVERHEAD_MB") ? atof(getenv("LLAMA_ELASTIC_OVERHEAD_MB")) : 300.0) * 1024.0 * 1024.0;
+        const double w_layer  = (double) ml.n_bytes / (double) hparams.n_layer;                                  // avg weight bytes/layer
+        const double kv_layer = (double) (hparams.n_embd_k_gqa(0) + hparams.n_embd_v_gqa(0)) * 2.0 * headroom_tok; // fp16 KV reserve/layer
+        const double cost     = w_layer + kv_layer;
+        std::vector<int> lpd(n_devices(), 0);
+        int remaining = (int) hparams.n_layer;
+        for (size_t i = 0; i < n_devices() && remaining > 0; ++i) {
+            size_t free = 0, total = 0;
+            ggml_backend_dev_memory(devices[i], &free, &total);
+            const double cap  = (double) free - overhead_b;
+            const int    fit  = cap > 0.0 ? (int) (cap / cost) : 0;
+            const int    take = std::min(remaining, fit);
+            lpd[i] = take;
+            remaining -= take;
+        }
+        // If the reserve was too generous to fit every layer on the packed devices, spill the rest
+        // round-robin so the model still loads (trading headroom, not leaving layers unplaced).
+        for (size_t i = 0; remaining > 0; i = (i + 1) % n_devices()) { lpd[i]++; remaining--; }
+        int used = 0;
+        for (size_t i = 0; i < n_devices(); ++i) { splits[i] = (float) lpd[i]; used += lpd[i] > 0; }
+        LLAMA_LOG_INFO("%s: elastic placement -> %d/%zu devices (KV headroom %d tok), layers/device:", __func__, used, n_devices(), headroom_tok);
+        for (size_t i = 0; i < n_devices(); ++i) { LLAMA_LOG_INFO(" %d", lpd[i]); }
+        LLAMA_LOG_INFO("\n");
+    } else if (all_zero) {
         // default split, by free memory
         for (size_t i = 0; i < n_devices(); ++i) {
             ggml_backend_dev_t dev = devices[i];
