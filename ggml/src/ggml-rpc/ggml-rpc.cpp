@@ -23,6 +23,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <queue>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -141,6 +142,8 @@ enum rpc_cmd {
     RPC_CMD_PATCH_COMPUTE,        // (PP diff cache) non-split: patch the stored graph + compute inline (HIT)
     RPC_CMD_ADVANCE_COMPUTE,  // (PP diff cache + prefetch) non-split: advance stored graph by cached stride + compute inline (predicted HIT, no patch payload)
     RPC_CMD_SEND_TO_PEER,  // direct pipeline handoff: the SRC server pushes a tensor straight into the DST peer's buffer (bypasses the client relay)
+    RPC_CMD_SEND_TO_PEER_ASYNC,  // (elastic prefetch) like SEND_TO_PEER but the SRC enqueues the push on a background worker (fresh socket) and acks immediately, so the transfer overlaps decode
+    RPC_CMD_PREFETCH_WAIT,       // (elastic prefetch) block until all this server's background pushes have landed (commit barrier)
     RPC_CMD_PERSIST_BIND,      // "do you have a resident weight buffer for (model_key,size)?" -> rebind, skip alloc+upload
     RPC_CMD_PERSIST_REGISTER,  // retain this freshly-uploaded weight buffer under model_key (don't free on teardown)
     RPC_CMD_PERSIST_DETACH,    // client is releasing a resident buffer -> keep it resident, mark unclaimed for the next process
@@ -272,6 +275,14 @@ struct rpc_msg_send_to_peer_req {
 
 struct rpc_msg_send_to_peer_rsp {
     uint8_t result;   // 1 = pushed+acked by the peer; 0 = fall back to the client relay
+};
+
+// (elastic prefetch) commit barrier: block until the SRC server's background pushes have landed.
+struct rpc_msg_prefetch_wait_req {
+    uint8_t dummy;
+};
+struct rpc_msg_prefetch_wait_rsp {
+    uint8_t result;   // 1 = all background pushes complete
 };
 
 struct rpc_msg_do_computation_req {
@@ -4939,6 +4950,9 @@ class rpc_server {
     bool create_peer_connection(const rpc_msg_create_peer_connection_req & request,
                                 rpc_msg_create_peer_connection_rsp &       response);
     bool send_to_peer(const rpc_msg_send_to_peer_req & request, rpc_msg_send_to_peer_rsp & response);
+    // (elastic prefetch) enqueue a background push (overlaps decode) + barrier for the commit.
+    bool send_to_peer_async(const rpc_msg_send_to_peer_req & request, rpc_msg_send_to_peer_rsp & response);
+    bool prefetch_wait(const rpc_msg_prefetch_wait_req & request, rpc_msg_prefetch_wait_rsp & response);
     void add_socket_listen(const std::shared_ptr<socket_t> & sock);
     bool all_reduce(std::vector<uint8_t> & input);
     bool ar_result(std::vector<uint8_t> & input);  // tree all-reduce: non-root applies root's result
@@ -4971,6 +4985,19 @@ class rpc_server {
         return ggml_backend_graph_compute(backend, graph);
     }
   private:
+    // (elastic prefetch) a single background worker drains queued weight pushes so the transfer
+    // overlaps decode. Serialized (WiFi is serial anyway) over a dedicated fresh socket per
+    // destination (NOT the peer_socks_held used by handoffs, so it never interleaves with them).
+    struct prefetch_job { rpc_tensor src; rpc_tensor dst; std::string endpoint; };
+    void prefetch_worker_loop();
+    void do_prefetch_transfer(const prefetch_job & job);
+    std::mutex                              prefetch_mutex;
+    std::condition_variable                 prefetch_cv;
+    std::queue<prefetch_job>                prefetch_q;
+    int                                     prefetch_inflight     = 0;      // queued + in-progress (guarded by prefetch_mutex)
+    bool                                    prefetch_worker_started = false;
+    std::unordered_map<std::string, std::shared_ptr<socket_t>> prefetch_socks;  // worker-only fresh sockets
+
     ggml_tensor * deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor);
     ggml_tensor * create_node(uint64_t id, struct ggml_context * ctx,
                               const std::unordered_map<uint64_t, const rpc_tensor *> & tensor_ptrs,
@@ -5762,6 +5789,88 @@ bool rpc_server::send_to_peer(const rpc_msg_send_to_peer_req & request, rpc_msg_
     bool ok = send_rpc_cmd(peer, RPC_CMD_SET_TENSOR, input.data(), input.size(), nullptr, 0);
     if (dbg) { GGML_LOG_INFO("[send_to_peer] pushed %zu B -> %s ok=%d\n", size, request.dst_endpoint, (int) ok); }
     response.result = ok ? 1 : 0;
+    return true;
+}
+
+// (elastic prefetch) do one queued push over a dedicated fresh socket to the destination. Same wire
+// format as send_to_peer (SET_TENSOR to the peer) but off the hot handoff path, so a big background
+// weight transfer never interleaves with the per-token handoffs on peer_socks_held.
+void rpc_server::do_prefetch_transfer(const prefetch_job & job) {
+    static const bool dbg = getenv("RPC_DBG_HANDOFF") != nullptr;
+    // dedicated socket per destination, dialed once and reused by this (single) worker
+    std::shared_ptr<socket_t> peer;
+    {
+        auto it = prefetch_socks.find(job.endpoint);
+        if (it != prefetch_socks.end() && it->second) { peer = it->second; }
+    }
+    if (!peer) {
+        std::string host; int port;
+        if (parse_endpoint(job.endpoint, host, port)) {
+            peer = socket_connect(host.c_str(), port);
+            if (peer) { prefetch_socks[job.endpoint] = peer; }
+        }
+    }
+    if (!peer) {
+        if (dbg) { GGML_LOG_INFO("[prefetch] no socket to %s -> drop (client will fall back)\n", job.endpoint.c_str()); }
+        return;
+    }
+    struct ggml_init_params params{ ggml_tensor_overhead(), NULL, true };
+    struct ggml_context * ctx = ggml_init(params);
+    ggml_tensor * src = deserialize_tensor(ctx, &job.src);
+    if (src == nullptr) { ggml_free(ctx); return; }
+    const size_t size = ggml_is_empty(src) ? 0 : (size_t) ggml_nbytes(src);
+    std::vector<uint8_t> input(sizeof(rpc_tensor) + sizeof(uint64_t) + size);
+    memcpy(input.data(), &job.dst, sizeof(rpc_tensor));
+    const uint64_t offset = 0;
+    memcpy(input.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
+    if (size > 0) { ggml_backend_tensor_get(src, input.data() + sizeof(rpc_tensor) + sizeof(offset), 0, size); }
+    ggml_free(ctx);
+    bool ok = send_rpc_cmd(peer, RPC_CMD_SET_TENSOR, input.data(), input.size(), nullptr, 0);
+    if (dbg) { GGML_LOG_INFO("[prefetch] pushed %zu B -> %s ok=%d\n", size, job.endpoint.c_str(), (int) ok); }
+}
+
+// (elastic prefetch) single background worker: drain the queue, one push at a time.
+void rpc_server::prefetch_worker_loop() {
+    while (true) {
+        prefetch_job job;
+        {
+            std::unique_lock<std::mutex> lk(prefetch_mutex);
+            prefetch_cv.wait(lk, [&] { return !prefetch_q.empty(); });
+            job = prefetch_q.front();
+            prefetch_q.pop();
+        }
+        do_prefetch_transfer(job);
+        {
+            std::lock_guard<std::mutex> lk(prefetch_mutex);
+            prefetch_inflight--;
+            prefetch_cv.notify_all();  // wake a PREFETCH_WAIT barrier when we hit 0
+        }
+    }
+}
+
+// (elastic prefetch) enqueue the push and ack immediately; the transfer runs on the worker so it
+// overlaps the client's ongoing decode. inflight is bumped under the lock BEFORE the ack so a
+// PREFETCH_WAIT issued right after cannot race past an as-yet-unstarted transfer.
+bool rpc_server::send_to_peer_async(const rpc_msg_send_to_peer_req & request, rpc_msg_send_to_peer_rsp & response) {
+    {
+        std::lock_guard<std::mutex> lk(prefetch_mutex);
+        if (!prefetch_worker_started) {
+            std::thread(&rpc_server::prefetch_worker_loop, this).detach();
+            prefetch_worker_started = true;
+        }
+        prefetch_q.push({ request.src, request.dst, std::string(request.dst_endpoint) });
+        prefetch_inflight++;
+        prefetch_cv.notify_all();
+    }
+    response.result = 1;
+    return true;
+}
+
+// (elastic prefetch) commit barrier: block until every queued push has landed.
+bool rpc_server::prefetch_wait(const rpc_msg_prefetch_wait_req & /*request*/, rpc_msg_prefetch_wait_rsp & response) {
+    std::unique_lock<std::mutex> lk(prefetch_mutex);
+    prefetch_cv.wait(lk, [&] { return prefetch_inflight == 0; });
+    response.result = 1;
     return true;
 }
 
@@ -6985,6 +7094,36 @@ static void rpc_serve_client(rpc_server & server, sockfd_t sockfd, size_t free_m
                     }
                     break;
                 }
+            case RPC_CMD_SEND_TO_PEER_ASYNC:
+                {
+                    rpc_msg_send_to_peer_req request;
+                    if (!recv_msg(sockfd, &request, sizeof(request))) {
+                        return;
+                    }
+                    rpc_msg_send_to_peer_rsp response;
+                    if (!server.send_to_peer_async(request, response)) {
+                        return;
+                    }
+                    if (!send_msg(sockfd, &response, sizeof(response))) {
+                        return;
+                    }
+                    break;
+                }
+            case RPC_CMD_PREFETCH_WAIT:
+                {
+                    rpc_msg_prefetch_wait_req request;
+                    if (!recv_msg(sockfd, &request, sizeof(request))) {
+                        return;
+                    }
+                    rpc_msg_prefetch_wait_rsp response;
+                    if (!server.prefetch_wait(request, response)) {
+                        return;
+                    }
+                    if (!send_msg(sockfd, &response, sizeof(response))) {
+                        return;
+                    }
+                    break;
+                }
             case RPC_CMD_PERSIST_BIND:
                 {
                     rpc_msg_persist_bind_req request;
@@ -7561,9 +7700,55 @@ static void ggml_backend_rpc_persist_end() {
     }
 }
 
+// (elastic prefetch) fire-and-return an async weight push: ask the SRC server to enqueue a
+// background push of `src` into the DST peer buffer and ack immediately, so the transfer overlaps
+// the client's ongoing decode. Returns false (caller should do a synchronous copy) when the two
+// tensors are not RPC tensors on different servers, or the async push wasn't accepted.
+static bool ggml_backend_rpc_async_send(const ggml_tensor * src, ggml_tensor * dst) {
+    if (!src || !dst || !src->buffer || !dst->buffer) {
+        return false;
+    }
+    if (src->buffer->buft->iface.get_name != ggml_backend_rpc_buffer_type_name ||
+        dst->buffer->buft->iface.get_name != ggml_backend_rpc_buffer_type_name) {
+        return false;  // not both RPC tensors
+    }
+    auto * src_ctx = (ggml_backend_rpc_buffer_context *) src->buffer->context;
+    auto * dst_ctx = (ggml_backend_rpc_buffer_context *) dst->buffer->context;
+    if (src_ctx->sock == dst_ctx->sock) {
+        return false;  // same server -> caller copies locally
+    }
+    auto * dst_buft = (ggml_backend_rpc_buffer_type_context *) dst->buffer->buft->context;
+    rpc_msg_send_to_peer_req req;
+    req.src = serialize_tensor(src);
+    req.dst = serialize_tensor(dst);
+    snprintf(req.dst_endpoint, sizeof(req.dst_endpoint), "%s", dst_buft->endpoint.c_str());
+    rpc_msg_send_to_peer_rsp resp;
+    resp.result = 0;
+    bool status = send_rpc_cmd(src_ctx->sock, RPC_CMD_SEND_TO_PEER_ASYNC, &req, sizeof(req), &resp, sizeof(resp));
+    return status && resp.result == 1;
+}
+
+// (elastic prefetch) commit barrier: block until the SRC server holding `t` has drained its queued
+// background pushes (all pre-staged weights have landed on their destinations).
+static void ggml_backend_rpc_prefetch_wait(const ggml_tensor * t) {
+    if (!t || !t->buffer || t->buffer->buft->iface.get_name != ggml_backend_rpc_buffer_type_name) {
+        return;
+    }
+    auto * ctx = (ggml_backend_rpc_buffer_context *) t->buffer->context;
+    rpc_msg_prefetch_wait_req req;  req.dummy = 0;
+    rpc_msg_prefetch_wait_rsp resp; resp.result = 0;
+    send_rpc_cmd(ctx->sock, RPC_CMD_PREFETCH_WAIT, &req, sizeof(req), &resp, sizeof(resp));
+}
+
 static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (std::strcmp(name, "ggml_backend_rpc_add_device") == 0) {
         return (void *) ggml_backend_rpc_add_device;
+    }
+    if (strcmp(name, "ggml_backend_rpc_async_send") == 0) {
+        return (void *) ggml_backend_rpc_async_send;
+    }
+    if (strcmp(name, "ggml_backend_rpc_prefetch_wait") == 0) {
+        return (void *) ggml_backend_rpc_prefetch_wait;
     }
     if (strcmp(name, "ggml_backend_split_buffer_type") == 0) {
         return (void *) ggml_backend_rpc_split_buffer_type;

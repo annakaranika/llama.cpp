@@ -383,6 +383,19 @@ struct llama_model::impl {
     layer_dev dev_input = {};
     layer_dev dev_output = {};
     std::vector<layer_dev> dev_layer;
+
+    // (elastic prefetch) one in-flight background weight pre-stage: the destination buffer + duplicate
+    // tensors are allocated and the async pushes fired; commit_layer_weights() barriers on completion
+    // and repoints. il < 0 means no prefetch pending.
+    struct pending_prefetch {
+        int                        il  = -1;
+        ggml_backend_dev_t         dst = nullptr;
+        ggml_context *             ctx = nullptr;
+        ggml_backend_buffer_t      buf = nullptr;
+        std::vector<ggml_tensor *> src;   // original tensor objects (referenced by the graph)
+        std::vector<ggml_tensor *> dup;   // pre-staged copies on dst
+    };
+    pending_prefetch prefetch;
 };
 
 llama_model::llama_model(const struct llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
@@ -3866,6 +3879,102 @@ bool llama_model::move_layer_weights(int il, ggml_backend_dev_t dst) {
     if (bit != pimpl->gpu_buft_list.end()) {
         pimpl->dev_layer[il].buft_list = &bit->second;
     }
+    return true;
+}
+
+typedef bool (*rpc_async_send_t)(const ggml_tensor *, ggml_tensor *);
+typedef void (*rpc_prefetch_wait_t)(const ggml_tensor *);
+
+// (elastic prefetch) stage layer il's weights onto dst in the BACKGROUND: allocate the destination
+// buffer + duplicate tensors, then fire async pushes so the src servers transfer while decode keeps
+// running. Does NOT touch the graph yet -- commit_layer_weights() barriers on completion and repoints.
+// Returns false (caller should fall back to the synchronous move_layer_weights) when the RPC async
+// path is unavailable or the tensors are not RPC cross-server pairs.
+bool llama_model::prefetch_layer_weights(int il, ggml_backend_dev_t dst) {
+    static rpc_async_send_t async_send = []() -> rpc_async_send_t {
+        ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
+        return reg ? (rpc_async_send_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_async_send") : nullptr;
+    }();
+    if (!async_send) {
+        return false;
+    }
+    if (il < 0 || il >= (int) pimpl->dev_layer.size() || dst == nullptr) {
+        return false;
+    }
+    if (pimpl->dev_layer[il].dev == dst || pimpl->prefetch.il >= 0) {
+        return false;  // already there, or a prefetch is already in flight (one at a time)
+    }
+
+    ggml_backend_buffer_type_t dst_buft = ggml_backend_dev_buffer_type(dst);
+    char prefix[64];
+    snprintf(prefix, sizeof(prefix), "blk.%d.", il);
+    std::vector<ggml_tensor *> src;
+    for (auto & nt : tensors_by_name) {
+        if (nt.first.rfind(prefix, 0) == 0) {
+            src.push_back(nt.second);
+        }
+    }
+    if (src.empty()) {
+        return false;
+    }
+    struct ggml_init_params params = { size_t(2u*src.size()*ggml_tensor_overhead()), NULL, true };
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        return false;
+    }
+    std::vector<ggml_tensor *> dup(src.size(), nullptr);
+    for (size_t i = 0; i < src.size(); i++) {
+        dup[i] = ggml_dup_tensor(ctx, src[i]);
+        ggml_set_name(dup[i], src[i]->name);
+    }
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, dst_buft);
+    if (!buf) {
+        ggml_free(ctx);
+        return false;
+    }
+    // fire the async pushes; each returns as soon as the src server has queued it.
+    for (size_t i = 0; i < src.size(); i++) {
+        if (!async_send(src[i], dup[i])) {
+            // not an RPC cross-server pair (or refused) -> abandon: free the staging and let the
+            // caller do the synchronous move at commit time.
+            ggml_backend_buffer_free(buf);
+            ggml_free(ctx);
+            return false;
+        }
+    }
+    pimpl->prefetch = { il, dst, ctx, buf, std::move(src), std::move(dup) };
+    return true;
+}
+
+// (elastic prefetch) finish a staged move: barrier until the background pushes have landed, then
+// repoint the original tensor objects (which the graph references) at the pre-staged dst memory and
+// flip the layer->device map. Returns false if nothing is staged for il (caller uses the sync move).
+bool llama_model::commit_layer_weights(int il) {
+    auto & pf = pimpl->prefetch;
+    if (pf.il != il) {
+        return false;
+    }
+    static rpc_prefetch_wait_t wait_fn = []() -> rpc_prefetch_wait_t {
+        ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
+        return reg ? (rpc_prefetch_wait_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_prefetch_wait") : nullptr;
+    }();
+    // all of the layer's tensors sit on one src server, so one barrier on the src socket drains them.
+    if (wait_fn && !pf.src.empty()) {
+        wait_fn(pf.src[0]);
+    }
+    for (size_t i = 0; i < pf.src.size(); i++) {
+        pf.src[i]->buffer = pf.dup[i]->buffer;
+        pf.src[i]->data   = pf.dup[i]->data;
+        pf.src[i]->extra  = pf.dup[i]->extra;
+    }
+    pimpl->ctxs.emplace_back(pf.ctx);
+    pimpl->bufs.emplace_back(pf.buf);
+    pimpl->dev_layer[il].dev = pf.dst;
+    auto bit = pimpl->gpu_buft_list.find(pf.dst);
+    if (bit != pimpl->gpu_buft_list.end()) {
+        pimpl->dev_layer[il].buft_list = &bit->second;
+    }
+    pf = impl::pending_prefetch{};  // clear the slot
     return true;
 }
 

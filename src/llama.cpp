@@ -8658,8 +8658,13 @@ static int llama_decode_impl(
     {
         static const double budget_mb = getenv("LLAMA_REBALANCE_BUDGET_MB") ? atof(getenv("LLAMA_REBALANCE_BUDGET_MB")) : 0.0;
         static const int    cooldown  = getenv("LLAMA_REBALANCE_COOLDOWN")  ? atoi(getenv("LLAMA_REBALANCE_COOLDOWN"))  : 32;
+        // prefetch lead in grow-blocks: pre-stage the shift's weights this many blocks before the
+        // predicted budget crossing so the transfer overlaps decode (0 disables -> synchronous shift).
+        static const double pf_lead   = getenv("LLAMA_REBALANCE_PREFETCH") ? atof(getenv("LLAMA_REBALANCE_PREFETCH")) : 1.0;
         static int rb_tok = 0, rb_last = -1000000;
-        if (budget_mb > 0.0 && rb_tok - rb_last >= cooldown) {
+        static int pf_il = -1;                          // layer currently pre-staged (-1 = none)
+        static ggml_backend_dev_t pf_target = nullptr;  // its staged destination
+        if (budget_mb > 0.0) {
             const uint32_t cells = kv_self.size;
             const size_t   elt   = ggml_type_size(kv_self.type_k) + ggml_type_size(kv_self.type_v);
             // per-device KV bytes (this decode's capacity) + layer count
@@ -8684,26 +8689,62 @@ static int llama_decode_impl(
             ggml_backend_dev_t target = nullptr; bool up = false;
             if (prev && (!next || load[prev] <= load[next])) { target = prev; up = false; }
             else if (next)                                   { target = next; up = true;  }
-            // only shift if the source is over budget AND has >=2 more layers than the target, so the
-            // shift reduces the imbalance and the policy converges instead of thrashing.
-            if (dmax && target && load[dmax] > budget_mb && cnt[dmax] >= cnt[target] + 2) {
-                int il = -1;
+            // dmax's EDGE layer toward target (highest if going up, lowest if going down)
+            int il = -1;
+            if (dmax && target) {
                 if (up) { for (int k = (int) hparams.n_layer - 1; k >= 0; k--) if (model.dev_layer(k) == dmax) { il = k; break; } }
                 else    { for (int k = 0; k < (int) hparams.n_layer; k++)      if (model.dev_layer(k) == dmax) { il = k; break; } }
-                if (il >= 0) {
+            }
+            // converge-not-thrash: only shift when the source has >=2 more layers than the target.
+            const bool converge = dmax && target && cnt[dmax] >= cnt[target] + 2;
+
+            // PREFETCH: pre-stage the next shift's weights in the background so the ~20 s transfer
+            // overlaps decode (WiFi is idle on the compute-bound -sm layer decode); the shift then
+            // commits as just a barrier + repoint + tiny KV move. Fires both PREDICTIVELY (projected
+            // one grow-block ahead crosses budget, while still under it) and DURING A BURST (already
+            // over budget with more shifts to come) -- the cooldown gap before the matching commit is
+            // the transfer's lead time, so each shift in a burst gets pipelined, not just the first.
+            if (pf_lead > 0.0 && pf_il < 0 && converge && il >= 0) {
+                const uint32_t gb = kv_self.grow_block > 0 ? kv_self.grow_block : 0;
+                const double projected = cells > 0
+                    ? load[dmax] * (double) (cells + (uint32_t) (pf_lead * gb)) / (double) cells
+                    : load[dmax];
+                if (projected > budget_mb &&
+                    const_cast<llama_model &>(model).prefetch_layer_weights(il, target)) {
+                    pf_il = il; pf_target = target;
+                    fprintf(stderr, "[rebalance] PREFETCH layer %d %s->%s (background) | cells=%u load=%.1fMB proj=%.1fMB budget=%.1fMB\n",
+                            il, ggml_backend_dev_name(dmax), ggml_backend_dev_name(target), cells, load[dmax], projected, budget_mb);
+                }
+            }
+
+            // COMMIT a shift when the cooldown has elapsed: prefer committing a pre-staged layer (fast),
+            // else fall back to a synchronous move of dmax's edge layer.
+            if (rb_tok - rb_last >= cooldown) {
+                int commit_il = -1; ggml_backend_dev_t commit_dst = nullptr; bool staged = false;
+                if (pf_il >= 0 && load[model.dev_layer(pf_il)] > budget_mb) {
+                    commit_il = pf_il; commit_dst = pf_target; staged = true;   // its source device crossed budget
+                } else if (pf_il < 0 && converge && load[dmax] > budget_mb && il >= 0) {
+                    commit_il = il; commit_dst = target;                        // no prefetch available -> sync shift
+                }
+                if (commit_il >= 0 && commit_dst) {
+                    ggml_backend_dev_t src_dev = model.dev_layer(commit_il);
                     size_t wbytes = 0;
-                    { char pfx[64]; snprintf(pfx, sizeof(pfx), "blk.%d.", il);
+                    { char pfx[64]; snprintf(pfx, sizeof(pfx), "blk.%d.", commit_il);
                       for (auto & nt : model.tensors_by_name) if (nt.first.rfind(pfx, 0) == 0) wbytes += ggml_nbytes(nt.second); }
-                    const size_t kvbytes = ggml_nbytes(kv_self.k_l[il]) + ggml_nbytes(kv_self.v_l[il]);
+                    const size_t kvbytes = ggml_nbytes(kv_self.k_l[commit_il]) + ggml_nbytes(kv_self.v_l[commit_il]);
                     const int64_t ts0 = ggml_time_us();
-                    const_cast<llama_model &>(model).move_layer_weights(il, target);
+                    bool committed = staged && const_cast<llama_model &>(model).commit_layer_weights(commit_il);
+                    if (!committed) {
+                        const_cast<llama_model &>(model).move_layer_weights(commit_il, commit_dst);  // sync fallback
+                    }
                     const int64_t ts1 = ggml_time_us();
-                    llama_kv_cache_move_layer(kv_self, model, il, target);
+                    llama_kv_cache_move_layer(kv_self, model, commit_il, commit_dst);
                     const int64_t ts2 = ggml_time_us();
-                    fprintf(stderr, "[rebalance] SHIFT layer %d %s->%s: weights=%.1fMB kv=%.2fMB | total=%.0fms (weights=%.0fms kv=%.0fms) | cells=%u\n",
-                            il, ggml_backend_dev_name(dmax), ggml_backend_dev_name(target),
-                            wbytes/1e6, kvbytes/1e6, (ts2-ts0)/1e3, (ts1-ts0)/1e3, (ts2-ts1)/1e3, cells);
+                    fprintf(stderr, "[rebalance] SHIFT layer %d %s->%s: weights=%.1fMB kv=%.2fMB | total=%.0fms (weights=%.0fms kv=%.0fms) | cells=%u prefetched=%d\n",
+                            commit_il, ggml_backend_dev_name(src_dev), ggml_backend_dev_name(commit_dst),
+                            wbytes/1e6, kvbytes/1e6, (ts2-ts0)/1e3, (ts1-ts0)/1e3, (ts2-ts1)/1e3, cells, (int) committed);
                     rb_last = rb_tok;
+                    pf_il = -1; pf_target = nullptr;
                 }
             }
         }

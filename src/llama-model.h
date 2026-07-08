@@ -363,6 +363,12 @@ struct llama_model {
     // layer on dst. Returns false if dst is invalid / already the layer's device.
     bool move_layer_weights(int il, ggml_backend_dev_t dst);
 
+    // Prefetching variant of the above: prefetch_layer_weights stages il's weights onto dst in the
+    // background (async pushes, overlaps decode); commit_layer_weights barriers on completion and
+    // repoints. prefetch returns false when the RPC async path is unavailable (use the sync move).
+    bool prefetch_layer_weights(int il, ggml_backend_dev_t dst);
+    bool commit_layer_weights(int il);
+
     ggml_backend_buffer_type_t select_buft(int il) const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;
