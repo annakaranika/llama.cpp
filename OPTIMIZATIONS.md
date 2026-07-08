@@ -218,28 +218,90 @@ duplicated src+dst). Bit-identical, freeing ~99 % of each large tensor (source o
 shedding from "lower the KV slope" into "lower the KV slope *and* the weight floor," so the pressured
 device actually frees room rather than just slowing its own growth.
 
-### Planned: capacity-aware placement + hidden batch recruit
+### Capacity-aware placement + hidden batch recruit (`LLAMA_REBALANCE_POLICY=balanced`)
 
-The current placement + rebalance assume **identical** devices and react to KV pressure with
-**one-layer** shifts. Three planned refinements form one design — the cluster continuously right-sizes
-itself:
+The earlier placement + rebalance assumed **identical** devices and reacted to KV pressure with
+**one-layer** shifts. Three refinements, implemented as one design — the cluster continuously
+right-sizes itself:
 
-1. **Capacity-aware, periodically re-measured placement.** Real devices differ in memory *and*
-   compute. Before each placement/rebalance decision, measure each device's *available memory* and
-   *current compute load* — not just once at load, and not assuming uniform — and weight each device's
-   layer share by its live capacity (a larger/faster device holds more). This generalizes today's
-   minimal-packing (which already reads per-device free memory) to (a) compute-weighting and (b)
-   periodic re-measurement so decisions track the actual cluster state.
-2. **Recruit = balanced batch, not one layer.** Recruiting a device and handing it a single layer is
-   near-pointless: it barely relieves pressure and forces repeated rebalancing. Instead, when
-   recruiting, move a *batch* that brings the new device to its capacity-weighted balanced share in one
-   step — maximising KV headroom across *all* devices at once and minimising how often (and thus how
-   expensively) we rebalance. (Today's recruit is emergent one-at-a-time — correct, but this is the
-   efficient version.)
-3. **Hide every move behind decode.** A move must *never* delay inference: predict the need ahead from
-   KV growth and prefetch the (batch) transfer in the background so it overlaps the compute-bound
-   decode and commits instantly. Combined with (2), a batch recruit is a larger transfer but fully
-   hidden — full relief, zero inference stall.
+1. **Capacity-aware, periodically re-measured.** A new `RPC_CMD_GET_LIVE_STATS` reports each
+   server's capacity *measured at request time*: live free memory (Linux `MemAvailable`; the old
+   `GET_DEVICE_MEMORY` value is a connection-time snapshot that reports free == total on Linux CPU
+   servers) and *external compute load* (1-min loadavg minus the server's own recent CPU use, from
+   `getrusage` deltas). One shared probe (`llama_dev_capacity_measure`) feeds both the elastic
+   placement at load — each device's fit is its live free memory scaled by its free-core fraction —
+   and the rebalance policy, which re-measures every `LLAMA_REBALANCE_MEASURE` tokens (default 32,
+   a few bytes per device), so another process eating a device's memory or cores shows up in the
+   next decision.
+2. **Recruit = balanced batch, not one layer — and only when needed.** The `balanced` policy
+   apportions the layers by live capacity (memory × free-core fraction, largest-remainder, clamped
+   so no target overruns the device's memory at a KV horizon) **over the active set only** ("use
+   the least of the cluster and grow"): an idle device is recruited — one per cycle, best live
+   capacity first — *only when even balanced targets over the current members would break a
+   device's memory or the KV budget at the horizon*. The recruit then receives its full
+   capacity-weighted share in **one batch** — maximum KV headroom, minimum rebalances — instead of
+   being drained onto one layer per cooldown, and devices that aren't needed are never touched.
+3. **Hide every move behind decode.** The prefetch machinery is now multi-slot: when the projected
+   KV load `LLAMA_REBALANCE_PREFETCH` grow-blocks ahead crosses the budget, the *whole batch* is
+   pre-staged in the background (server-side async pushes on fresh sockets, overlapping the
+   compute-bound decode); at the actual crossing each layer commits as barrier + repoint + its tiny
+   KV move.
+
+**Localhost validation** (2 rpc-servers, tinyllama, elastic placement packs 22/0): the balanced
+policy recruited dev1 with a single 10-layer pre-staged batch (22/0 → 12/10, commits ≈1 ms/layer),
+converging 11/11 one cooldown later — **bit-identical** to the no-rebalance baseline. With
+heterogeneous capacity faked via the server-side test hooks (`RPC_STATS_FREE_MB=9000` vs `3000`),
+the targets became 17/5 and the recruit moved 5 layers in one batch — also bit-identical. The
+compute term shows up in placement as `fit ∝ free_mem × (1 − ext_load/n_cpu)`. Lazy membership:
+with a roomy budget the same setup produced **zero** rebalance activity (the idle device is never
+touched); tightening the budget produced exactly one `RECRUIT` + one staged batch.
+
+**Cluster A/B (7B, 4× 2 GB Pi, elastic placement, growable KV block 32, 300 tok, measured
+2026-07-08):** the live-stats placement measured each Pi at ~1.6 GB actually available with ~0.7/4
+cores busy → 10 layers fit per Pi → packed **10 10 10 2** (with *real* free memory 7B does not fit
+on three 2 GB Pis; the old snapshot probe claimed 2 GB free everywhere). Run B
+(`balanced`, budget 40 MB, prefetch lead 8 blocks): at cells = 32 the policy computed targets
+8/8/8/8 and pre-staged the whole 7-move batch; ~900 MB of weights flowed to rpi25 in the background
+over ~3.5 min of decode (RSS 256 → 1126 MB *while generating*); at the crossing (cells = 128) the
+**batch committed in 2.56 s total — weights 2–6 ms per layer** (all pre-staged), the visible cost
+being the 7 small KV moves (~0.3–0.5 s each). Distribution 10/10/10/2 → **8/8/8/8 in one step**,
+0 errors, **A == B bit-identical**.
+
+**Caveat found in that run — run `balanced` with reclaim on.** Without `LLAMA_REBALANCE_RECLAIM`
+a donor's weights stay resident after a shed, so its *live free memory never recovers* while its
+held share shrinks — its measured capacity spirals down and the targets drift (rpi20's target sank
+8 → 3 over the rest of the run, causing small follow-up batches; all hidden and bit-identical, but
+wasted transfers). Reclaim frees the shed layer's pages on the source, which restores the
+move-invariance of `free + held` that the capacity model assumes.
+
+**Why membership must be lazy — the 9-Pi eager stress test (7B, 9× 2 GB Pi cell, 2026-07-08).**
+The first `balanced` implementation apportioned targets over *all* devices, so on a 9-Pi cell
+(placement 12/10/10 + six idle) it staged a **20-move batch at cells = 32** and spread the model
+across all nine Pis. Three useful results: (1) *mechanism scales* — ~2.6 GB fanned out to six idle
+devices concurrently (each donor pushes from its own background worker) during decode, and the
+distribution landed **exactly on target** (4/4/4/4/3/3/3/3/4); (2) *reclaim works at scale* — at
+commit the three donors dropped 1532/1216/1251 → 516/534/633 MB (madvise), the cluster ending at
+~380–630 MB per Pi; (3) *eager spread is wrong anyway* — the 2.6 GB transfer outran its ~3.5 min
+lead (commit stalled 59 s on the barrier), and the 9-stage non-contiguous pipeline afterwards
+slowed decode by roughly an order of magnitude (more per-token hops on one contended channel).
+Hence the lazy-membership revision above: small one-recruit batches hide fully, and devices that
+aren't needed are never touched.
+
+**Lazy recruit on the 9-Pi cell (7B, 400 tok, budget 60 MB, lead 3 blocks, reclaim on, measured
+2026-07-08).** Placement packed 12/12/8 with six Pis idle. The run then played out the designed
+arc: first a *within-active* rebalance only (3 moves, 12/12/8 → 11/11/10 — no recruit while the
+members still fit); then, as the KV grew, `RECRUIT` fired **one device per budget crossing**
+(rpi25 → rpi19 → rpi15 → rpi16 → rpi13 → rpi17), each recruit receiving its balanced share as one
+pre-staged batch and each idle Pi staying at a 5 MB RSS *until the growth genuinely needed it*
+(total KV at cells ≈ 450 is ~470 MB against a 60 MB/device budget, so needing ~8 devices by the end
+is the correct math). Weight reclaim kept every donor shrinking as it shed (e.g. 1503 → 682 MB),
+the cluster flattening toward ~650–750 MB per active Pi. **0 errors, bit-identical to the
+no-rebalance baseline** across 7 recruits / ~38 moves — placement, rebalancing, and recruit timing
+change nothing in the math. Commit visibility varied with pressure timing: intermittent pressure →
+fully hidden (9-move recruit committed in 5.4 s, weights 50–70 ms each); *sustained* pressure →
+the commit fires one cooldown after staging, so the effective lead is the cooldown, not `pf_lead`,
+and larger batches block on the barrier (76.7 s / 67.5 s observed). Known refinement: defer a
+non-urgent commit while staged transfers are still in flight.
 
 ## Environment-variable reference
 
@@ -267,6 +329,12 @@ itself:
 | `LLAMA_KV_GROW_BLOCK` | 0 (off) | grow the KV cache in blocks of N tokens instead of committing full `n_ctx` |
 | `LLAMA_REBALANCE_BUDGET_MB` | 0 (off) | per-device KV budget; a device over it sheds a layer (enables elastic rebalance) |
 | `LLAMA_REBALANCE_COOLDOWN` | 32 | min tokens between shifts (anti-thrash) |
+| `LLAMA_REBALANCE_POLICY` | `adjacent` | `adjacent` (neighbor + prefetch) / `cache` (0×-WiFi cache locality) / `balanced` (capacity-weighted targets, one prefetched batch) |
+| `LLAMA_REBALANCE_PREFETCH` | 1 | prefetch lead in grow-blocks (0 = synchronous shifts) |
+| `LLAMA_REBALANCE_MEASURE` | 32 | (balanced) tokens between live capacity re-measurements |
+| `LLAMA_REBALANCE_MARGIN_MB` | 100 | (balanced) per-device safety margin subtracted from live free memory |
+| `RPC_STATS_FREE_MB` / `RPC_STATS_EXT_LOAD` | unset | server-side test hooks: fake the live-stats report (exercise heterogeneous capacity locally) |
+| `RPC_DBG_STATS` | off | log each live-stats report on the server |
 | `LLAMA_REBALANCE_POLICY` | `adjacent` | `adjacent` = shift to lower-loaded neighbor + prefetch; `cache` = shift to a device that caches the layer (0× WiFi) |
 | `LLAMA_REBALANCE_PREFETCH` | 1 | (adjacent policy) grow-blocks of lead to pre-stage the transfer; 0 = synchronous shift |
 | `LLAMA_REBALANCE_RECLAIM` | off | after a shift, `madvise(DONTNEED)` the moved layer's pages on the source so its weight RAM is freed (not just KV) |

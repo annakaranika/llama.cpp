@@ -1,6 +1,12 @@
 # name ip
-# peer compute servers (4 -> enables N=4 -sm row TP; GQA needs N | num_kv_heads=4)
+# peer compute servers on the IBSS cell (fleet split: rpi2-9 stay on dprgnet/campus,
+# rpi13+ live on the cell; 9 cell devices enable idle-Pi recruit demos + bigger models)
 rpi24 192.168.4.24
 rpi25 192.168.4.25
 rpi20 192.168.4.20
 rpi22 192.168.4.22
+rpi13 192.168.4.13
+rpi15 192.168.4.15
+rpi16 192.168.4.16
+rpi17 192.168.4.17
+rpi19 192.168.4.19

@@ -43,6 +43,13 @@ output appears). `ablate.sh` + `rpc_profiles.conf` apply a profile to all nodes 
 | `RPC_WEIGHT_CACHE_DIR` | `$HOME/.cache/llama-rpc-weights` | Where the weight cache lives (auto-mkdir). | server |
 | `RPC_SERIAL_UPLOAD` | unset (**concurrent**) | Set=1 → serial (not threaded) buffer alloc/upload/download. Diagnostic; concurrent is the default when opts on. | both |
 
+## Live stats (capacity-aware elastic placement/rebalance)
+
+| Var | Default | Effect | Set on |
+|---|---|---|---|
+| `RPC_STATS_FREE_MB` | unset (**measure**) | Test hook: report this value as the server's live free memory instead of measuring `/proc/meminfo MemAvailable` — exercise heterogeneous-capacity placement/targets without real memory pressure. | server |
+| `RPC_STATS_EXT_LOAD` | unset (**measure**) | Test hook: report this as the external compute load (cores busy with other work) instead of loadavg − own-CPU. | server |
+
 ## Debug / instrumentation (all default OFF, logging only)
 
 | Var | Logs | Set on |
@@ -59,6 +66,7 @@ output appears). `ablate.sh` + `rpc_profiles.conf` apply a profile to all nodes 
 | `RPC_DBG_AR` | all-reduce internals (server-side) | server |
 | `RPC_DBG_COMPARE` | graph-compare debug | server |
 | `RPC_DBG_WCACHE` | weight-cache hit/miss debug | server |
+| `RPC_DBG_STATS` | `[live-stats]` one line per GET_LIVE_STATS report (free/total mem, ncpu, ext_load, own recent CPU) | server |
 
 ## Common combos (see `rpc_profiles.conf`)
 
