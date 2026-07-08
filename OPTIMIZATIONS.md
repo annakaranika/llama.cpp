@@ -16,6 +16,26 @@ servers — cluster 7B reload 283 s → 153 s).
 
 # Part 1 — Implemented optimizations
 
+## Measured impact (A/B summary)
+
+Consolidated before→after for each optimization; details + setup in the sections below. All
+bit-identical / output-preserving unless noted. 7B Q4_K_M on 4× Pi 4B over WiFi unless stated.
+
+| Optimization | Metric | Before → After | Gate |
+|---|---|---|---|
+| P2P all-reduce + deterministic fold | decode | 7.9 → 6.5 s/tok (~18%) | on |
+| Diff cache | graph-send / token | ~halved | `RPC_PP_DIFF` (pipeline) |
+| Direct pipeline handoff | prefill / decode | −0.8% / −0.7% | on |
+| Activation pool | per-server RAM | 1205 → 475 MB (long prefill OOM → fits) | on |
+| Per-token buffer reuse | graph-build; decode | 3.3 s → 5 ms; 4.3× | on |
+| On-disk weight cache | load | 194 → 46 s (4.2×) | on |
+| Cross-process persist | reload / restart | 283 → 153 s (~130 s saved) | `RPC_PERSIST` |
+| Resident serving process | load / request | cold 1015 / warm 283 / **resident 0 s** | — |
+| Growable KV cache | per-Pi KV footprint | commit full `n_ctx` → grow in blocks (~500 MB/Pi saved) | `LLAMA_KV_GROW_BLOCK` |
+| Elastic boundary shift | per-shift stall | 44 s → **0.2 s** (prefetch) / **3.4 s** (cache-aware) | `LLAMA_REBALANCE_*` |
+
+The elastic boundary-shift row is broken out per weight-move strategy in *Elastic rebalancing* below.
+
 ## Communication (all-reduce is ≈74% of decode — the primary target)
 
 - **P2P all-reduce** — servers exchange tensor-parallel partials *directly* peer-to-peer
@@ -121,6 +141,45 @@ servers — cluster 7B reload 283 s → 153 s).
   forwards would cross-talk). The persist use case is sequential processes, where the lock is
   uncontended.
 
+## Elastic rebalancing (growable KV + adaptive boundary shift)
+
+The pipeline is sized to fit, then rebalanced as the KV cache grows (Part 2 is the analysis). Two
+mechanisms, both opt-in and bit-identical to baseline:
+
+- **Growable KV cache** (`LLAMA_KV_GROW_BLOCK=N`) — grow the cache in blocks of N tokens as context
+  grows, instead of committing the full `n_ctx` up front. Frees ~500 MB/Pi on the 7B cluster and is the
+  prerequisite for elastic sizing. Ring-buffer-aware; block ≥ `n_ubatch`.
+- **Gated boundary shift** (`LLAMA_REBALANCE_BUDGET_MB`) — when a device's KV footprint crosses the
+  budget, move one of its layers to another device (weights + KV), gated by a cooldown and a
+  converge-not-thrash rule (shift only when the source has ≥2 more layers than the target). The KV part
+  is negligible (1–1.6 MB, ~0.2–0.3 s); the **weight** part (~130 MB/layer) dominates and is what the
+  strategies below optimize. Policy selected by `LLAMA_REBALANCE_POLICY`.
+
+**Per-shift cost, 7B / 4-Pi / layer ≈130 MB (measured, A/B):**
+
+| Weight-move strategy | weight move | total shift | WiFi | how |
+|---|---|---|---|---|
+| Host relay (baseline) | 43.9 s | 44.3 s | 2× | src → coordinator → dst |
+| Direct peer copy | 20.2 s | 20.4 s | 1× | src pushes straight to dst (`SEND_TO_PEER`) |
+| **Prefetch** (adjacent policy) | ~0 visible | **0.21 s** | 1× overlapped | staged in background, hidden behind decode |
+| **Cache-aware**, disk hit | 3.2 s | **3.4 s** | **0×** | dst loads the layer from its local weight cache |
+| Cache-aware, page-cached | 0.3 s | 0.6 s | 0× | re-read from the OS page cache |
+
+- **Direct peer copy + adjacent-neighbor** (default `adjacent` policy): shift the overloaded device's
+  edge layer to its lower-loaded pipeline neighbor (stays contiguous, no extra handoffs), pushing the
+  weights straight to the destination — halves the transfer (44 → 20 s) by removing the host round-trip.
+- **Prefetch**: predict the budget crossing from the linear KV growth and pre-stage the layer's weights
+  in the background (server-side async push on a dedicated socket), so the ~20 s transfer overlaps the
+  compute-bound decode where the WiFi is idle; the shift then commits in ~0.2 s. Needs a small enough
+  grow-block that the device crosses budget gradually (so there's decode-time lead).
+- **Cache-aware** (`LLAMA_REBALANCE_POLICY=cache`): shift to whichever device already holds the layer in
+  its on-disk weight cache and load it **locally** — 0× WiFi. WHOLE weight-cache keys are
+  device-independent content hashes, so a layer's key is identical on every server; a cold destination
+  transfers once and lazily caches, so subsequent moves hit. Robust exactly where prefetch degrades
+  (busy channel / throughput serving, where the idle-WiFi assumption breaks). On the well-used cluster
+  every shift already hit (`cache=9/9`); a true miss costs the direct-peer transfer (20.4 s) measured
+  above, so the SD read (~3.2 s, or ~0.3 s from page cache) is the steady-state cost.
+
 ## Environment-variable reference
 
 | Var | Default | Effect |
@@ -141,6 +200,11 @@ servers — cluster 7B reload 283 s → 153 s).
 | `RPC_PERSIST_MAX_GB` | 8 | resident-model RAM cap per server (≤0 = unlimited) |
 | `RPC_DBG_PERSIST` | off | log BIND/REGISTER/DETACH/RELEASE/EVICT |
 | `RPC_GRAPH_WRAP_AT` | 256 | lower the diff-cache graph-number wrap point for testing the reuse path |
+| `LLAMA_KV_GROW_BLOCK` | 0 (off) | grow the KV cache in blocks of N tokens instead of committing full `n_ctx` |
+| `LLAMA_REBALANCE_BUDGET_MB` | 0 (off) | per-device KV budget; a device over it sheds a layer (enables elastic rebalance) |
+| `LLAMA_REBALANCE_COOLDOWN` | 32 | min tokens between shifts (anti-thrash) |
+| `LLAMA_REBALANCE_POLICY` | `adjacent` | `adjacent` = shift to lower-loaded neighbor + prefetch; `cache` = shift to a device that caches the layer (0× WiFi) |
+| `LLAMA_REBALANCE_PREFETCH` | 1 | (adjacent policy) grow-blocks of lead to pre-stage the transfer; 0 = synchronous shift |
 
 ## Correctness fixes that were prerequisites (enabling, not speedups)
 
