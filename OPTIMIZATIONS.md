@@ -322,6 +322,12 @@ aren't needed are never touched.
 - **Auto-rate paced staging** (`LLAMA_REBALANCE_PACE=auto`): each batch is paced at
   `bytes / (0.7 × predicted lead)` — lead from the earliest allowance crossing at the measured
   decode-rate EMA — so transfers finish just before their commit while sipping the channel.
+- **Measured payoff (run B8 vs B6, identical 800-token shape)**: **0.13 → 0.20 t/s (+54%)** from
+  deleting the grow round-trip, with the recruit, commit-defer, and auto-rate all exercised on
+  hardware (12-move recruit batch committed in 8 s; a deferred commit landed in 2.1 s). Remaining
+  gap to the 0.4 t/s target: capacity-measurement churn right after a restart (fix: EMA-smoothed
+  readings + a warm-up grace) and the raw 3-device kernel rate (next: Q4_0_4_4 requant — the fork
+  carries the aarch64 repack kernels).
 - **KV shrink + de-recruit**: capacity finally moves *both* ways. `llama_kv_cache_shrink`
   (same local strided-copy path) returns grown-but-idle capacity once ≥2 spare grow-blocks
   persist; the policy then **evicts** the smallest member when the rest fit under
