@@ -240,6 +240,28 @@ void llama_rebalance_step(llama_model & model, llama_kv_cache & kv, int32_t n_to
             static const int    measure_every = getenv("LLAMA_REBALANCE_MEASURE")   ? atoi(getenv("LLAMA_REBALANCE_MEASURE"))   : 32;
             static const double margin_mb     = getenv("LLAMA_REBALANCE_MARGIN_MB") ? atof(getenv("LLAMA_REBALANCE_MARGIN_MB")) : 100.0;
             static const int    headroom_tok  = getenv("LLAMA_ELASTIC_KV_HEADROOM") ? atoi(getenv("LLAMA_ELASTIC_KV_HEADROOM")) : 512;
+            // (commit-defer) keep decoding while a staged batch's transfers are still in flight,
+            // unless the overshoot beyond the allowance exceeds this (then commit = block on the
+            // barrier, the pre-defer behavior -- correctness never depends on the defer).
+            static const double defer_mb      = getenv("LLAMA_REBALANCE_DEFER_MB")  ? atof(getenv("LLAMA_REBALANCE_DEFER_MB"))  : 50.0;
+            // (paced staging) LLAMA_REBALANCE_PACE: unset/0 = unpaced; "auto" = rate each batch at
+            // batch bytes / (0.7 x predicted lead), so the transfer finishes just before the
+            // crossing while sipping the shared channel; a number = fixed MB/s per push.
+            static const char * pace_env  = getenv("LLAMA_REBALANCE_PACE");
+            static const bool   pace_auto = pace_env && strcmp(pace_env, "auto") == 0;
+            static const double pace_mbps = pace_env && !pace_auto ? atof(pace_env) : 0.0;
+            // decode seconds-per-token EMA (feeds the auto rate's lead estimate); updated on
+            // decode-sized calls only so prefill bursts don't skew it.
+            static int64_t ema_last_us = 0;
+            static double  ema_spt     = 0.0;
+            {
+                const int64_t now_us = ggml_time_us();
+                if (ema_last_us > 0 && n_tokens >= 1 && n_tokens <= 2) {
+                    const double spt = (now_us - ema_last_us) / 1e6 / n_tokens;
+                    if (spt > 0.0 && spt < 60.0) { ema_spt = ema_spt > 0.0 ? 0.9 * ema_spt + 0.1 * spt : spt; }
+                }
+                ema_last_us = now_us;
+            }
             const int nd = (int) model.devices.size();
             const int nl = (int) hparams.n_layer;
 
@@ -464,15 +486,30 @@ void llama_rebalance_step(llama_model & model, llama_kv_cache & kv, int32_t n_to
             // allowance: every planned layer's weights start moving in the background while decode
             // continues. (Fixed budget: allowance == budget for every device, same as before.)
             if (pf_lead > 0.0 && batch.empty() && !plan.empty() && cells > 0 && stage_over > 0.0) {
+                // (auto-rate) pace the batch to finish just before the predicted crossing: rate =
+                // batch bytes / (0.7 x lead), lead = tokens until the earliest member crossing at
+                // the measured decode speed. Falls back to unpaced when the estimate is unusable.
+                double rate = pace_mbps;
+                if (pace_auto) {
+                    double cross_cells = 1e18;
+                    for (int i = 0; i < nd; i++) {
+                        const int c = cnt[model.devices[i]];
+                        if (c > 0 && kv_allow[i] > 0.0) { cross_cells = std::min(cross_cells, kv_allow[i] / (c * per_tok_mb)); }
+                    }
+                    const double lead_tok = std::max(8.0, cross_cells - (double) cells);
+                    const double lead_s   = lead_tok * (ema_spt > 0.0 ? ema_spt : 1.0);
+                    const double batch_mb = plan.size() * w_layer_mb;
+                    rate = std::max(1.0, batch_mb / (0.7 * lead_s));
+                }
                 int staged_n = 0;
                 for (auto & m : plan) {
-                    m.staged  = model.prefetch_layer_weights(m.il, model.devices[m.dst_i]);
+                    m.staged  = model.prefetch_layer_weights(m.il, model.devices[m.dst_i], rate);
                     staged_n += m.staged ? 1 : 0;
                 }
                 batch = plan;
-                fprintf(stderr, "[rebalance] PREFETCH-BATCH %zu layers (%d staged) | cells=%u proj_over=%.1fMB %s | runs %d->%d | targets:",
+                fprintf(stderr, "[rebalance] PREFETCH-BATCH %zu layers (%d staged) | cells=%u proj_over=%.1fMB %s | rate=%.1fMB/s | runs %d->%d | targets:",
                         batch.size(), staged_n, cells, stage_over,
-                        auto_budget ? "budget=auto" : "budget=fixed", plan_runs_cur, plan_runs_want);
+                        auto_budget ? "budget=auto" : "budget=fixed", rate, plan_runs_cur, plan_runs_want);
                 for (int i = 0; i < nd; i++) { fprintf(stderr, " %d", target[i]); }
                 fprintf(stderr, "\n");
             }
@@ -482,6 +519,26 @@ void llama_rebalance_step(llama_model & model, llama_kv_cache & kv, int32_t n_to
             // moves with it. One cooldown covers the whole batch.
             if (rb_tok - rb_last >= cooldown && commit_over > 0.0) {
                 std::vector<llama_rebalance_move> & moves = !batch.empty() ? batch : plan;
+                // (commit-defer) a staged batch whose transfers are still in flight would block
+                // decode on the barrier for the tail -- defer the commit and keep generating,
+                // unless the overshoot has grown past defer_mb (urgent -> commit anyway).
+                static int defer_logged = 0;
+                if (!batch.empty() && commit_over <= defer_mb) {
+                    bool in_flight = false;
+                    for (auto & m : batch) {
+                        if (m.staged && !model.prefetch_ready(m.il)) { in_flight = true; break; }
+                    }
+                    if (in_flight) {
+                        if (!defer_logged) {
+                            fprintf(stderr, "[rebalance] DEFER commit: staged transfers in flight | cells=%u over=%.1fMB (<= %.0fMB)\n",
+                                    cells, commit_over, defer_mb);
+                            defer_logged = 1;
+                        }
+                        rb_tok += n_tokens;
+                        return;
+                    }
+                }
+                defer_logged = 0;
                 if (!moves.empty()) {
                     const int64_t tb0 = ggml_time_us();
                     int done = 0;

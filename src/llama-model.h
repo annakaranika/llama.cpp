@@ -364,9 +364,13 @@ struct llama_model {
     bool move_layer_weights(int il, ggml_backend_dev_t dst);
 
     // Prefetching variant of the above: prefetch_layer_weights stages il's weights onto dst in the
-    // background (async pushes, overlaps decode); commit_layer_weights barriers on completion and
-    // repoints. prefetch returns false when the RPC async path is unavailable (use the sync move).
-    bool prefetch_layer_weights(int il, ggml_backend_dev_t dst);
+    // background (async pushes, overlaps decode; rate_mbps > 0 paces the source's pushes so a
+    // long-lead batch sips the shared channel instead of gulping it); prefetch_ready reports
+    // NON-blocking whether the staged layer's pushes have drained (commit-defer probe);
+    // commit_layer_weights barriers on completion and repoints. prefetch returns false when the
+    // RPC async path is unavailable (use the sync move).
+    bool prefetch_layer_weights(int il, ggml_backend_dev_t dst, double rate_mbps = 0.0);
+    bool prefetch_ready(int il) const;
     bool commit_layer_weights(int il);
 
     // Cache-aware rebalancing: layer_cache_hits_on reports how many of il's weight tensors are already

@@ -403,7 +403,23 @@ struct llama_model::impl {
 llama_model::llama_model(const struct llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
 }
 
-llama_model::~llama_model() {}
+llama_model::~llama_model() {
+    // (elastic prefetch) a staged-but-never-committed batch may still have background pushes in
+    // flight (paced transfers make this window long). Freeing the staged destination buffers
+    // under the source worker's feet crashes the servers at teardown -- drain each source first.
+    if (!pimpl->prefetch.empty()) {
+        typedef void (*rpc_prefetch_wait_fn)(const ggml_tensor *);
+        ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
+        rpc_prefetch_wait_fn wait_fn = reg ? (rpc_prefetch_wait_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_prefetch_wait") : nullptr;
+        if (wait_fn) {
+            for (const auto & pf : pimpl->prefetch) {
+                if (!pf.src.empty()) {
+                    wait_fn(pf.src[0]);
+                }
+            }
+        }
+    }
+}
 
 void llama_model::load_stats(llama_model_loader & ml) {
     pimpl->n_elements = ml.n_elements;
@@ -3941,15 +3957,16 @@ bool llama_model::move_layer_weights(int il, ggml_backend_dev_t dst) {
     return true;
 }
 
-typedef bool (*rpc_async_send_t)(const ggml_tensor *, ggml_tensor *);
+typedef bool (*rpc_async_send_t)(const ggml_tensor *, ggml_tensor *, float);
 typedef void (*rpc_prefetch_wait_t)(const ggml_tensor *);
+typedef int  (*rpc_prefetch_pending_t)(const ggml_tensor *);
 
 // (elastic prefetch) stage layer il's weights onto dst in the BACKGROUND: allocate the destination
 // buffer + duplicate tensors, then fire async pushes so the src servers transfer while decode keeps
 // running. Does NOT touch the graph yet -- commit_layer_weights() barriers on completion and repoints.
 // Returns false (caller should fall back to the synchronous move_layer_weights) when the RPC async
 // path is unavailable or the tensors are not RPC cross-server pairs.
-bool llama_model::prefetch_layer_weights(int il, ggml_backend_dev_t dst) {
+bool llama_model::prefetch_layer_weights(int il, ggml_backend_dev_t dst, double rate_mbps) {
     static rpc_async_send_t async_send = []() -> rpc_async_send_t {
         ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
         return reg ? (rpc_async_send_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_async_send") : nullptr;
@@ -3998,7 +4015,7 @@ bool llama_model::prefetch_layer_weights(int il, ggml_backend_dev_t dst) {
     }
     // fire the async pushes; each returns as soon as the src server has queued it.
     for (size_t i = 0; i < src.size(); i++) {
-        if (!async_send(src[i], dup[i])) {
+        if (!async_send(src[i], dup[i], (float) rate_mbps)) {
             // not an RPC cross-server pair (or refused) -> abandon: free the staging and let the
             // caller do the synchronous move at commit time.
             ggml_backend_buffer_free(buf);
@@ -4013,6 +4030,25 @@ bool llama_model::prefetch_layer_weights(int il, ggml_backend_dev_t dst) {
 // (elastic prefetch) finish a staged move: barrier until the background pushes have landed, then
 // repoint the original tensor objects (which the graph references) at the pre-staged dst memory and
 // flip the layer->device map. Returns false if nothing is staged for il (caller uses the sync move).
+// (commit-defer) NON-blocking: has the staged layer's source drained its background pushes? The
+// inflight counter is per-server (covers every queued push from that source), so a true here can
+// briefly be conservative for multi-source batches -- exactly the safe direction.
+bool llama_model::prefetch_ready(int il) const {
+    static rpc_prefetch_pending_t pending_fn = [] () -> rpc_prefetch_pending_t {
+        ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
+        return reg ? (rpc_prefetch_pending_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_prefetch_pending") : nullptr;
+    }();
+    auto it = std::find_if(pimpl->prefetch.begin(), pimpl->prefetch.end(),
+                           [il](const impl::pending_prefetch & p) { return p.il == il; });
+    if (it == pimpl->prefetch.end()) {
+        return false;  // nothing staged for il
+    }
+    if (!pending_fn || it->src.empty()) {
+        return true;   // no probe available -> let the commit barrier handle it (old behavior)
+    }
+    return pending_fn(it->src[0]) == 0;
+}
+
 bool llama_model::commit_layer_weights(int il) {
     auto it = std::find_if(pimpl->prefetch.begin(), pimpl->prefetch.end(),
                            [il](const impl::pending_prefetch & p) { return p.il == il; });

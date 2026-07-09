@@ -158,6 +158,7 @@ enum rpc_cmd {
     RPC_CMD_PERSIST_DETACH,    // client is releasing a resident buffer -> keep it resident, mark unclaimed for the next process
     RPC_CMD_GET_LIVE_STATS,    // (capacity-aware rebalance) live free memory + compute load measured NOW (GET_DEVICE_MEMORY is a connection-time snapshot)
     RPC_CMD_STRIDED_COPY,      // (growable KV) server-LOCAL strided copy between two same-server tensors (KV grow re-stride without host round-tripping the cache over the wire)
+    RPC_CMD_PREFETCH_PENDING,  // (commit-defer) NON-blocking probe: how many background pushes are still in flight here? (PREFETCH_WAIT blocks; this lets the policy defer a commit instead)
     RPC_CMD_COUNT,
 };
 
@@ -282,6 +283,7 @@ struct rpc_msg_send_to_peer_req {
     rpc_tensor src;                 // locate the bytes on the SOURCE server
     rpc_tensor dst;                 // where to write them on the DESTINATION server
     char       dst_endpoint[256];   // which peer to push to (key into sockets_connectto)
+    float      rate_mbps;           // (paced staging, ASYNC only) per-push rate cap; 0 = server env / unlimited
 };
 
 struct rpc_msg_send_to_peer_rsp {
@@ -294,6 +296,15 @@ struct rpc_msg_prefetch_wait_req {
 };
 struct rpc_msg_prefetch_wait_rsp {
     uint8_t result;   // 1 = all background pushes complete
+};
+
+// (commit-defer) non-blocking variant: report how many pushes are still queued/in-progress so the
+// policy can DEFER a commit (keep decoding) instead of blocking on the barrier for the tail.
+struct rpc_msg_prefetch_pending_req {
+    uint8_t dummy;
+};
+struct rpc_msg_prefetch_pending_rsp {
+    uint32_t inflight;
 };
 
 // (capacity-aware rebalance) live capacity of the machine behind this server, measured at request
@@ -1683,6 +1694,7 @@ static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, con
         req.src = serialize_tensor(src);
         req.dst = serialize_tensor(dst);
         snprintf(req.dst_endpoint, sizeof(req.dst_endpoint), "%s", dst_buft->endpoint.c_str());
+        req.rate_mbps = 0.0f;  // hot handoff path: never paced
         rpc_msg_send_to_peer_rsp resp;
         resp.result = 0;
         bool status = send_rpc_cmd(src_ctx->sock, RPC_CMD_SEND_TO_PEER, &req, sizeof(req), &resp, sizeof(resp));
@@ -5030,6 +5042,7 @@ class rpc_server {
     // (elastic prefetch) enqueue a background push (overlaps decode) + barrier for the commit.
     bool send_to_peer_async(const rpc_msg_send_to_peer_req & request, rpc_msg_send_to_peer_rsp & response);
     bool prefetch_wait(const rpc_msg_prefetch_wait_req & request, rpc_msg_prefetch_wait_rsp & response);
+    bool prefetch_pending(const rpc_msg_prefetch_pending_req & request, rpc_msg_prefetch_pending_rsp & response);
     bool strided_copy(const rpc_msg_strided_copy_req & request, rpc_msg_strided_copy_rsp & response);
     void add_socket_listen(const std::shared_ptr<socket_t> & sock);
     bool all_reduce(std::vector<uint8_t> & input);
@@ -5071,7 +5084,7 @@ class rpc_server {
     // (elastic prefetch) a single background worker drains queued weight pushes so the transfer
     // overlaps decode. Serialized (WiFi is serial anyway) over a dedicated fresh socket per
     // destination (NOT the peer_socks_held used by handoffs, so it never interleaves with them).
-    struct prefetch_job { rpc_tensor src; rpc_tensor dst; std::string endpoint; };
+    struct prefetch_job { rpc_tensor src; rpc_tensor dst; std::string endpoint; float rate_mbps; };
     void prefetch_worker_loop();
     void do_prefetch_transfer(const prefetch_job & job);
     std::mutex                              prefetch_mutex;
@@ -6009,7 +6022,8 @@ void rpc_server::do_prefetch_transfer(const prefetch_job & job) {
     // decode even though it never stalls it. 0/unset = unlimited (previous behavior). Pacing
     // chunks the push through SET_TENSOR's offset field with sleeps sized to the target rate;
     // a PREFETCH_WAIT barrier issued early simply blocks until the paced pushes drain.
-    static const double rate_mbps = getenv("RPC_PREFETCH_RATE_MBPS") ? atof(getenv("RPC_PREFETCH_RATE_MBPS")) : 0.0;
+    static const double env_rate = getenv("RPC_PREFETCH_RATE_MBPS") ? atof(getenv("RPC_PREFETCH_RATE_MBPS")) : 0.0;
+    const double rate_mbps = job.rate_mbps > 0.0f ? (double) job.rate_mbps : env_rate;  // per-push (auto-rate) wins over the env
     const size_t chunk = rate_mbps > 0.0 ? (size_t) 1024*1024 : (size ? size : 1);
     bool ok = true;
     for (size_t off = 0; off < size || (size == 0 && off == 0); off += chunk) {
@@ -6064,7 +6078,7 @@ bool rpc_server::send_to_peer_async(const rpc_msg_send_to_peer_req & request, rp
             std::thread(&rpc_server::prefetch_worker_loop, this).detach();
             prefetch_worker_started = true;
         }
-        prefetch_q.push({ request.src, request.dst, std::string(request.dst_endpoint) });
+        prefetch_q.push({ request.src, request.dst, std::string(request.dst_endpoint), request.rate_mbps });
         prefetch_inflight++;
         prefetch_cv.notify_all();
     }
@@ -6111,6 +6125,13 @@ bool rpc_server::prefetch_wait(const rpc_msg_prefetch_wait_req & /*request*/, rp
     std::unique_lock<std::mutex> lk(prefetch_mutex);
     prefetch_cv.wait(lk, [&] { return prefetch_inflight == 0; });
     response.result = 1;
+    return true;
+}
+
+// (commit-defer) non-blocking probe of the same counter the barrier waits on.
+bool rpc_server::prefetch_pending(const rpc_msg_prefetch_pending_req & /*request*/, rpc_msg_prefetch_pending_rsp & response) {
+    std::lock_guard<std::mutex> lk(prefetch_mutex);
+    response.inflight = (uint32_t) prefetch_inflight;
     return true;
 }
 
@@ -7476,6 +7497,21 @@ static void rpc_serve_client(rpc_server & server, sockfd_t sockfd, size_t free_m
                     }
                     break;
                 }
+            case RPC_CMD_PREFETCH_PENDING:
+                {
+                    rpc_msg_prefetch_pending_req request;
+                    if (!recv_msg(sockfd, &request, sizeof(request))) {
+                        return;
+                    }
+                    rpc_msg_prefetch_pending_rsp response;
+                    if (!server.prefetch_pending(request, response)) {
+                        return;
+                    }
+                    if (!send_msg(sockfd, &response, sizeof(response))) {
+                        return;
+                    }
+                    break;
+                }
             case RPC_CMD_PERSIST_BIND:
                 {
                     rpc_msg_persist_bind_req request;
@@ -8101,7 +8137,7 @@ static void ggml_backend_rpc_persist_end() {
 // background push of `src` into the DST peer buffer and ack immediately, so the transfer overlaps
 // the client's ongoing decode. Returns false (caller should do a synchronous copy) when the two
 // tensors are not RPC tensors on different servers, or the async push wasn't accepted.
-static bool ggml_backend_rpc_async_send(const ggml_tensor * src, ggml_tensor * dst) {
+static bool ggml_backend_rpc_async_send(const ggml_tensor * src, ggml_tensor * dst, float rate_mbps) {
     if (!src || !dst || !src->buffer || !dst->buffer) {
         return false;
     }
@@ -8119,10 +8155,26 @@ static bool ggml_backend_rpc_async_send(const ggml_tensor * src, ggml_tensor * d
     req.src = serialize_tensor(src);
     req.dst = serialize_tensor(dst);
     snprintf(req.dst_endpoint, sizeof(req.dst_endpoint), "%s", dst_buft->endpoint.c_str());
+    req.rate_mbps = rate_mbps;   // (auto-rate) per-push pace; 0 = server env / unlimited
     rpc_msg_send_to_peer_rsp resp;
     resp.result = 0;
     bool status = send_rpc_cmd(src_ctx->sock, RPC_CMD_SEND_TO_PEER_ASYNC, &req, sizeof(req), &resp, sizeof(resp));
     return status && resp.result == 1;
+}
+
+// (commit-defer) how many background pushes are still in flight on the server holding `t`?
+// Non-blocking counterpart of prefetch_wait; -1 = unknown (not an RPC tensor / probe failed).
+static int ggml_backend_rpc_prefetch_pending(const ggml_tensor * t) {
+    if (!t || !t->buffer || t->buffer->buft->iface.get_name != ggml_backend_rpc_buffer_type_name) {
+        return -1;
+    }
+    auto * ctx = (ggml_backend_rpc_buffer_context *) t->buffer->context;
+    rpc_msg_prefetch_pending_req req;  req.dummy = 0;
+    rpc_msg_prefetch_pending_rsp rsp;  rsp.inflight = 0;
+    if (!send_rpc_cmd(ctx->sock, RPC_CMD_PREFETCH_PENDING, &req, sizeof(req), &rsp, sizeof(rsp))) {
+        return -1;
+    }
+    return (int) rsp.inflight;
 }
 
 // (elastic prefetch) commit barrier: block until the SRC server holding `t` has drained its queued
@@ -8270,6 +8322,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (strcmp(name, "ggml_backend_rpc_strided_copy") == 0) {
         return (void *) ggml_backend_rpc_strided_copy;
+    }
+    if (strcmp(name, "ggml_backend_rpc_prefetch_pending") == 0) {
+        return (void *) ggml_backend_rpc_prefetch_pending;
     }
     if (strcmp(name, "ggml_backend_rpc_weight_hash") == 0) {
         return (void *) ggml_backend_rpc_weight_hash;
