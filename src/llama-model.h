@@ -372,6 +372,12 @@ struct llama_model {
     bool prefetch_layer_weights(int il, ggml_backend_dev_t dst, double rate_mbps = 0.0);
     bool prefetch_ready(int il) const;
     bool commit_layer_weights(int il);
+    // (batch cancel) abandon a staged layer whose pressure cleared: cancel_prefetch tells the
+    // source server to stop pushing (queued jobs dropped, in-progress push aborts at its next
+    // chunk); drop_prefetch frees the staged destination buffer once the source has drained
+    // (call only when prefetch_ready(il) is true) and forgets the entry.
+    void cancel_prefetch(int il);
+    bool drop_prefetch(int il);
 
     // Cache-aware rebalancing: layer_cache_hits_on reports how many of il's weight tensors are already
     // cached on dst (for locality-driven target selection); move_layer_weights_cached moves il to dst,

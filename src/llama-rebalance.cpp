@@ -268,13 +268,35 @@ void llama_rebalance_step(llama_model & model, llama_kv_cache & kv, int32_t n_to
             // PERIODIC MEASUREMENT: live per-device capacity, re-read every measure_every tokens
             // (a few bytes per device on the existing sockets) so decisions track the actual
             // cluster state -- another process eating a device's memory or cores shows up here.
+            // Readings are EMA-SMOOTHED: one noisy MemAvailable sample (page-cache flux, a fresh
+            // restart) must not swing the targets -- chasing measurement noise was costing ~20-30
+            // churn moves per run. The first sample seeds the average; totals/core-counts pass
+            // through unsmoothed.
+            static const double ema_alpha = getenv("LLAMA_REBALANCE_EMA") ? atof(getenv("LLAMA_REBALANCE_EMA")) : 0.3;
             static std::vector<llama_dev_capacity> caps;
             static int cap_tok = -1000000;
+            static int n_measured = 0;
             if ((int) caps.size() != nd || rb_tok - cap_tok >= measure_every) {
-                caps.clear();
-                for (auto * d : model.devices) { caps.push_back(llama_dev_capacity_measure(d)); }
+                std::vector<llama_dev_capacity> raw;
+                for (auto * d : model.devices) { raw.push_back(llama_dev_capacity_measure(d)); }
+                if ((int) caps.size() != nd) {
+                    caps = raw;
+                } else {
+                    for (int i = 0; i < nd; i++) {
+                        caps[i].mem_free_mb  = ema_alpha * raw[i].mem_free_mb + (1.0 - ema_alpha) * caps[i].mem_free_mb;
+                        caps[i].ext_load     = ema_alpha * raw[i].ext_load    + (1.0 - ema_alpha) * caps[i].ext_load;
+                        caps[i].mem_total_mb = raw[i].mem_total_mb;
+                        caps[i].n_cpu        = raw[i].n_cpu;
+                        caps[i].live         = raw[i].live;
+                    }
+                }
                 cap_tok = rb_tok;
+                n_measured++;
             }
+            // WARM-UP GRACE: don't plan anything until the smoothed readings have a few samples
+            // behind them -- right after load/restart MemAvailable is unsettled and the first
+            // reading is the least trustworthy of the whole run (B8 started churning at cells=32).
+            static const int warmup = getenv("LLAMA_REBALANCE_WARMUP") ? atoi(getenv("LLAMA_REBALANCE_WARMUP")) : 3;
 
             // CAPACITY-WEIGHTED TARGETS: apportion the layers by live capacity. A device's memory
             // capacity for our layers = free now + what our layers already occupy there (a move
@@ -416,7 +438,7 @@ void llama_rebalance_step(llama_model & model, llama_kv_cache & kv, int32_t n_to
             int plan_runs_cur = 0, plan_runs_want = 0;  // pipeline contiguity before/after the plan
             bool evict_planned = false;
             static bool batch_evict = false;            // the staged batch is an eviction (no pressure gate)
-            if (batch.empty()) {
+            if (batch.empty() && n_measured >= warmup) {
                 bool fit = apportion();
                 if (!fit) {
                     // the active set cannot fit at the horizon -> recruit the best idle device
@@ -574,7 +596,45 @@ void llama_rebalance_step(llama_model & model, llama_kv_cache & kv, int32_t n_to
             // COMMIT THE BATCH at the actual budget crossing: staged layers just barrier + repoint
             // (~instant), unstaged ones fall back to a synchronous move; each layer's (tiny) KV
             // moves with it. One cooldown covers the whole batch.
-            if (rb_tok - rb_last >= cooldown && (commit_over > 0.0 || (batch_evict && !batch.empty()))) {
+            // ABANDON a staged (non-evict) batch whose pressure cleared: without this it neither
+            // commits nor dies -- its transfers trickle until teardown for nothing (B8 pushed
+            // ~1.5GB it then threw away). After `cancel_after` pressure-free decodes, tell the
+            // sources to stop (queued pushes dropped, the in-progress one aborts at its next
+            // chunk), then free the staged buffers once each source reports drained. A cancelled
+            // batch is never committed (its transfers are partial).
+            static const int cancel_after = getenv("LLAMA_REBALANCE_CANCEL") ? atoi(getenv("LLAMA_REBALANCE_CANCEL")) : 64;
+            static int  press_calm = 0;
+            static bool batch_cancelling = false;
+            if (!batch.empty() && !batch_evict && cancel_after > 0) {
+                press_calm = commit_over > 0.0 ? 0 : press_calm + 1;
+                if (!batch_cancelling && press_calm >= cancel_after) {
+                    for (auto & m : batch) {
+                        if (m.staged) { model.cancel_prefetch(m.il); }
+                    }
+                    batch_cancelling = true;
+                    fprintf(stderr, "[rebalance] ABANDON staged batch (%zu moves): pressure clear for %d decodes\n",
+                            batch.size(), press_calm);
+                }
+                if (batch_cancelling) {
+                    bool drained = true;
+                    for (auto & m : batch) {
+                        if (m.staged && !model.prefetch_ready(m.il)) { drained = false; break; }
+                    }
+                    if (drained) {
+                        for (auto & m : batch) {
+                            if (m.staged) { model.drop_prefetch(m.il); }
+                        }
+                        batch.clear();
+                        batch_cancelling = false;
+                        press_calm = 0;
+                        fprintf(stderr, "[rebalance] ABANDONED: staged buffers freed\n");
+                    }
+                }
+            } else {
+                press_calm = 0;
+            }
+
+            if (!batch_cancelling && rb_tok - rb_last >= cooldown && (commit_over > 0.0 || (batch_evict && !batch.empty()))) {
                 std::vector<llama_rebalance_move> & moves = !batch.empty() ? batch : plan;
                 // (commit-defer) a staged batch whose transfers are still in flight would block
                 // decode on the barrier for the tail -- defer the commit and keep generating,

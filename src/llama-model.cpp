@@ -4049,6 +4049,35 @@ bool llama_model::prefetch_ready(int il) const {
     return pending_fn(it->src[0]) == 0;
 }
 
+// (batch cancel) tell the staged layer's source server to stop pushing. The staged buffers stay
+// alive until drop_prefetch -- the in-progress chunk may still land in them.
+void llama_model::cancel_prefetch(int il) {
+    typedef int (*rpc_prefetch_cancel_t)(const ggml_tensor *);
+    static rpc_prefetch_cancel_t cancel_fn = [] () -> rpc_prefetch_cancel_t {
+        ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
+        return reg ? (rpc_prefetch_cancel_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_prefetch_cancel") : nullptr;
+    }();
+    auto it = std::find_if(pimpl->prefetch.begin(), pimpl->prefetch.end(),
+                           [il](const impl::pending_prefetch & p) { return p.il == il; });
+    if (it != pimpl->prefetch.end() && cancel_fn && !it->src.empty()) {
+        cancel_fn(it->src[0]);
+    }
+}
+
+// (batch cancel) free a staged layer's destination buffer and forget it. Only call once the
+// source reports drained (prefetch_ready) -- freeing under an in-flight push crashes the peer.
+bool llama_model::drop_prefetch(int il) {
+    auto it = std::find_if(pimpl->prefetch.begin(), pimpl->prefetch.end(),
+                           [il](const impl::pending_prefetch & p) { return p.il == il; });
+    if (it == pimpl->prefetch.end()) {
+        return false;
+    }
+    ggml_backend_buffer_free(it->buf);
+    ggml_free(it->ctx);
+    pimpl->prefetch.erase(it);
+    return true;
+}
+
 bool llama_model::commit_layer_weights(int il) {
     auto it = std::find_if(pimpl->prefetch.begin(), pimpl->prefetch.end(),
                            [il](const impl::pending_prefetch & p) { return p.il == il; });
