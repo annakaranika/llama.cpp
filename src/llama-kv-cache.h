@@ -114,6 +114,15 @@ bool llama_kv_cache_grow(
             const llama_model & model,
                      uint32_t   new_size);
 
+// Shrink a growable KV cache back down to new_size cells (the reverse of grow, for de-recruit /
+// after a request ends): reallocates the per-layer K/V tensors at the smaller capacity and copies
+// the occupied prefix across (same server-local strided-copy path as grow). Refuses when any
+// occupied cell or the write head lies at or beyond new_size. Returns true if the cache shrank.
+bool llama_kv_cache_shrink(
+        struct llama_kv_cache & cache,
+            const llama_model & model,
+                     uint32_t   new_size);
+
 // Elastic rebalancing: migrate layer il's K/V tensors onto device dst (same capacity, different
 // device), copying the live data. Pairs with llama_model::move_layer_weights so a moved layer's KV
 // lives on the same device as its weights. Returns true if it moved.

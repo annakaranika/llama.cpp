@@ -390,10 +390,35 @@ void llama_rebalance_step(llama_model & model, llama_kv_cache & kv, int32_t n_to
                 return tmax * proj_cells * per_tok_mb <= budget_mb;  // budget-feasible at the horizon?
             };
 
+            // KV SHRINK (de-recruit prerequisite): a finished request leaves the grown capacity
+            // mostly empty; give the memory back by shrinking toward the live cells once the
+            // slack has persisted (>= 2 spare grow-blocks for 48 consecutive decodes). Smaller
+            // capacity -> smaller loads -> the eviction below becomes feasible.
+            static int shrink_calm = 0;
+            if (batch.empty() && gb > 0) {
+                uint32_t max_occ = 0;
+                for (uint32_t ci = 0; ci < kv.size; ci++) {
+                    if (kv.cells[ci].pos >= 0) { max_occ = ci + 1; }
+                }
+                if (max_occ == 0) { kv.head = 0; }  // empty cache: head is only a search hint, park it
+                const uint32_t livec = std::max(kv.head, max_occ);
+                if (kv.size >= livec + 2 * gb) {
+                    if (++shrink_calm >= 48) {
+                        const uint32_t tgt = ((livec + gb) + gb - 1) / gb * gb;
+                        if (llama_kv_cache_shrink(kv, model, tgt)) { shrink_calm = 0; }
+                    }
+                } else {
+                    shrink_calm = 0;
+                }
+            }
+
             std::vector<llama_rebalance_move> plan;
             int plan_runs_cur = 0, plan_runs_want = 0;  // pipeline contiguity before/after the plan
+            bool evict_planned = false;
+            static bool batch_evict = false;            // the staged batch is an eviction (no pressure gate)
             if (batch.empty()) {
-                if (!apportion()) {
+                bool fit = apportion();
+                if (!fit) {
                     // the active set cannot fit at the horizon -> recruit the best idle device
                     // (one per cycle; if it is still not enough the next cycle recruits another).
                     int best = -1;
@@ -404,7 +429,37 @@ void llama_rebalance_step(llama_model & model, llama_kv_cache & kv, int32_t n_to
                         member[best] = 1;
                         fprintf(stderr, "[rebalance] RECRUIT %s (active set cannot fit at horizon cells=%.0f)\n",
                                 ggml_backend_dev_name(model.devices[best]), proj_cells);
-                        apportion();
+                        fit = apportion();
+                    }
+                }
+
+                // DE-RECRUIT: no pressure even at the horizon -> try handing the smallest member
+                // back (fewer pipeline hops for the single stream + a device returned to the
+                // pool). Only when the remaining members would sit under evict_slack of their
+                // post-eviction allowance at the horizon -- the gap between recruiting at 100%
+                // and evicting at 80% is the hysteresis against recruit/evict ping-pong.
+                static const double evict_slack = getenv("LLAMA_REBALANCE_EVICT_SLACK") ? atof(getenv("LLAMA_REBALANCE_EVICT_SLACK")) : 0.8;
+                if (fit && stage_over <= 0.0 && rb_tok - rb_last >= cooldown && evict_slack > 0.0) {
+                    int e = -1, nmem = 0;
+                    for (int i = 0; i < nd; i++) {
+                        if (!member[i]) { continue; }
+                        nmem++;
+                        if (cnt[model.devices[i]] > 0 && (e < 0 || cnt[model.devices[i]] < cnt[model.devices[e]])) { e = i; }
+                    }
+                    if (nmem > 1 && e >= 0) {
+                        member[e] = 0;
+                        bool ok = apportion();
+                        for (int i = 0; ok && i < nd; i++) {
+                            if (member[i] && target[i] * proj_cells * per_tok_mb > evict_slack * (mem_cap[i] - target[i] * w_layer_mb)) { ok = false; }
+                        }
+                        if (ok) {
+                            evict_planned = true;
+                            fprintf(stderr, "[rebalance] EVICT %s (remaining members fit under %.0f%% of allowance at horizon cells=%.0f)\n",
+                                    ggml_backend_dev_name(model.devices[e]), evict_slack * 100.0, proj_cells);
+                        } else {
+                            member[e] = 1;
+                            apportion();
+                        }
                     }
                 }
 
@@ -485,12 +540,13 @@ void llama_rebalance_step(llama_model & model, llama_kv_cache & kv, int32_t n_to
             // PREFETCH THE WHOLE BATCH when the projected KV at the horizon crosses some device's
             // allowance: every planned layer's weights start moving in the background while decode
             // continues. (Fixed budget: allowance == budget for every device, same as before.)
-            if (pf_lead > 0.0 && batch.empty() && !plan.empty() && cells > 0 && stage_over > 0.0) {
+            if (pf_lead > 0.0 && batch.empty() && !plan.empty() && cells > 0 && (stage_over > 0.0 || evict_planned)) {
                 // (auto-rate) pace the batch to finish just before the predicted crossing: rate =
                 // batch bytes / (0.7 x lead), lead = tokens until the earliest member crossing at
                 // the measured decode speed. Falls back to unpaced when the estimate is unusable.
+                // An eviction has no crossing (no pressure) -> unpaced unless a fixed rate is set.
                 double rate = pace_mbps;
-                if (pace_auto) {
+                if (pace_auto && !evict_planned) {
                     double cross_cells = 1e18;
                     for (int i = 0; i < nd; i++) {
                         const int c = cnt[model.devices[i]];
@@ -507,8 +563,9 @@ void llama_rebalance_step(llama_model & model, llama_kv_cache & kv, int32_t n_to
                     staged_n += m.staged ? 1 : 0;
                 }
                 batch = plan;
-                fprintf(stderr, "[rebalance] PREFETCH-BATCH %zu layers (%d staged) | cells=%u proj_over=%.1fMB %s | rate=%.1fMB/s | runs %d->%d | targets:",
-                        batch.size(), staged_n, cells, stage_over,
+                batch_evict = evict_planned;
+                fprintf(stderr, "[rebalance] PREFETCH-BATCH %zu layers (%d staged)%s | cells=%u proj_over=%.1fMB %s | rate=%.1fMB/s | runs %d->%d | targets:",
+                        batch.size(), staged_n, batch_evict ? " [evict]" : "", cells, stage_over,
                         auto_budget ? "budget=auto" : "budget=fixed", rate, plan_runs_cur, plan_runs_want);
                 for (int i = 0; i < nd; i++) { fprintf(stderr, " %d", target[i]); }
                 fprintf(stderr, "\n");
@@ -517,7 +574,7 @@ void llama_rebalance_step(llama_model & model, llama_kv_cache & kv, int32_t n_to
             // COMMIT THE BATCH at the actual budget crossing: staged layers just barrier + repoint
             // (~instant), unstaged ones fall back to a synchronous move; each layer's (tiny) KV
             // moves with it. One cooldown covers the whole batch.
-            if (rb_tok - rb_last >= cooldown && commit_over > 0.0) {
+            if (rb_tok - rb_last >= cooldown && (commit_over > 0.0 || (batch_evict && !batch.empty()))) {
                 std::vector<llama_rebalance_move> & moves = !batch.empty() ? batch : plan;
                 // (commit-defer) a staged batch whose transfers are still in flight would block
                 // decode on the barrier for the tail -- defer the commit and keep generating,
@@ -564,6 +621,7 @@ void llama_rebalance_step(llama_model & model, llama_kv_cache & kv, int32_t n_to
                     log_layer_dist(model, hparams.n_layer);
                     rb_last = rb_tok;
                     batch.clear();
+                    batch_evict = false;
                 }
             }
         }

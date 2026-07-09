@@ -161,24 +161,19 @@ bool llama_kv_cache_init(
     return true;
 }
 
-bool llama_kv_cache_grow(
+// shared by grow and shrink: reallocate every layer's K/V tensors at new_size cells and copy the
+// live prefix [0, live) across (K contiguous; transposed V re-strided from the old capacity to the
+// new -- both directions -- server-locally on RPC devices). Swaps the new tensors/buffers in.
+static bool llama_kv_cache_realloc(
         struct llama_kv_cache & cache,
             const llama_model & model,
-                     uint32_t   new_size) {
-    if (cache.grow_block == 0) {
-        return false;  // not a growable cache
-    }
-    new_size = std::min(new_size, cache.size_max);
-    if (new_size <= cache.size) {
-        return false;  // nothing to do (already big enough, or capped)
-    }
-
+                     uint32_t   new_size,
+                     uint32_t   live) {
     const struct llama_hparams & hparams = model.hparams;
     const int        n_layer  = (int) cache.k_l.size();
     const ggml_type  type_k   = cache.type_k;
     const ggml_type  type_v   = cache.type_v;
     const uint32_t   old_size = cache.size;
-    const uint32_t   live     = cache.head;  // single-sequence append frontier: cells [0, head) are live
 
     // allocate new, larger K/V tensors on the SAME buffer type each layer already used (so the
     // per-layer device placement is preserved), in fresh metadata contexts.
@@ -302,9 +297,57 @@ bool llama_kv_cache_grow(
     cache.bufs = std::move(new_bufs);
     cache.ctxs = std::move(new_ctxs);
     cache.size = new_size;
-    cache.cells.resize(new_size);  // preserves cells [0, old_size); new cells are default (empty)
+    cache.cells.resize(new_size);  // preserves cells [0, min(old,new)); new cells are default (empty)
 
+    return true;
+}
+
+bool llama_kv_cache_grow(
+        struct llama_kv_cache & cache,
+            const llama_model & model,
+                     uint32_t   new_size) {
+    if (cache.grow_block == 0) {
+        return false;  // not a growable cache
+    }
+    new_size = std::min(new_size, cache.size_max);
+    if (new_size <= cache.size) {
+        return false;  // nothing to do (already big enough, or capped)
+    }
+    const uint32_t old_size = cache.size;
+    const uint32_t live     = cache.head;  // single-sequence append frontier: cells [0, head) are live
+    if (!llama_kv_cache_realloc(cache, model, new_size, live)) {
+        return false;
+    }
     LLAMA_LOG_INFO("%s: grew KV cache %u -> %u cells (live %u)\n", __func__, old_size, new_size, live);
+    return true;
+}
+
+bool llama_kv_cache_shrink(
+        struct llama_kv_cache & cache,
+            const llama_model & model,
+                     uint32_t   new_size) {
+    if (cache.grow_block == 0) {
+        return false;  // only a growable cache shrinks
+    }
+    new_size = std::max(new_size, cache.grow_block);  // never below one block
+    if (new_size >= cache.size) {
+        return false;
+    }
+    // every occupied cell AND the write head must survive the cut -- refuse otherwise (a ring
+    // cache can have live cells scattered; only a clean prefix occupancy is shrinkable).
+    uint32_t max_occ = 0;
+    for (uint32_t i = 0; i < cache.size; i++) {
+        if (cache.cells[i].pos >= 0) { max_occ = i + 1; }
+    }
+    const uint32_t live = std::max(cache.head, max_occ);
+    if (live > new_size) {
+        return false;
+    }
+    const uint32_t old_size = cache.size;
+    if (!llama_kv_cache_realloc(cache, model, new_size, live)) {
+        return false;
+    }
+    LLAMA_LOG_INFO("%s: shrank KV cache %u -> %u cells (live %u)\n", __func__, old_size, new_size, live);
     return true;
 }
 
