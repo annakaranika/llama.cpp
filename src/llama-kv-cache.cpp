@@ -256,7 +256,15 @@ bool llama_kv_cache_grow(
 
     // copy the live prefix [0, live) from old to new. K is position-contiguous (a straight prefix
     // copy); transposed V is channel-major with stride == capacity, so each channel's live prefix
-    // moves from the old stride to the new stride.
+    // moves from the old stride to the new stride. On RPC devices the copy runs SERVER-LOCALLY
+    // (both tensors live on the same server; dragging the whole cache through the coordinator's
+    // get/set cost ~8KB x (2*live + old + new) per layer per grow over WiFi); the host get/set
+    // path below is the fallback for non-RPC backends.
+    typedef bool (*rpc_strided_copy_t)(const ggml_tensor *, ggml_tensor *, uint64_t, uint64_t, uint64_t, uint64_t);
+    static rpc_strided_copy_t local_copy = [] () -> rpc_strided_copy_t {
+        ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
+        return reg ? (rpc_strided_copy_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_strided_copy") : nullptr;
+    }();
     std::vector<uint8_t> tmp;
     std::vector<uint8_t> tmpv;
     for (int i = 0; i < n_layer; i++) {
@@ -264,11 +272,17 @@ bool llama_kv_cache_grow(
         const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(i) + hparams.n_embd_v_s();
         if (live > 0) {
             const size_t k_bytes = ggml_row_size(type_k, n_embd_k_gqa) * (size_t) live;
-            tmp.resize(k_bytes);
-            ggml_backend_tensor_get(cache.k_l[i], tmp.data(), 0, k_bytes);
-            ggml_backend_tensor_set(new_k[i], tmp.data(), 0, k_bytes);
-
-            const size_t elt_v = ggml_type_size(type_v);
+            const size_t elt_v   = ggml_type_size(type_v);
+            const bool k_local = local_copy && local_copy(cache.k_l[i], new_k[i], 1, 0, 0, k_bytes);
+            if (!k_local) {
+                tmp.resize(k_bytes);
+                ggml_backend_tensor_get(cache.k_l[i], tmp.data(), 0, k_bytes);
+                ggml_backend_tensor_set(new_k[i], tmp.data(), 0, k_bytes);
+            }
+            const bool v_local = local_copy && local_copy(cache.v_l[i], new_v[i], n_embd_v_gqa,
+                                                          (uint64_t) old_size * elt_v, (uint64_t) new_size * elt_v,
+                                                          (uint64_t) live * elt_v);
+            if (!v_local) {
             tmpv.assign((size_t) n_embd_v_gqa * old_size * elt_v, 0);
             ggml_backend_tensor_get(cache.v_l[i], tmpv.data(), 0, tmpv.size());
             std::vector<uint8_t> newv((size_t) n_embd_v_gqa * new_size * elt_v, 0);
@@ -278,6 +292,7 @@ bool llama_kv_cache_grow(
                        (size_t) live * elt_v);
             }
             ggml_backend_tensor_set(new_v[i], newv.data(), 0, newv.size());
+            }
         }
     }
 

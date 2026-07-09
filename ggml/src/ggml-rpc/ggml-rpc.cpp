@@ -157,6 +157,7 @@ enum rpc_cmd {
     RPC_CMD_PERSIST_REGISTER,  // retain this freshly-uploaded weight buffer under model_key (don't free on teardown)
     RPC_CMD_PERSIST_DETACH,    // client is releasing a resident buffer -> keep it resident, mark unclaimed for the next process
     RPC_CMD_GET_LIVE_STATS,    // (capacity-aware rebalance) live free memory + compute load measured NOW (GET_DEVICE_MEMORY is a connection-time snapshot)
+    RPC_CMD_STRIDED_COPY,      // (growable KV) server-LOCAL strided copy between two same-server tensors (KV grow re-stride without host round-tripping the cache over the wire)
     RPC_CMD_COUNT,
 };
 
@@ -303,6 +304,23 @@ struct rpc_msg_prefetch_wait_rsp {
 struct rpc_msg_get_live_stats_req {
     uint8_t dummy;
 };
+// (growable KV) server-local strided copy: rows x row_bytes from src (stride src_stride) to dst
+// (stride dst_stride), all inside the server's own RAM. The KV grow needs exactly this shape --
+// K is one contiguous prefix (rows=1), transposed V is a per-channel re-stride from the old
+// capacity to the new -- and doing it locally removes the get/set round trip that used to drag
+// the whole cache through the coordinator over WiFi on every grow.
+struct rpc_msg_strided_copy_req {
+    rpc_tensor src;
+    rpc_tensor dst;
+    uint64_t   rows;
+    uint64_t   src_stride;
+    uint64_t   dst_stride;
+    uint64_t   row_bytes;
+};
+struct rpc_msg_strided_copy_rsp {
+    uint8_t result;   // 1 = copied
+};
+
 struct rpc_msg_get_live_stats_rsp {
     uint64_t free_mem;   // bytes available to new allocations right now
     uint64_t total_mem;  // bytes of physical memory
@@ -5012,6 +5030,7 @@ class rpc_server {
     // (elastic prefetch) enqueue a background push (overlaps decode) + barrier for the commit.
     bool send_to_peer_async(const rpc_msg_send_to_peer_req & request, rpc_msg_send_to_peer_rsp & response);
     bool prefetch_wait(const rpc_msg_prefetch_wait_req & request, rpc_msg_prefetch_wait_rsp & response);
+    bool strided_copy(const rpc_msg_strided_copy_req & request, rpc_msg_strided_copy_rsp & response);
     void add_socket_listen(const std::shared_ptr<socket_t> & sock);
     bool all_reduce(std::vector<uint8_t> & input);
     bool ar_result(std::vector<uint8_t> & input);  // tree all-reduce: non-root applies root's result
@@ -6050,6 +6069,40 @@ bool rpc_server::send_to_peer_async(const rpc_msg_send_to_peer_req & request, rp
         prefetch_cv.notify_all();
     }
     response.result = 1;
+    return true;
+}
+
+// (growable KV) server-local strided copy between two tensors resident HERE: the KV grow's
+// re-stride runs entirely in this server's RAM instead of dragging the old+new cache through the
+// coordinator over the wire. Bounds-checked against both tensors before any byte moves.
+bool rpc_server::strided_copy(const rpc_msg_strided_copy_req & request, rpc_msg_strided_copy_rsp & response) {
+    response.result = 0;
+    struct ggml_init_params params{ 2*ggml_tensor_overhead(), NULL, true };
+    struct ggml_context * ctx = ggml_init(params);
+    ggml_tensor * src = deserialize_tensor(ctx, &request.src);
+    ggml_tensor * dst = deserialize_tensor(ctx, &request.dst);
+    if (src == nullptr || dst == nullptr || request.row_bytes == 0 || request.rows == 0) {
+        ggml_free(ctx);
+        return true;  // refused (client falls back to the host path); not a protocol error
+    }
+    const uint64_t src_span = (request.rows - 1) * request.src_stride + request.row_bytes;
+    const uint64_t dst_span = (request.rows - 1) * request.dst_stride + request.row_bytes;
+    if (src_span > ggml_nbytes(src) || dst_span > ggml_nbytes(dst)) {
+        ggml_free(ctx);
+        return true;  // out of bounds -> refuse
+    }
+    for (uint64_t r = 0; r < request.rows; r++) {
+        memcpy((char *) dst->data + r * request.dst_stride,
+               (const char *) src->data + r * request.src_stride,
+               request.row_bytes);
+    }
+    ggml_free(ctx);
+    response.result = 1;
+    static const bool dbg = getenv("RPC_DBG_KVGROW") != nullptr;
+    if (dbg) {
+        GGML_LOG_INFO("[kv-grow] local strided copy: %llu rows x %llu B (0 bytes over the wire)\n",
+                      (unsigned long long) request.rows, (unsigned long long) request.row_bytes);
+    }
     return true;
 }
 
@@ -7408,6 +7461,21 @@ static void rpc_serve_client(rpc_server & server, sockfd_t sockfd, size_t free_m
                     }
                     break;
                 }
+            case RPC_CMD_STRIDED_COPY:
+                {
+                    rpc_msg_strided_copy_req request;
+                    if (!recv_msg(sockfd, &request, sizeof(request))) {
+                        return;
+                    }
+                    rpc_msg_strided_copy_rsp response;
+                    if (!server.strided_copy(request, response)) {
+                        return;
+                    }
+                    if (!send_msg(sockfd, &response, sizeof(response))) {
+                        return;
+                    }
+                    break;
+                }
             case RPC_CMD_PERSIST_BIND:
                 {
                     rpc_msg_persist_bind_req request;
@@ -8093,6 +8161,34 @@ static bool ggml_backend_rpc_dev_live_stats(ggml_backend_dev_t dev, uint64_t * f
     return true;
 }
 
+// (growable KV) ask the server holding BOTH tensors to do a strided copy locally -- the KV grow's
+// re-stride then never crosses the wire. Returns false when the tensors are not a same-server RPC
+// pair (or the server refuses); the caller falls back to the host get/set path.
+static bool ggml_backend_rpc_strided_copy(const ggml_tensor * src, ggml_tensor * dst,
+                                          uint64_t rows, uint64_t src_stride, uint64_t dst_stride, uint64_t row_bytes) {
+    if (!src || !dst || !src->buffer || !dst->buffer ||
+        src->buffer->buft->iface.get_name != ggml_backend_rpc_buffer_type_name ||
+        dst->buffer->buft->iface.get_name != ggml_backend_rpc_buffer_type_name) {
+        return false;
+    }
+    auto * src_ctx = (ggml_backend_rpc_buffer_context *) src->buffer->context;
+    auto * dst_ctx = (ggml_backend_rpc_buffer_context *) dst->buffer->context;
+    if (src_ctx->sock != dst_ctx->sock) {
+        return false;  // different servers -> not a local copy
+    }
+    rpc_msg_strided_copy_req req;
+    req.src        = serialize_tensor(src);
+    req.dst        = serialize_tensor(dst);
+    req.rows       = rows;
+    req.src_stride = src_stride;
+    req.dst_stride = dst_stride;
+    req.row_bytes  = row_bytes;
+    rpc_msg_strided_copy_rsp rsp;
+    rsp.result = 0;
+    bool ok = send_rpc_cmd(src_ctx->sock, RPC_CMD_STRIDED_COPY, &req, sizeof(req), &rsp, sizeof(rsp));
+    return ok && rsp.result == 1;
+}
+
 // (cache-aware rebalance) look up a weight tensor's retained content hash (0 if unknown -- e.g. the
 // weight cache was off at load, so the key was never computed/retained).
 static uint64_t ggml_backend_rpc_weight_hash(const ggml_tensor * t) {
@@ -8171,6 +8267,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (strcmp(name, "ggml_backend_rpc_dev_live_stats") == 0) {
         return (void *) ggml_backend_rpc_dev_live_stats;
+    }
+    if (strcmp(name, "ggml_backend_rpc_strided_copy") == 0) {
+        return (void *) ggml_backend_rpc_strided_copy;
     }
     if (strcmp(name, "ggml_backend_rpc_weight_hash") == 0) {
         return (void *) ggml_backend_rpc_weight_hash;
