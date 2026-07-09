@@ -287,6 +287,50 @@ slowed decode by roughly an order of magnitude (more per-token hops on one conte
 Hence the lazy-membership revision above: small one-recruit batches hide fully, and devices that
 aren't needed are never touched.
 
+**Iteration on the 9-Pi cell (three follow-up runs, 2026-07-08/09, all bit-identical, 0 errors):**
+- **Contiguity-preserving plans** (run B4): the block-partition planner held the pipeline at
+  exactly one run per member through all 8 batches (`runs` = member count, hops at the
+  theoretical minimum) — but it also exposed a capacity-model feedback: received weights land in
+  the page cache, keeping `MemAvailable` high while `held` grows, so receivers looked ever bigger
+  and targets swung 2..11 across *identical* Pis (72 moves vs the 38 of the scatter run).
+- **Physics clamp + hysteresis**: `mem_cap = min(free + held, total) − margin` (a device can't
+  exceed its RAM) plus a ±1-layer deadband kills that feedback and the churn.
+- **Auto budget** (`LLAMA_REBALANCE_BUDGET_MB=auto`, run B5): each device's KV allowance derives
+  from its live capacity (`mem_cap − weights held`) — shed/recruit only when memory *truly* runs
+  out. Result: a 400-token 7B context genuinely fits 3 Pis (allowance ≈ 209 MB/Pi ⇒ crossing at
+  ≈ 530 cells), so the run had **zero rebalance activity**, six Pis stayed at 5 MB RSS, and the
+  whole run took **36 min vs ~2 h** for the toy-budget runs — the pipeline stayed at 3-device
+  depth and full decode speed. The machinery stands by for contexts that genuinely outgrow the
+  active set (validated with a longer run recruiting at the real crossing).
+- **Paced staging** (`RPC_PREFETCH_RATE_MBPS`): background pushes chunked + rate-capped so a
+  batch can stage far ahead and sip shared-channel airtime instead of gulping it next to the
+  decode handoffs (unpaced staging measurably slowed decode even while "hidden").
+- **Auto budget validated end-to-end** (run B6, 800 tok): the policy held 3 devices until token
+  ~690, then fired exactly one memory-driven `RECRUIT` (rpi25) with contiguous batches — output
+  bit-identical to baseline over the comparable prefix.
+
+**Closing the loop (2026-07-09): grow copies, deferred commits, auto-paced staging, de-recruit.**
+- **Server-local KV grow/shrink** (`RPC_CMD_STRIDED_COPY`): the growable cache used to re-copy
+  itself *through the coordinator* on every grow (K prefix twice over WiFi; transposed V pulled
+  and pushed in full — ~2.6 GB over a 12-grow run). Both copy shapes are one strided-copy
+  primitive that now runs inside the server holding the tensors: **zero KV bytes over the wire**
+  (968/968 copies local in validation, bit-identical to pure CPU).
+- **Commit-defer** (`LLAMA_REBALANCE_DEFER_MB`, default 50): a commit no longer blocks decode on
+  the transfer barrier — while staged pushes are in flight (non-blocking `PREFETCH_PENDING`
+  probe) the commit is deferred unless the overshoot turns urgent. A batch that previously
+  stalled 13.7 s at commit now defers and commits in 16 ms.
+- **Auto-rate paced staging** (`LLAMA_REBALANCE_PACE=auto`): each batch is paced at
+  `bytes / (0.7 × predicted lead)` — lead from the earliest allowance crossing at the measured
+  decode-rate EMA — so transfers finish just before their commit while sipping the channel.
+- **KV shrink + de-recruit**: capacity finally moves *both* ways. `llama_kv_cache_shrink`
+  (same local strided-copy path) returns grown-but-idle capacity once ≥2 spare grow-blocks
+  persist; the policy then **evicts** the smallest member when the rest fit under
+  `LLAMA_REBALANCE_EVICT_SLACK` (0.8) of their allowance — recruit at 100%, evict at 80% is the
+  anti-ping-pong hysteresis. Lifecycle validated on a localhost llama-server: recruit under
+  pressure (22/0 → 12/10) → request ends → `shrank KV 736 → 96` → `EVICT` (10-layer staged
+  batch, `runs 2->1`, dist 22/0) → correct re-recruit when the next request grew — responses
+  identical to a no-rebalance baseline.
+
 **Lazy recruit on the 9-Pi cell (7B, 400 tok, budget 60 MB, lead 3 blocks, reclaim on, measured
 2026-07-08).** Placement packed 12/12/8 with six Pis idle. The run then played out the designed
 arc: first a *within-active* rebalance only (3 moves, 12/12/8 → 11/11/10 — no recruit while the
@@ -335,6 +379,11 @@ non-urgent commit while staged transfers are still in flight.
 | `LLAMA_REBALANCE_MARGIN_MB` | 100 | (balanced) per-device safety margin subtracted from live free memory |
 | `RPC_STATS_FREE_MB` / `RPC_STATS_EXT_LOAD` | unset | server-side test hooks: fake the live-stats report (exercise heterogeneous capacity locally) |
 | `RPC_DBG_STATS` | off | log each live-stats report on the server |
+| `LLAMA_REBALANCE_DEFER_MB` | 50 | defer a commit while staged transfers are in flight, unless the overshoot exceeds this |
+| `LLAMA_REBALANCE_PACE` | off | `auto` = pace each staged batch to finish just before its commit; number = fixed MB/s |
+| `LLAMA_REBALANCE_EVICT_SLACK` | 0.8 | de-recruit when remaining members fit under this fraction of their allowance (0 disables) |
+| `RPC_PREFETCH_RATE_MBPS` | unset | server-side fixed pace for background pushes (per-batch auto-rate overrides) |
+| `RPC_DBG_KVGROW` | off | log each server-local KV grow/shrink copy |
 | `LLAMA_REBALANCE_POLICY` | `adjacent` | `adjacent` = shift to lower-loaded neighbor + prefetch; `cache` = shift to a device that caches the layer (0× WiFi) |
 | `LLAMA_REBALANCE_PREFETCH` | 1 | (adjacent policy) grow-blocks of lead to pre-stage the transfer; 0 = synchronous shift |
 | `LLAMA_REBALANCE_RECLAIM` | off | after a shift, `madvise(DONTNEED)` the moved layer's pages on the source so its weight RAM is freed (not just KV) |
