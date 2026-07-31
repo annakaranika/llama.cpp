@@ -6,6 +6,11 @@ TinyLlama-1.1B-chat Q5_K_M and Llama-2-7B Q4_K_M, N=2–4. This is the single re
 what was implemented, how to toggle it, and the design that motivates it. Raw measurements
 live in `bench-results.md`.
 
+**New to this work?** Read [`HANDOFF.md`](HANDOFF.md) first: it covers orientation, the code
+map, the local-first development workflow, and — most importantly — what is currently broken
+(notably multi-sequence batching, which invalidates the throughput-serving argument in Part 2
+until it is fixed).
+
 **Headlines:** decode ~7.9 → ~6.5 s/tok (~18%) and prefill ~16% (all-reduce work); warm
 model load 4.2×; a per-server-memory fix that turned N=4 long prefills from OOM-killed into
 fitting; a **resident serving process** (load once, serve many, no per-request reload); and
