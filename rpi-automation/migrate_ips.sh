@@ -12,7 +12,14 @@ SUBNET="${1:-128.174.61.128/26}"
 KNOWN_FILE="${2:-dprgnet_ips.txt}"
 MIGRATE_FILE="${3:-illinoisnet_ips.txt}"
 NEW_NETWORK_SSID="${4:-NETGEAR75}"
-NEW_NETWORK_PASSWORD="${5:-***REMOVED***}"
+# Credentials are NOT hardcoded here -- this repository is public.
+# Pass the password as $5, or export WIFI_PASSWORD in your environment.
+NEW_NETWORK_PASSWORD="${5:-${WIFI_PASSWORD:-}}"
+if [[ -z "$NEW_NETWORK_PASSWORD" ]]; then
+  echo "No WiFi password given. Pass it as the 5th argument, or set WIFI_PASSWORD." >&2
+  echo "  $0 <subnet> <known_file> <migrate_file> <ssid> <password>" >&2
+  exit 1
+fi
 NMAP_BIN="${NMAP_BIN:-nmap}"                 # path to nmap if not on PATH
 SLEEP_AFTER_SWITCH="${SLEEP_AFTER_SWITCH:-10}"   # seconds to wait for WiFi network switch and DHCP
 
