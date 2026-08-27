@@ -13,7 +13,12 @@ KNOWN_FILE="${2:-dprgnet_ips.txt}"
 MIGRATE_FILE="${3:-illinoisnet_ips.txt}"
 NEW_NETWORK_SSID="${4:-NETGEAR75}"
 # Credentials are NOT hardcoded here -- this repository is public.
-# Pass the password as $5, or export WIFI_PASSWORD in your environment.
+# They come from rpi-automation/secrets.env (gitignored; copy secrets.env.example
+# and fill it in), or from $5 / the WIFI_PASSWORD environment variable.
+_SECRETS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/secrets.env"
+# shellcheck source=/dev/null
+[[ -f "$_SECRETS" ]] && source "$_SECRETS"
+NEW_NETWORK_SSID="${4:-${WIFI_SSID:-NETGEAR75}}"
 NEW_NETWORK_PASSWORD="${5:-${WIFI_PASSWORD:-}}"
 if [[ -z "$NEW_NETWORK_PASSWORD" ]]; then
   echo "No WiFi password given. Pass it as the 5th argument, or set WIFI_PASSWORD." >&2

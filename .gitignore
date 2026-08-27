@@ -147,3 +147,7 @@ poetry.toml
 /run-chat.sh
 
 sim_output/
+
+# Cluster credentials for rpi-automation/ -- NEVER commit; this repo is public.
+# Copy rpi-automation/secrets.env.example to rpi-automation/secrets.env and fill it in.
+rpi-automation/secrets.env
